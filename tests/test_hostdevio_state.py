@@ -39,8 +39,51 @@ FAKE_ADB = (
 )
 
 
-def _cli(tmp_path, *args):
-    """Run the CLI with a temp HOME and a fake adb, so no real device is reachable."""
+def _backend_stub(tmp_path, mode: str) -> str:
+    """A PYTHONPATH entry that decides what the optional USB backends look like to the CLI.
+
+    `mode="usable"` supplies minimal `hid` and `usb.core` modules, so the child sees an environment
+    where both backends import and no deck is attached. `mode="missing"` installs a `sitecustomize`
+    whose meta-path finder makes both unimportable, which is the A-102 environment.
+
+    Injecting the environment is what makes these tests deterministic: this venv happens to have
+    neither backend installed, but that is a property of the machine, not of the CLI. The stub dir
+    is placed before `SRC` on PYTHONPATH, so it shadows an ambient backend if one ever exists.
+    """
+    stub = tmp_path / f"backends-{mode}"
+    stub.mkdir(exist_ok=True)
+    if mode == "usable":
+        (stub / "hid.py").write_text("def enumerate(vid, pid):\n    return []\n", encoding="utf-8")
+        core = stub / "usb"
+        core.mkdir(exist_ok=True)
+        (core / "__init__.py").write_text("", encoding="utf-8")
+        (core / "core.py").write_text("def find(**kwargs):\n    return None\n", encoding="utf-8")
+    else:
+        (stub / "sitecustomize.py").write_text(
+            "import sys\n"
+            "\n"
+            "\n"
+            "class _BlockBackends:\n"
+            "    blocked = (\"hid\", \"usb\")\n"
+            "\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name.split(\".\")[0] in self.blocked:\n"
+            "            raise ModuleNotFoundError(f\"blocked for this test: {name}\")\n"
+            "        return None\n"
+            "\n"
+            "\n"
+            "sys.meta_path.insert(0, _BlockBackends())\n",
+            encoding="utf-8",
+        )
+    return str(stub)
+
+
+def _cli(tmp_path, *args, backends: str | None = None):
+    """Run the CLI with a temp HOME and a fake adb, so no real device is reachable.
+
+    `backends` selects the stub environment above; None keeps the ambient interpreter, which is
+    only appropriate for a test that does not depend on what the backends report.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     fake = bindir / "adb"
@@ -49,7 +92,10 @@ def _cli(tmp_path, *args):
     env = dict(os.environ)
     env["HOME"] = str(tmp_path)
     env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
-    env["PYTHONPATH"] = str(SRC)
+    paths = [str(SRC)]
+    if backends is not None:
+        paths.insert(0, _backend_stub(tmp_path, backends))
+    env["PYTHONPATH"] = os.pathsep.join(paths)
     return subprocess.run(
         [sys.executable, "-m", "ghostdeck.cli", *args],
         cwd=str(ROOT),
@@ -221,16 +267,61 @@ def test_oversized_pid_is_normalized_away(state_path):
 
 
 def test_cli_status_survives_the_oversized_pid(tmp_path):
+    """An oversized `play_pid` must not be fatal to `status`.
+
+    The point is the state guard, so the environment is pinned rather than inherited: usable
+    backends are injected, which makes the expected outcome exact (`rc 0`, `usb=none`) instead of
+    "whatever this interpreter happens to report". The venv used here has neither hidapi nor pyusb,
+    so without the injection this test was really asserting FIX-1's A-102 behaviour by accident --
+    and broke when that behaviour was corrected (T10).
+    """
     home = tmp_path / ".ghostdeck"
     home.mkdir()
     (home / "state.json").write_text(json.dumps({"play_pid": JUNK_PID}) + "\n")
-    result = _cli(tmp_path, "status")
+    result = _cli(tmp_path, "status", backends="usable")
     out = result.stdout + result.stderr
     assert "OverflowError" not in out
     assert "int too large" not in out
     assert "Traceback" not in out
     assert result.returncode == 0, out
+    assert "usb=none" in result.stdout, "both backends were supplied, so the deck verdict is 'none'"
     assert "release_gate=" in result.stdout
+    assert "Unknown" not in result.stdout
+
+
+def test_cli_status_reports_a_missing_backend_as_the_reason_not_a_bare_code(tmp_path):
+    """The A-102 contract behind the T10 change, asserted on the *reason*, never on a code range.
+
+    `assert rc in (0, 1, 2)` would hide exactly the regression that is interesting here: the CLI
+    blaming the deck, or a missing backend silently succeeding. Both backends are made unimportable
+    so this does not depend on the ambient interpreter either.
+    """
+    home = tmp_path / ".ghostdeck"
+    home.mkdir()
+    (home / "state.json").write_text(json.dumps({"play_pid": JUNK_PID}) + "\n")
+    result = _cli(tmp_path, "status", backends="missing")
+    out = result.stdout + result.stderr
+    assert "OverflowError" not in out
+    assert "int too large" not in out
+    assert "Traceback" not in out
+    # Exactly 2, and the number alone is not the assertion: `_ENV_EXIT` means "the environment is
+    # wrong, not the hardware", and the reason must name the package.
+    assert result.returncode == 2, out
+    assert "is not installed" in result.stderr
+    assert ("hidapi" in result.stderr) or ("pyusb" in result.stderr)
+    # The deck must not be blamed, and the host-side half of the diagnostic is still reported.
+    assert "no device" not in result.stderr
+    assert "usb=unknown" in result.stdout
+    assert "usb=none" not in result.stdout
+    assert "release_gate=" in result.stdout
+
+
+def test_cli_detect_reports_a_missing_backend_the_same_way(tmp_path):
+    """The sibling command must agree, so the two diagnostics cannot drift apart."""
+    result = _cli(tmp_path, "detect", backends="missing")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "is not installed" in result.stderr
+    assert "no device" not in result.stderr
 
 
 def test_cli_stop_does_not_crash_on_the_oversized_pid(tmp_path):
@@ -247,12 +338,14 @@ def test_cli_stop_does_not_crash_on_the_oversized_pid(tmp_path):
     home.mkdir()
     state_file = home / "state.json"
     state_file.write_text(json.dumps({"play_pid": JUNK_PID}) + "\n")
-    result = _cli(tmp_path, "stop")
+    result = _cli(tmp_path, "stop", backends="usable")
     out = result.stdout + result.stderr
     assert "OverflowError" not in out
     assert "int too large" not in out
     assert "Traceback" not in out
-    # The exit code of `stop` is FIX-1's lane (FIX-1-T2 owns it); only non-crash is pinned here.
+    # With both backends supplied there is no environment fault left, so `stop`'s own exit code is
+    # the only variable -- and it belongs to FIX-1's lane (FIX-1-T2 owns it), so only the absence of
+    # an environment failure (2) and of a crash is pinned here.
     assert result.returncode in (0, 1), out
     # Whatever `stop` chose to do, it must not have written a partially-normalized document.
     assert json.loads(state_file.read_text())["play_pid"] in (None, JUNK_PID)
@@ -410,3 +503,92 @@ def test_a_failed_replace_cleans_up_its_temp_file(state_path, monkeypatch):
         blocker.rmdir()
         state_path.write_text(before)
     assert json.loads(state_path.read_text())["play_pid"] == 777
+
+
+# --------------------------------------------------------------------------- A-127
+# `ensure_dirs()` used a bare `mkdir(mode=0o700, exist_ok=True)`, so a read-only `ghostdeck status`
+# died with a bare errno when the parent did not exist or when the path existed as a *file*.
+
+
+def test_a_missing_home_tree_is_created_not_raised_on(tmp_path, monkeypatch):
+    """`parents=True`: neither `~` nor `~/.ghostdeck` need to exist yet."""
+    nested = tmp_path / "does" / "not" / "exist" / ".ghostdeck"
+    monkeypatch.setattr(state, "HOME", nested)
+    monkeypatch.setattr(state, "STATE_PATH", nested / "state.json")
+    monkeypatch.setattr(state, "PLUGIN_DIR", nested / "plugins")
+    monkeypatch.setattr(state, "BIN_DIR", nested / "bin")
+    assert state.load()["vhid"]["status"] == "down"
+    for directory in (nested, nested / "plugins", nested / "bin"):
+        assert directory.is_dir(), directory
+
+
+def test_a_state_directory_that_is_a_file_is_named_not_a_bare_errno(state_path):
+    """`exist_ok=True` still raises FileExistsError for a file, which reached the user as a
+    traceback out of a read-only command."""
+    state.HOME.parent.mkdir(parents=True, exist_ok=True)
+    state.HOME.write_text("not a directory\n")
+    with pytest.raises(RuntimeError, match="exists and is not a directory"):
+        state.load()
+    assert state.HOME.read_text() == "not a directory\n", "the foreign file was modified"
+
+
+def test_the_named_error_is_not_an_errno_type(state_path):
+    """It must be the explanatory RuntimeError, not the OSError the user used to see."""
+    state.HOME.parent.mkdir(parents=True, exist_ok=True)
+    state.HOME.write_text("x\n")
+    with pytest.raises(RuntimeError) as excinfo:
+        state.load()
+    assert not isinstance(excinfo.value, OSError)
+    assert str(state.HOME) in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- A-107
+# `load()` materialises both shapes from the nested record, so after any load both keys exist and
+# `_normalized()` -- flat key for the pid, nested one for the flags -- could not tell which side the
+# caller had just written. `update(vhid={'pid': 4242})` and `update(vhid_iohid=True)` were silent
+# no-ops.
+
+
+def test_update_moves_both_spellings_of_a_pid(state_path):
+    state.save({"vhid_pid": 100, "vhid": {"pid": 100}})
+    state.update(vhid={"pid": 4242})
+    loaded = state.load()
+    assert loaded["vhid"]["pid"] == loaded["vhid_pid"] == 4242
+    assert json.loads(state_path.read_text())["vhid_pid"] == 4242
+
+
+def test_update_moves_both_spellings_of_each_flag(state_path):
+    state.save({"vhid_pid": 100, "vhid": {"pid": 100}})
+    for nested, flat, name in (
+        ({"iohid": True}, "vhid_iohid", "iohid"),
+        ({"visible": True}, "vhid_visible", "visible"),
+        ({"experimental": False}, "vhid_experimental", "experimental"),
+    ):
+        expected = nested[name]
+        state.update(vhid=nested)
+        loaded = state.load()
+        assert loaded["vhid"][name] is expected, (name, loaded["vhid"][name])
+        assert loaded[flat] is expected, (flat, loaded[flat])
+        # the flat alias is a spelling the CLI reads, so it must reach disk too
+        assert json.loads(state_path.read_text())[flat] is expected
+
+
+def test_update_moves_both_spellings_when_the_flat_alias_is_used(state_path):
+    """The reverse direction: a flat alias must not be dropped either."""
+    state.save({"vhid_pid": 100, "vhid": {"pid": 100, "iohid": False}})
+    state.update(vhid_iohid=True)
+    loaded = state.load()
+    assert loaded["vhid"]["iohid"] is True
+    assert loaded["vhid_iohid"] is True
+    assert json.loads(state_path.read_text())["vhid"]["iohid"] is True
+    state.update(vhid_pid=4242)
+    loaded = state.load()
+    assert loaded["vhid"]["pid"] == loaded["vhid_pid"] == 4242
+
+
+def test_a_named_field_in_a_section_wins_over_a_conflicting_flat_alias(state_path):
+    """Deterministic precedence, so the result cannot depend on dict ordering."""
+    state.update(vhid={"iohid": True}, vhid_iohid=False)
+    loaded = state.load()
+    assert loaded["vhid"]["iohid"] is True
+    assert loaded["vhid_iohid"] is True

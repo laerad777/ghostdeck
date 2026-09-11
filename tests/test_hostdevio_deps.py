@@ -528,3 +528,71 @@ def test_the_accepting_path_leaves_no_temp_files_behind(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert list(probe_root.iterdir()) == [], "the recipe leaked its member-probe directory"
+
+
+# --------------------------------------------------------------------------- A-108
+# The pyusb half of the A-004 hint could never reach the user: ADB-mode enumeration is only visible
+# through pyusb (`detect` -> `_adb_device` -> `_usb_find`), so with pyusb missing the post-switch
+# poll timed out and `enable_adb()` reported the hardware verdict "D200 did not enumerate through
+# ADB" while `missing_dependency()` already knew the real cause.
+
+
+class _FakeHidModule:
+    """Stands in for `hid` so the switch write happens without touching the attached deck."""
+
+    class _Device:
+        def open_path(self, path):
+            return None
+
+        def write(self, packet):
+            return len(packet)
+
+        def close(self):
+            return None
+
+    def device(self):
+        return _FakeHidModule._Device()
+
+
+def _drive_enable_adb(monkeypatch, *, usb_present: bool):
+    """Reach the post-switch poll with pyusb present or absent.
+
+    Only `_hid_iface0` and the hidapi device are faked. `detect()` is left as the real function, so
+    the verdict under test is the one the product actually computes from the real backend state.
+    """
+    monkeypatch.setattr(usb, "_importable", lambda name: name != "usb" or usb_present)
+    monkeypatch.setattr(usb, "_hid_iface0", lambda *, timeout: {"path": b"/dev/fake"})
+    monkeypatch.setattr(usb, "_hid_module", lambda: _FakeHidModule())
+
+
+def test_a_missing_pyusb_is_reported_as_a_package_not_an_unswitched_deck(monkeypatch):
+    _drive_enable_adb(monkeypatch, usb_present=False)
+    assert "pyusb" in (usb.missing_dependency() or ""), "precondition: pyusb is the missing backend"
+    with pytest.raises(usb.MissingDependency) as excinfo:
+        usb.enable_adb(timeout=0)
+    message = str(excinfo.value)
+    assert "pyusb" in message
+    assert "did not enumerate" not in message
+    assert "install" in message
+
+
+def test_the_hardware_verdict_is_still_reached_when_every_backend_works(monkeypatch):
+    """The other half: a deck that genuinely did not switch is still reported as one."""
+    _drive_enable_adb(monkeypatch, usb_present=True)
+    assert usb.missing_dependency() is None, "precondition: both backends import"
+    with pytest.raises(RuntimeError) as excinfo:
+        usb.enable_adb(timeout=0)
+    assert isinstance(excinfo.value, usb.MissingDependency) is False
+    assert "did not enumerate through ADB" in str(excinfo.value)
+
+
+def test_the_missing_backend_is_reported_before_the_switch_poll_is_spent(monkeypatch):
+    """A missing backend must not cost the caller the whole readiness timeout first."""
+    _drive_enable_adb(monkeypatch, usb_present=False)
+    polls = []
+    monkeypatch.setattr(usb, "detect", lambda: polls.append(1) or {"mode": "none"})
+    with pytest.raises(usb.MissingDependency):
+        usb.enable_adb(timeout=5)
+    # Exactly one call: `enable_adb`'s own pre-switch detection. Zero poll iterations, so the
+    # 5s readiness timeout was not spent proving something that could never succeed.
+    assert polls == [1], f"the post-switch poll ran {len(polls) - 1} time(s) anyway"

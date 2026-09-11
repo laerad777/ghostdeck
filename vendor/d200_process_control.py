@@ -11,6 +11,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -156,12 +157,18 @@ def _process_start_time(pid):
     * ``(None, None)`` -- ps ran; there is no such process (dead, or recycled away).
     * ``(None, reason)`` -- ps itself could not answer, so identity is undeterminable.
 
-    ``LC_ALL=C`` keeps a recorded string from diverging from a later reading by
-    locale and ``-ww`` prevents truncation, exactly as ``src/ghostdeck/play.py``
-    proves ownership. Both identity users in this module -- the device-admission
-    lock holder and the published record's owner -- go through this one oracle, so
-    the two lanes agree on how identity is proven. An out-of-range pid cannot be
-    asked about, so it is reported as "no such process" rather than handed to ps.
+    ``LC_ALL=C`` and ``TZ=UTC`` keep a recorded string from diverging from a later
+    reading by locale or timezone, and ``-ww`` prevents truncation, exactly as
+    ``src/ghostdeck/play.py`` and ``src/ghostdeck/vhid.py`` prove ownership. Both
+    identity users in this module -- the device-admission lock holder and the
+    published record's owner -- go through this one oracle, so the two lanes agree
+    on how identity is proven. The zone pin is load-bearing, not cosmetic:
+    ``_owner_is_live_elsewhere`` compares this string against a recorded one, and
+    ``ps -o lstart=`` renders local time, so a zone change between the two readings
+    (a DST transition straddling a long play, or the operator changing the system
+    zone) would otherwise make the guard fail open and let a foreign publisher
+    overwrite a live owner's record. An out-of-range pid cannot be asked about, so
+    it is reported as "no such process" rather than handed to ps.
     """
     if type(pid) is not int or not 0 < pid <= PID_MAX:
         return None, None
@@ -170,7 +177,7 @@ def _process_start_time(pid):
             ["ps", "-o", "lstart=", "-ww", "-p", str(pid)],
             capture_output=True,
             text=True,
-            env=dict(os.environ, LC_ALL="C"),
+            env=dict(os.environ, LC_ALL="C", TZ="UTC"),
             timeout=_PS_TIMEOUT,
             check=False,
         )
@@ -190,6 +197,51 @@ def admission_lock_path():
     """The stable lock file under the state root, resolved at call time (so a test
     HOME or an operator's HOME is honoured rather than frozen at import)."""
     return Path.home() / ".ghostdeck" / ADMISSION_LOCK_NAME
+
+
+def _open_admission_lock(target):
+    """Open the admission lock without ever adopting a planted inode.
+
+    The lock lives at a fixed path under the state root, so whoever can create that
+    name would otherwise choose the inode this module truncates and writes: a
+    symlink at ``~/.ghostdeck/device-admission.lock`` used to turn every bridge
+    start into an overwrite of an arbitrary operator file (and a foreign flock used
+    to refuse the deck permanently). ``O_NOFOLLOW`` plus a regular-file check on
+    the descriptor this call itself opened makes that impossible.
+
+    A path that resolves to a symlink or to a non-regular inode is dropped and
+    retried once; if it is still not a regular file this bridge creates and owns,
+    admission is refused instead of taken over. Any other open failure is reported
+    as a refusal too, so callers see `DeviceAdmissionError` rather than a raw
+    traceback out of a startup path.
+    """
+    for attempt in (0, 1):
+        try:
+            descriptor = os.open(target, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        except OSError as error:
+            if error.errno == errno.ELOOP:  # the path is a symlink; drop it and retry once
+                if not attempt:
+                    try:
+                        os.unlink(target)
+                    except OSError:
+                        pass
+                    continue
+                raise DeviceAdmissionError(
+                    f"the device-admission lock {target} is not a regular file") from error
+            raise DeviceAdmissionError(
+                f"cannot open the device-admission lock {target}: {error}") from error
+        information = os.fstat(descriptor)
+        if stat.S_ISREG(information.st_mode) and information.st_uid == os.geteuid():
+            return descriptor
+        os.close(descriptor)
+        if attempt:
+            raise DeviceAdmissionError(
+                f"the device-admission lock {target} is not a regular file this user owns")
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+    raise DeviceAdmissionError(f"cannot open the device-admission lock {target}")
 
 
 def _lock_owner(descriptor):
@@ -335,14 +387,22 @@ def publish_video_state(state, *, claim=False, state_path=HOST_STATE):
     if claim and updated.get("phase") != "active":
         raise RuntimeError("playback claim must be active")
     kind = _state_kind(path)
-    # Anything that is not our regular file (symlink, fifo, directory) is never
-    # read through or written through; drop it and publish a fresh file.
+    # Anything that is not our regular file (symlink, fifo) is never read through
+    # or written through: drop it and publish a fresh file. A *directory* cannot
+    # be dropped by unlink at all, so the path stays unusable and nothing is
+    # published -- that is a genuine misconfiguration of a fixed /tmp path, not
+    # advisory noise, and reporting it as a success (which the previous revision
+    # did) silently disabled the ownership check below for that path as well.
     if kind == "foreign":
         try:
             path.unlink()
         except OSError as error:
             if claim:
                 raise RuntimeError("state path is not an owned regular file") from error
+            emit_diagnostic(sys.stderr, dict(
+                event="statePublicationSkipped", path=str(path),
+                reason="not an owned regular file",
+                errno=error.errno if type(error.errno) is int else None))
             return updated
         kind = "absent"
     if not claim:
@@ -352,9 +412,13 @@ def publish_video_state(state, *, claim=False, state_path=HOST_STATE):
                 return updated
     try:
         _write_private_file(path, json.dumps(updated) + "\n")
-    except OSError:
+    except OSError as error:
         if claim:
             raise
+        emit_diagnostic(sys.stderr, dict(
+            event="statePublicationSkipped", path=str(path),
+            reason="write failed",
+            errno=error.errno if type(error.errno) is int else None))
         return updated
     _record_owner(path, updated)
     return updated
@@ -416,7 +480,7 @@ def managed_device_admission(*, state_path=HOST_STATE, lock_path=None):
     """
     target = Path(lock_path) if lock_path is not None else admission_lock_path()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(target, os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = _open_admission_lock(target)
     try:
         os.fchmod(descriptor, 0o600)
         try:

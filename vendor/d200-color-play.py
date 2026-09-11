@@ -97,8 +97,18 @@ def ensure_runtime_modules():
 
 
 def probe_source_fps(source):
-    result = run("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                 "stream=avg_frame_rate,r_frame_rate", "-of", "json", source, capture=True)
+    try:
+        result = run("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                     "stream=avg_frame_rate,r_frame_rate", "-of", "json", source, capture=True)
+    except FileNotFoundError as error:
+        # C-004/C-122: ffprobe is a hard requirement of every run and its absence
+        # must be a diagnosis, not a traceback out of the player.
+        raise RuntimeError(f"ffprobe is not on PATH: install ffmpeg ({source})") from error
+    except subprocess.CalledProcessError as error:
+        status = "" if error.returncode is None else f" (exit {error.returncode})"
+        raise RuntimeError(f"ffprobe could not read {source}{status}") from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"ffprobe timed out reading {source}") from error
     try:
         stream = (json.loads(result.stdout).get("streams") or [{}])[0]
     except json.JSONDecodeError:
@@ -739,6 +749,17 @@ def cli():
         main()
     except (KeyboardInterrupt, InterruptedError):
         raise SystemExit(130) from None
+    except SystemExit:
+        raise
+    except Exception as error:
+        # C-122: `main()` has a `finally` but no handler, so a failing dependency
+        # (a present-but-broken ffprobe, a bad source, a rejected video OPEN) used to
+        # reach the user as a raw traceback. One bounded line names the failure and
+        # the exit status stays non-zero; the `finally` cleanup has already run.
+        detail = " ".join(str(error).split())[:300]
+        print(f"{type(error).__name__}: {detail}" if detail else type(error).__name__,
+              file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

@@ -189,16 +189,24 @@ def test_quit_never_signals_a_pid_it_cannot_prove_is_ours(home):
 
 
 def test_quit_does_not_signal_a_pid_whose_recorded_identity_differs(home):
+    """A sidecar mismatch must never signal, and must not discard an unaccounted-for live process.
+
+    The contract changed with A-145. It used to answer "not ours" from the mismatch alone, which
+    cleared the record and exited 0 while leaving a live process nobody could reach again. A
+    mismatch is not proof (the sidecar can be stale), so the honest answer is "cannot verify":
+    nothing is signalled and the record that is the only handle on the process is kept.
+    """
     victim = _sleep()
     other = _sleep()
     try:
         vhid._write_identity({"pid": other.pid, "lstart": "Thu Jan  1 00:00:00 1970"})
         _seed_vhid(victim.pid)
-        assert vhid.quit()["status"] == "down"
+        with pytest.raises(RuntimeError, match="cannot verify"):
+            vhid.quit()
         assert victim.poll() is None
         assert other.poll() is None
-        assert state.load()["vhid_pid"] is None
-        assert not vhid._identity_path().exists()
+        assert state.load()["vhid_pid"] == victim.pid
+        assert vhid._identity_path().exists()
     finally:
         _kill(victim, other)
 
@@ -331,3 +339,92 @@ def test_is_up_agrees_with_status(home):
     assert vhid.is_up() is False
     vhid._record_identity(me)
     assert vhid.is_up() is True
+
+
+# --------------------------------------------------------------------------- A-145
+# A sidecar naming a DIFFERENT pid made `_keeper_identity` answer False without ever probing the
+# state pid, so a read-only `status()` erased vhid_pid and the sidecar of a LIVE keeper that nothing
+# then signalled, and `quit()` took the identical branch and left the keeper unreachable.
+
+
+def test_a_stale_sidecar_cannot_erase_a_live_keepers_record(home):
+    """A-145 acceptance: state names a live pid, the sidecar names another one."""
+    keeper = _sleep()
+    other = _sleep()
+    try:
+        _seed_vhid(keeper.pid)
+        vhid._write_identity({"pid": other.pid, "lstart": "Thu Jan  1 00:00:00 1970"})
+        record = vhid.status()
+        assert record["status"] == "down"
+        assert record["pid"] == keeper.pid
+        assert "different pid" in (record.get("unverified") or "")
+        # The whole point: the record is the only handle on a process whose fate is unknown.
+        assert state.load()["vhid_pid"] == keeper.pid, "a live keeper's record was erased"
+        assert vhid._identity_path().exists()
+        assert keeper.poll() is None and other.poll() is None
+    finally:
+        _kill(keeper, other)
+
+
+def test_quit_refuses_to_discard_a_live_pid_behind_a_stale_sidecar(home):
+    """Same state, on the mutating path: refuse and report rather than pretend to have cleaned up."""
+    keeper = _sleep()
+    other = _sleep()
+    try:
+        _seed_vhid(keeper.pid)
+        vhid._write_identity({"pid": other.pid, "lstart": "Thu Jan  1 00:00:00 1970"})
+        with pytest.raises(RuntimeError, match="cannot verify"):
+            vhid.quit()
+        assert keeper.poll() is None, "the keeper was signalled on a sidecar mismatch alone"
+        assert other.poll() is None
+        assert state.load()["vhid_pid"] == keeper.pid
+    finally:
+        _kill(keeper, other)
+
+
+def test_a_sidecar_mismatch_is_still_discarded_when_that_pid_is_dead(home):
+    """The bound on the change: a dead pid behind a mismatched sidecar is still classifiable.
+
+    `_keeper_identity` may only answer False when `ps` ran and reports no such process -- otherwise
+    the A-145 fix would leak records forever.
+    """
+    dead = _sleep()
+    other = _sleep()
+    pid = dead.pid
+    _kill(dead)
+    try:
+        _seed_vhid(pid)
+        vhid._write_identity({"pid": other.pid, "lstart": "Thu Jan  1 00:00:00 1970"})
+        assert vhid._keeper_identity(pid)[0] is False
+        assert vhid.quit()["status"] == "down"
+        assert state.load()["vhid_pid"] is None
+    finally:
+        _kill(other)
+
+
+def test_the_recorder_removes_a_stale_sidecar_it_cannot_replace(home, monkeypatch):
+    """When the start time cannot be read, the sidecar must not be left naming another process."""
+    me = os.getpid()
+    vhid._record_identity(me)
+    assert vhid._load_identity()["pid"] == me
+    monkeypatch.setattr(vhid, "_probe_start_time", lambda pid: (None, "ps could not be run"))
+    vhid._record_identity(os.getppid())
+    assert vhid._load_identity() is None, "a sidecar naming another pid was left behind"
+
+
+# --------------------------------------------------------------------------- A-136
+
+def test_the_report_descriptor_has_exactly_one_definition():
+    """Both virtual-HID bindings must hand the same bytes to IOHIDUserDeviceCreate (A-136).
+
+    It was copied verbatim into `vhid.py` and `iohid.py` with nothing tying the copies together; an
+    edit to one side would have made only the fallback binding wrong.
+    """
+    from ghostdeck import iohid
+
+    assert vhid._DESCRIPTOR is iohid.REPORT_DESCRIPTOR
+    assert len(vhid._DESCRIPTOR) == 25
+    assert vhid._DESCRIPTOR.hex() == "0600ff0901a101150026ff00750895400901810209019102c0"
+    assert "0x95, 0x40" not in Path(vhid.__file__).read_text(encoding="utf-8"), (
+        "vhid.py carries a second copy of the descriptor again"
+    )

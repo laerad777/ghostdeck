@@ -353,9 +353,17 @@ def test_status_reports_playing_no_for_a_recycled_pid(tmp_path):
     try:
         time.sleep(0.2)
         result, calls, _ = _cli(HAPPY_ADB, tmp_path, "status", pre_state={"play_pid": victim.pid})
-        assert result.returncode == 0, result.stderr
+        # The two properties this test exists for: an unclassifiable pid is not a running player, and
+        # `status` is a read-only command that never touches the device.
         assert "playing=no" in result.stdout, result.stdout
         assert len(calls) == 0, f"status contacted the device through adb: {calls}"
+        # The exit code follows the environment, not the CLI's own text (A-102): 2 when this
+        # interpreter has no usable backend, otherwise 0. Pinning it to 0 would make the suite depend
+        # on the ambient interpreter; deriving it from the CLI's output would be vacuous.
+        from ghostdeck import usb
+
+        expected = 2 if usb.missing_dependency() else 0
+        assert result.returncode == expected, (result.returncode, expected, result.stderr)
     finally:
         victim.kill()
         victim.wait()
@@ -473,17 +481,19 @@ def test_stranger_recycling_a_recorded_pid_is_not_signalable(tmp_path):
         second = _ours()
         try:
             time.sleep(0.4)
-            lstart = subprocess.run(
-                ["ps", "-o", "lstart=", "-ww", "-p", str(second.pid)],
-                capture_output=True,
-                text=True,
-                env=dict(os.environ, LC_ALL="C"),
-            ).stdout.strip()
-            if lstart == recorded["lstart"]:  # cannot distinguish; skip rather than assert wrongly
-                pytest.skip("lstart collided at one-second resolution")
+            # A-144: read the start time with the PRODUCT's own oracle, not a second hand-rolled `ps`
+            # call. `recorded` came from `_probe_start_time`, which pins `LC_ALL=C, TZ=UTC`; a local
+            # read that pins only the locale returns a LOCAL-time string, so under a non-UTC ambient
+            # zone the two sides always differ and this collision guard could never fire. The test
+            # then fell through to `assert _alive(second)`, which in a genuine one-second collision
+            # is exactly the state the product is entitled to produce - a spurious red that the
+            # "any red test is a real regression" rule would read as a product defect.
             monkey = play.gdstate.HOME
             play.gdstate.HOME = home / ".ghostdeck"
             try:
+                lstart = play._probe_start_time(second.pid)[0]
+                if lstart is not None and lstart == recorded["lstart"]:
+                    pytest.skip("lstart collided at one-second resolution")
                 # HOME is patched BEFORE any identity call, so the operator's real
                 # ~/.ghostdeck/play.pid is never read by this test.
                 assert play._load_identity() == recorded
@@ -747,3 +757,160 @@ def test_stop_reports_both_the_identity_and_a_failed_cleanup(tmp_path):
     finally:
         victim.kill()
         victim.wait()
+
+
+# --- A-116: a wedged adb server must not hang the recovery command -------------
+
+
+def _wedged_adb(tmp_path: Path, *, hang_listing: bool = False) -> Path:
+    """A PATH dir whose `adb` answers `devices -l` and then never returns from a `shell` call.
+
+    `devices -l` answering normally is exactly what used to let `stop()` reach the unbounded call.
+    The hang is `exec sleep 30`, so the shell is replaced rather than left with an orphaned child,
+    and `subprocess.run`'s timeout kills the blocking process itself.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "adb"
+    shell_branch = (
+        'case "$*" in\n  *"ls /tmp/ghostdeck"*) exec sleep 30 ;;\nesac\nexit 0\n'
+        if hang_listing
+        else "exec sleep 30\n"
+    )
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in\n  devices) printf \'{DEVICE_LINE}\'; exit 0 ;;\nesac\n' + shell_branch,
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return bin_dir
+
+
+def test_cleanup_device_times_out_on_a_wedged_adb_server(tmp_path, monkeypatch):
+    """A-116: `subprocess.run` without a timeout blocked `stop` forever with the deck still hijacked.
+
+    `_ADB_TIMEOUT` is shortened so the assertion can be about the *shape* of the failure (a named
+    timeout, not a hang) without the test itself waiting the production 30s.
+    """
+    from ghostdeck import play
+
+    bin_dir = _wedged_adb(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin:/bin")
+    monkeypatch.setattr(play, "_ADB_TIMEOUT", 3.0)
+
+    start = time.monotonic()
+    with pytest.raises(RuntimeError) as excinfo:
+        play._cleanup_device()
+    elapsed = time.monotonic() - start
+
+    message = str(excinfo.value)
+    assert "timed out" in message, message
+    assert "setprop ctl.stop zkswe" in message, message
+    assert elapsed < 10, f"the timeout did not bound the call: {elapsed:.1f}s"
+
+
+def test_cleanup_device_tolerates_a_listing_that_times_out(tmp_path, monkeypatch):
+    """The listing is informational, so its timeout must be as non-fatal as its exit code (A-116).
+
+    Every mutating call succeeds here; only the trailing `ls` hangs. `stop()` must still report the
+    deck as restored rather than turning a successful restore into a failure.
+    """
+    from ghostdeck import play
+
+    bin_dir = _wedged_adb(tmp_path, hang_listing=True)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin:/bin")
+    monkeypatch.setattr(play, "_ADB_TIMEOUT", 3.0)
+
+    start = time.monotonic()
+    play._cleanup_device()  # must not raise
+    elapsed = time.monotonic() - start
+    assert elapsed < 10, f"the listing timeout did not bound the call: {elapsed:.1f}s"
+
+
+# --- A-137: the cleanup must target the deck, not the first device listed ------
+
+
+# A phone listed BEFORE the deck. `serial_from_devices()` returned the first match, which is how
+# every mutating cleanup command went to the phone while `stop` exited 0.
+TWO_DEVICE_ADB = _adb(f"""case "$1" in
+  devices) printf 'List of devices attached\\nPHONE123\\tdevice product:shiba model:Pixel_8 device:shiba transport_id:1\\n{SERIAL}\\tdevice product:d200 model:D200 device:d200 transport_id:2\\n'; exit 0 ;;
+esac
+exit 0
+""")
+
+# Only a phone: no attached device identifies as the deck, so the command must refuse.
+PHONE_ONLY_ADB = _adb("""case "$1" in
+  devices) printf 'List of devices attached\\nPHONE123\\tdevice product:shiba model:Pixel_8 device:shiba transport_id:1\\n'; exit 0 ;;
+esac
+exit 0
+""")
+
+
+def test_stop_targets_the_deck_when_a_phone_is_listed_first(tmp_path):
+    """A-137: the deck is chosen by its own identity fields, not by its position in `devices -l`."""
+    result, calls, _ = _cli(TWO_DEVICE_ADB, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert calls == STOP_ARGV, calls
+    assert not any("PHONE123" in call for call in calls), f"the phone was mutated: {calls}"
+
+
+def test_stop_refuses_when_no_attached_device_is_the_deck(tmp_path):
+    """With only a phone attached the deck is absent, and the command must say so rather than guess."""
+    result, calls, _ = _cli(PHONE_ONLY_ADB, tmp_path)
+    assert result.returncode != 0, result.stdout
+    assert "no ADB device" in result.stderr, result.stderr
+    assert "D200" in result.stderr, result.stderr  # names the deck as the missing device
+    assert calls == [DEVICES_ARGV], f"nothing may be sent to an unidentified device: {calls}"
+    assert not any("PHONE123" in call for call in calls), calls
+
+
+# --- A-126: the session record must outlive the deck's effects ----------------
+
+
+def test_stop_keeps_the_player_record_when_the_deck_step_fails(tmp_path):
+    """A-126: `stop()` erased the pid and the sidecar before touching the device, so a failed stop
+    left a hijacked deck and nothing on disk recording that a player had ever run.
+
+    The player was stopped (it is ours, and identity is determinable) but the deck was not restored,
+    so the record that describes the session must still be there for the user and for a later run.
+    """
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        recorded = _record(ours.pid, tmp_path / "home")
+        result, calls, home = _cli(
+            NO_DEVICE_ADB,
+            tmp_path,
+            "stop",
+            pre_state={"play_pid": ours.pid},
+            sidecar=recorded,
+        )
+        assert result.returncode != 0, result.stdout
+        assert "no ADB device" in result.stderr, result.stderr
+        assert not _alive(ours), "our own player must still be stopped"
+        saved = json.loads((home / ".ghostdeck" / "state.json").read_text())
+        assert saved["play_pid"] == ours.pid, "the session record was destroyed before the deck came back"
+        assert (home / ".ghostdeck" / "play.pid").is_file(), "the sidecar was destroyed"
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+        ours.wait()
+
+
+def test_stop_erases_the_record_once_the_deck_is_restored(tmp_path):
+    """The other side of A-126: a successful stop still leaves no stale session behind."""
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        recorded = _record(ours.pid, tmp_path / "home")
+        result, calls, home = _cli(
+            HAPPY_ADB, tmp_path, "stop", pre_state={"play_pid": ours.pid}, sidecar=recorded
+        )
+        assert result.returncode == 0, result.stderr
+        assert calls == STOP_ARGV, calls
+        assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
+        assert not (home / ".ghostdeck" / "play.pid").exists()
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+        ours.wait()

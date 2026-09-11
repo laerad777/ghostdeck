@@ -31,6 +31,19 @@ DENY = [
     ["-s", "S", "shell", "/tmp/ghostdeck-x\treboot"],
     ["-s", "S", "shell", "/tmp/ghostdeck-x\rreboot"],
     ["-s", "S", "shell", "/tmp/ghostdeck-x", "\n", "reboot"],
+    # A-135: the whitespace codepoints `_UNSAFE` does not name. `str.split()` is Unicode-aware, so
+    # these were silently rewritten into an allowlisted command while adb forwarded the raw bytes.
+    ["-s", "S", "shell", "/tmp/ghostdeck-x\u00a0reboot"],
+    ["-s", "S", "shell", "/tmp/ghostdeck-x\u2028reboot"],
+    ["-s", "S", "shell", "/tmp/ghostdeck-x\u3000reboot"],
+    ["-s", "S", "shell", "/tmp/ghostdeck-x\x0breboot"],
+    ["-s", "S", "shell", "/tmp/ghostdeck-x\x0creboot"],
+    ["-s", "S", "shell", "/tmp/ghostdeck-x\x1creboot"],
+    ["-s", "S", "shell", "getprop\u00a0sys.usb.config"],
+    # Normalisation that merely *adds* whitespace is the same defect: the allowlist would judge a
+    # different string than the one forwarded.
+    ["-s", "S", "shell", "rm -f  /tmp/ghostdeck-*"],
+    ["-s", "S", "shell", " rm -f /tmp/ghostdeck-*"],
     # Quoting, substitution and redirection inside a token.
     ["-s", "S", "shell", "/tmp/ghostdeck-x", '"reboot"'],
     ["-s", "S", "shell", "/tmp/ghostdeck-x", "'reboot'"],
@@ -117,3 +130,63 @@ def test_denied_argv_never_reaches_adb(monkeypatch):
         with pytest.raises(adb.AdbDenied):
             adb.run(argv)
     assert calls == []
+
+
+# --- A-135: the allowlist must judge exactly the bytes adb forwards --------------------------
+
+UNICODE_WHITESPACE = [
+    "\u00a0",  # no-break space
+    "\u1680",
+    "\u2000",
+    "\u2028",  # line separator
+    "\u2029",
+    "\u202f",
+    "\u205f",
+    "\u3000",  # ideographic space
+    "\x0b",  # vertical tab
+    "\x0c",  # form feed
+    "\x1c",  # file/group/record/unit separators
+    "\x1d",
+    "\x1e",
+    "\x1f",
+]
+
+
+@pytest.mark.parametrize("space", UNICODE_WHITESPACE, ids=lambda c: f"U+{ord(c):04X}")
+def test_no_unicode_whitespace_smuggles_a_second_token(space):
+    """A-135: 14 whitespace codepoints are not named by `_UNSAFE` but *are* split on by
+    `str.split()`, so the allowlist used to approve `getprop\xa0sys.usb.config` (judged as the
+    allowlisted `getprop sys.usb.config`) while adb forwarded the U+00A0 form."""
+    assert adb.allowed(["-s", "S", "shell", f"/tmp/ghostdeck-x{space}reboot"]) is False
+    assert adb.allowed(["-s", "S", "shell", f"getprop{space}sys.usb.config"]) is False
+    assert adb.allowed(["-s", "S", "shell", f"rm -f{space}{space}/tmp/ghostdeck-*"]) is False
+
+
+def test_the_allowlist_judges_the_string_that_is_forwarded():
+    """The invariant behind A-135, stated directly: normalising must be a no-op for anything the
+    allowlist approves, so a permitted argv can never differ from the bytes adb receives."""
+    for argv in ALLOW:
+        parts = argv[3:]
+        if argv[:3] != ["-s", "S", "shell"] or not parts:
+            continue
+        forwarded = " ".join(parts)
+        assert forwarded == " ".join(forwarded.split()), argv
+
+
+def test_multi_token_single_parts_stay_allowed():
+    """The precise rule is on the raw join, not on per-part token count.
+
+    A per-part `len(part.split()) != 1` rule closes A-135 too, but it would also reject the
+    multi-token single parts this product really sends -- `rm -f /tmp/ghostdeck-*`,
+    `ls /tmp/ghostdeck*`, `getprop sys.usb.config` -- so it must not be the fix.
+    """
+    for command in (
+        "rm -f /tmp/ghostdeck-*",
+        "ls /tmp/ghostdeck*",
+        "getprop sys.usb.config",
+        "chmod 700 /tmp/ghostdeck-x",
+        "killall /tmp/ghostdeck-x",
+        "setprop ctl.start zkswe",
+    ):
+        assert len(command.split()) > 1, command
+        assert adb.allowed(["-s", "S", "shell", command]) is True, command

@@ -17,6 +17,7 @@ import contextlib
 import errno
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -433,3 +434,67 @@ def test_a_failed_restart_is_reported_without_a_traceback(scratch, monkeypatch):
     assert "could not be restarted" in str(excinfo.value)
     assert "cannot bind" in str(excinfo.value)
     assert spawned == []
+
+
+# --- A-153: two of the H3 guards were not pinned by any test -------------------------------
+
+
+def test_usb_reports_adb_requires_the_matching_serial(scratch, monkeypatch):
+    """A-153: another ADB device on the bus is not proof that OUR deck is the ADB device.
+
+    Dropping the serial equality made the host restart the shared adb server for any ADB device --
+    a phone on the same bus -- and left the whole suite green.
+    """
+    sock = scratch / "b.sock"
+    restarts: list = []
+    _usb_says(monkeypatch, "adb", restarts, serial="SOME-OTHER-DEVICE")
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, endpoint=None)
+    monkeypatch.setattr(studio, "_device_ready", lambda serial, *, timeout: False)
+    assert studio._usb_reports_adb("SERIAL") is False
+    with pytest.raises(RuntimeError):
+        studio._ensure_bridge()
+    assert restarts == [], "the shared adb server was restarted for a different device"
+    # The same reading is positive only for the serial that was asked about.
+    _usb_says(monkeypatch, "adb", restarts, serial="SERIAL")
+    assert studio._usb_reports_adb("SERIAL") is True
+
+
+def test_restart_server_names_a_failing_command(monkeypatch):
+    """A-153: the error-reporting contract of the new host-daemon call, pinned directly.
+
+    Deleting the return-code check made the whole "report what was tried" contract disappear while
+    the suite stayed green, so it is asserted on the exception text, not on a status code.
+    """
+    monkeypatch.setattr(studio.adb, "adb_bin", lambda: "/nonexistent/adb")
+    seen = []
+
+    def fake_run(argv, **_kwargs):
+        seen.append(argv[-1])
+        if argv[-1] == "start-server":
+            return subprocess.CompletedProcess(argv, 1, "", "cannot bind to 127.0.0.1:5037\n")
+        return subprocess.CompletedProcess(argv, 0, "killed\n", "")
+
+    monkeypatch.setattr(studio.adb.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError) as excinfo:
+        studio.adb.restart_server()
+    message = str(excinfo.value)
+    assert "start-server" in message
+    assert "cannot bind" in message
+    assert "status 1" in message
+    assert seen == ["kill-server", "start-server"]
+
+
+def test_restart_server_succeeds_quietly_when_both_commands_exit_zero(monkeypatch):
+    """The accept side of the same contract, so the check is not merely 'always raise'."""
+    monkeypatch.setattr(studio.adb, "adb_bin", lambda: "/nonexistent/adb")
+    seen = []
+
+    def fake_run(argv, **_kwargs):
+        seen.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(studio.adb.subprocess, "run", fake_run)
+    assert studio.adb.restart_server() is None
+    assert seen == ["kill-server", "start-server"]

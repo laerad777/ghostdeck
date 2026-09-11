@@ -54,22 +54,40 @@ def copy_exists() -> bool:
 
 
 def _copy_pids() -> list[int]:
-    """PIDs whose live command line is this copy's own executable.
+    """PIDs whose live command line IS this copy's own executable, as argv[0].
 
-    Identity comes from the running process, so the official Studio.app and a
-    recycled pid are never matched. `-ww` disables ps truncation of the argv.
+    The marker must be the whole argv[0], not a substring of the command line: a stranger that
+    merely mentions the path (an editor, a `grep`, a `python -c` carrier) is not our copy. That
+    difference is the C-103 defect class, which `play.py` had already closed; `studio.py` had not
+    been brought along, so `running()` false-positived and `_quit_copy()` SIGTERM'd a stranger
+    (A-105).
+
+    Matching argv[0] exactly is also what keeps the official /Applications/Ulanzi Studio.app and a
+    recycled pid safe: neither has this copy's resolved executable as its argv[0].
+
+    The marker contains spaces ("Ulanzi Studio ADB.app"), so this cannot be a token comparison:
+    argv[0] is the marker exactly, or the marker followed by its own arguments. `-ww` genuinely
+    prevents ps truncation here and `LC_ALL=C` keeps the output stable, which the previous argv
+    (`ps -axo pid=,command=`) did not deliver despite this docstring claiming it.
     """
     if not COPY.is_dir() or not EXE.is_file():
         return []
     marker = str(EXE.resolve())
     try:
-        listed = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
-    except subprocess.CalledProcessError:
+        listed = subprocess.check_output(
+            ["ps", "-ww", "-axo", "pid=,command="],
+            text=True,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+    except (subprocess.CalledProcessError, OSError):
         return []
     pids = []
     for line in listed.splitlines():
         pid, _, command = line.strip().partition(" ")
-        if pid.isdigit() and marker in command:
+        if not pid.isdigit():
+            continue
+        command = command.strip()
+        if command == marker or command.startswith(f"{marker} "):
             pids.append(int(pid))
     return pids
 

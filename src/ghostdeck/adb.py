@@ -76,6 +76,19 @@ def validate(argv: Sequence[str]) -> None:
                 raise AdbDenied("composite gadget hid+adb is not allowed")
             command = " ".join(parts).strip()
             command = " ".join(command.split())
+            # The allowlist must judge exactly the bytes adb will forward. `str.split()` is
+            # Unicode-aware, so re-tokenising silently rewrites 14 whitespace codepoints that
+            # `_UNSAFE` does not name (U+00A0, U+2028, U+3000, \x0b, \x0c, \x1c-\x1f, ...):
+            # `getprop\xa0sys.usb.config` matched the allowlisted `getprop sys.usb.config` while
+            # the device shell received the U+00A0 form instead (A-135). Comparing the raw join
+            # against the normalised command closes every such codepoint at once, and cannot
+            # drift from Python's own definition of whitespace the way a charset can.
+            #
+            # A per-part `len(part.split()) != 1` rule would close it too, but it would also
+            # reject the legitimate multi-token single parts this host really sends
+            # (`rm -f /tmp/ghostdeck-*`, `ls /tmp/ghostdeck*`, `getprop sys.usb.config`).
+            if " ".join(parts) != command:
+                raise AdbDenied("shell argument contains whitespace")
             if not command:
                 raise AdbDenied("empty shell command")
             if not _shell_allowed(command):

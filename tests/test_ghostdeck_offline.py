@@ -14,6 +14,62 @@ SRC = ROOT / "src"
 PACKAGE = SRC / "ghostdeck"
 MARKER = "02C47" + "A"
 
+# A-102 made an unusable Python environment distinguishable from an absent deck, so the exit code of
+# `detect`/`status` is no longer a fixed value. These tests assert the REASON the command reported
+# and let that reason entail the code. A widened `returncode in (0, 1, 2)` would accept every outcome
+# and hide exactly the regression class this operation has been removing.
+BACKEND_HINT = "is not installed (pip install"
+
+
+def _backend_hint():
+    """The dependency hint THIS interpreter should produce, asked of `usb` directly.
+
+    Deriving the expectation from the environment rather than from the CLI's own output is what keeps
+    these assertions non-vacuous. A test that only checked "the exit code matches the text" would still
+    pass if the CLI stopped mentioning the missing backend altogether and fell back to blaming the
+    deck - which is precisely the A-102 regression. This probe is independent of the code under test.
+    """
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    from ghostdeck import usb
+
+    return usb.missing_dependency()
+
+
+def _assert_detect_outcome(result) -> None:
+    """Assert `detect` reported the right reason for THIS environment, and the code that follows."""
+    hint = _backend_hint()
+    text = result.stdout + result.stderr
+    assert "Traceback" not in text, text
+    if hint:
+        # A-102: the Python environment is unusable. `detect` must name the package, must NOT present
+        # a hardware verdict, and must not share "no deck"'s exit code.
+        assert hint in result.stderr, (hint, result.stderr)
+        assert result.returncode == 2, (result.returncode, text)
+        assert "no device" not in text, text
+        return
+    # Every backend is usable here, so the deck is either found or genuinely absent.
+    if result.returncode == 0:
+        assert "mode=" in result.stdout, result.stdout
+    else:
+        assert result.returncode == 1, (result.returncode, text)
+        assert "no device" in result.stderr, (result.returncode, text)
+
+
+def _assert_status_outcome(result) -> None:
+    """Assert `status` printed its line and did not turn an environment failure into a verdict."""
+    hint = _backend_hint()
+    text = result.stdout + result.stderr
+    assert "Traceback" not in text, text
+    assert "release_gate=" in result.stdout, result.stdout
+    if hint:
+        assert hint in result.stderr, (hint, result.stderr)
+        assert result.returncode == 2, (result.returncode, text)
+        assert "usb=unknown" in result.stdout, result.stdout
+        assert "usb=none" not in result.stdout, result.stdout
+        return
+    assert result.returncode == 0, (result.returncode, text)
+
 
 def _env(home):
     env = dict(os.environ)
@@ -102,11 +158,14 @@ def test_allowlist_rejects_illegal_shell():
 
 def test_status_and_detect_without_device_do_not_crash():
     detect = _run("detect")
-    assert detect.returncode in (0, 1)
     status = _run("status")
-    assert status.returncode in (0, 1)
     combined = detect.stdout + detect.stderr + status.stdout + status.stderr
     assert "Traceback" not in combined
+    # The property that motivated this test is "no crash", and its specific form is "a reason was
+    # reported and the exit code follows from that reason" - not a fixed code.
+    _assert_detect_outcome(detect)
+    _assert_status_outcome(status)
+    assert detect.stdout or detect.stderr, "`detect` said nothing at all"
 
 def test_readmes_describe_hidshim_copy():
     en = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -124,7 +183,10 @@ def test_readmes_describe_hidshim_copy():
 
 def test_status_stdout_release_gate_offline_not_visible():
     status = _run("status")
-    assert status.returncode in (0, 1)
+    # This test is about the CONTENT of the status line, which is printed whatever the USB verdict is.
+    # The exit code is asserted against the reason rather than pinned, so the test does not depend on
+    # whether an optional backend happens to be installed in the interpreter running the suite.
+    _assert_status_outcome(status)
     out = status.stdout
     assert "release_gate=" in out
     assert "visible=yes" not in out

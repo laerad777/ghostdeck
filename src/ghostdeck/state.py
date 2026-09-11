@@ -39,9 +39,18 @@ def default_state() -> dict:
 
 
 def ensure_dirs() -> None:
-    HOME.mkdir(mode=0o700, exist_ok=True)
-    PLUGIN_DIR.mkdir(mode=0o700, exist_ok=True)
-    BIN_DIR.mkdir(mode=0o700, exist_ok=True)
+    """Create the state directories, naming a path that is unusable instead of a bare errno.
+
+    `parents=True` because `~` itself may not exist (a fresh temp HOME, a container), and the
+    explicit check because `exist_ok=True` still raises FileExistsError when the path exists as a
+    *file* -- a bare errno out of a read-only `ghostdeck status` (A-127).
+    """
+    for directory in (HOME, PLUGIN_DIR, BIN_DIR):
+        # Checked before mkdir: `exist_ok=True` raises FileExistsError for a path that exists as a
+        # *file*, so the explanatory message below would never be reached.
+        if directory.exists() and not directory.is_dir():
+            raise RuntimeError(f"{directory} exists and is not a directory; remove it")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
 def load() -> dict:
@@ -121,16 +130,45 @@ def save(data: dict) -> None:
         _write_state(data)
 
 
+# The vhid fields that exist in BOTH shapes -- the nested `vhid` record and a flat `vhid_<name>`
+# alias -- paired with the flat spelling each one mirrors.
+_VHID_ALIASES = (("pid", "vhid_pid"),) + tuple((name, "vhid_" + name) for name, _ in _VHID_FLAGS)
+
+
+def _apply_vhid_intent(data: dict, sections: dict) -> None:
+    """Write both spellings of every vhid field the caller asked to change (A-107).
+
+    `load()` materialises both shapes from the nested record, so after any load both keys are
+    present in `data` and `_normalized()` -- which prefers the flat key for the pid but the nested
+    one for the flags -- cannot tell which side the caller just wrote. The caller's intent is
+    therefore read from `sections` (the argument, not the loaded state) and both spellings are
+    written from it, so the two can never disagree. A nested section wins for the fields it names;
+    a flat alias still wins for fields the section did not mention.
+    """
+    record = data.get("vhid") if isinstance(data.get("vhid"), dict) else None
+    if record is None:
+        return
+    nested = sections.get("vhid") if isinstance(sections.get("vhid"), dict) else {}
+    for name, flat in _VHID_ALIASES:
+        if name in nested:
+            value = nested[name]
+        elif flat in sections:
+            value = sections[flat]
+        else:
+            continue
+        record[name] = value
+        data[flat] = value
+
+
 def update(**sections) -> dict:
     with locked():
         data = load()
         for key, value in sections.items():
             if isinstance(value, dict) and isinstance(data.get(key), dict):
-                merged = dict(data[key])
-                merged.update(value)
-                data[key] = merged
+                data[key] = {**data[key], **value}
             else:
                 data[key] = value
+        _apply_vhid_intent(data, sections)
         _write_state(data)
         return load()
 

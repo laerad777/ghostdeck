@@ -15,6 +15,17 @@ VENDOR_PLAY = Path(__file__).resolve().parents[2] / "vendor" / "d200-color-play.
 VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor"
 
 _PS_TIMEOUT = 5.0
+# A wedged adb server must not turn `stop` - the one documented recovery command - into a hang
+# (A-116). Every device call is bounded; the informational listing's timeout is tolerated exactly
+# like its non-zero exit code already is.
+_ADB_TIMEOUT = 30.0
+# A player that dies immediately (a bad source, a missing device-side tool) must not be reported as
+# a successful start (A-103). The window is a grace period, not a health check: it is long enough to
+# catch an interpreter that starts and exits, and short enough to stay invisible to the user.
+_PLAY_GRACE = 1.0
+# `adb devices -l` identifies the deck in its product/model/device fields (A-137), matched as whole
+# fields so `model:D200X` cannot be mistaken for the deck.
+_DECK_FIELDS = ("product:d200", "model:D200", "device:d200")
 
 
 _TOOL_HINTS = {
@@ -32,6 +43,46 @@ def _require_tools(source: str) -> None:
     for tool in tools:
         if shutil.which(tool) is None:
             raise RuntimeError(f"{tool} not on PATH: install it ({_TOOL_HINTS[tool]})")
+
+
+def _validate_source(source: str) -> None:
+    """Reject a source that is neither an existing file nor a URL before any device work (A-103).
+
+    SOURCE is handed straight to the player's argv, so a typo used to travel all the way to a
+    child process that died on its first read - and was still reported as a successful start.
+    """
+    if "://" in source:
+        return
+    if not Path(source).is_file():
+        raise RuntimeError(f"source is not a file and is not a URL: {source}")
+
+
+def _deck_serial() -> str | None:
+    """The serial of a device that identifies itself as the D200, or None (A-137).
+
+    `adb.serial_from_devices()` returns the FIRST device line, so with a phone also plugged in the
+    mutating cleanup commands went to the phone - `stop` even exited 0 - and the deck was never
+    restored. The target is chosen by the deck's own product/model/device fields instead of by
+    position. Returning None makes the caller refuse and name the deck as absent: an unidentified
+    device is never sent a firmware-adjacent command.
+
+    The serial's shape is left to `adb.run`'s own validation, which already gates every call: a
+    malformed serial raises there and nothing reaches the deck either way, so the rule is not
+    restated here.
+    """
+    try:
+        result = adb.run(["devices", "-l"], capture_output=True, text=True, timeout=_ADB_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"adb timed out after {_ADB_TIMEOUT:g}s: devices -l (is the adb server wedged?)"
+        ) from None
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        if not fields or line.startswith("List"):
+            continue
+        if any(field in _DECK_FIELDS for field in fields):
+            return fields[0]
+    return None
 
 
 def _identity_path() -> Path:
@@ -173,11 +224,30 @@ def _is_our_player(pid):
     return _player_identity(pid)[0]
 
 
-def _kill_play() -> None:
-    """Stop our own player. Raises when its fate cannot be determined (nothing is then erased)."""
+def _clear_play_records() -> None:
+    """Erase the stored pid and the identity sidecar together (A-126).
+
+    A-104: this is a single locked read-modify-write. The previous `load()`-then-`save()` left the
+    read outside the lock, so a concurrent writer's update that landed in between was discarded.
+
+    Called only once nothing can still act on the record, so the record that describes a session
+    outlives the session's own effects on the deck.
+    """
+    gdstate.update(play_pid=None)
+    _remove_identity()
+
+
+def _kill_play(*, keep_record: bool = False) -> None:
+    """Stop our own player. Raises when its fate cannot be determined (nothing is then erased).
+
+    `keep_record=True` leaves the pid and the sidecar in place after a determinable outcome so the
+    caller can erase them once its own work has succeeded (A-126); nothing is ever erased when the
+    identity is undeterminable, whatever the caller asks for.
+    """
     data = gdstate.load()
     pid = data.get("play_pid")
     if pid is None:
+        # No session is recorded, so an orphaned sidecar describes nothing and is just litter.
         _remove_identity()
         return
     identity, reason = _player_identity(pid)
@@ -188,19 +258,28 @@ def _kill_play() -> None:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
-    # Determinable either way, so the record is no longer meaningful: clear it with the pid.
-    data["play_pid"] = None
-    gdstate.save(data)
-    _remove_identity()
+    # Determinable either way, so the record is no longer meaningful. It is cleared here unless the
+    # caller still needs it to outlive its own later steps.
+    if not keep_record:
+        _clear_play_records()
 
 
 def start_play(source: str) -> None:
     _require_tools(source)
     adb.require_adb()
+    # Before any device work: an unusable SOURCE must fail cheaply and name the user's own input,
+    # not travel to a child process that dies on its first read (A-103).
+    _validate_source(source)
     gdstate.ensure_dirs()
     devicebuild.ensure()
     found = usb.detect()
     if found is None or found.get("mode") in (None, "none"):
+        # A missing backend is not a missing deck (A-102): `detect()` attaches the hint when it
+        # could not reach a hardware conclusion, and reporting "no D200 on USB" here would blame
+        # the hardware for an incomplete Python environment.
+        dependency = (found or {}).get("dependency")
+        if dependency:
+            raise usb.MissingDependency(dependency)
         raise RuntimeError("no D200 on USB")
     if found["mode"] == "hid":
         usb.switch_hid_to_adb()
@@ -219,7 +298,7 @@ def start_play(source: str) -> None:
     if not VENDOR_PLAY.is_file():
         raise RuntimeError(f"vendor player missing: {VENDOR_PLAY}")
     env = dict(os.environ)
-    env["GHOSTDECK_SERIAL"] = found.get("serial") or adb.serial_from_devices() or ""
+    env["GHOSTDECK_SERIAL"] = found.get("serial") or _deck_serial() or ""
     env["PYTHONPATH"] = str(VENDOR_DIR) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
         [
@@ -239,14 +318,46 @@ def start_play(source: str) -> None:
         start_new_session=True,
         env=env,
     )
-    data = gdstate.load()
-    data["play_pid"] = proc.pid
-    gdstate.save(data)
+    # A-103: a player that died on startup must not be recorded as a running session, and the
+    # command must not exit 0 - the user would be told playback started while nothing is playing.
+    # Nothing is written before this check, so there is no stale record to clear on the way out.
+    try:
+        returncode = proc.wait(timeout=_PLAY_GRACE)
+    except subprocess.TimeoutExpired:
+        returncode = None
+    if returncode is not None:
+        raise RuntimeError(
+            f"player exited with status {returncode} before it started; nothing is playing"
+        )
+    data = gdstate.update(play_pid=proc.pid)
+    if data.get("play_pid") != proc.pid:
+        # A-104: fail loudly rather than silently reporting a session that was never recorded.
+        raise RuntimeError(f"could not record the player pid {proc.pid} in {gdstate.STATE_PATH}")
     _record_identity(proc.pid)
 
 
 def playing() -> bool:
     return _is_our_player(gdstate.load().get("play_pid")) is True
+
+
+def _adb_mutate(argv: list[str]) -> None:
+    """Run one device-mutating command, bounded by `_ADB_TIMEOUT` (A-116).
+
+    `subprocess.run` without a timeout blocks indefinitely, so a wedged adb server made `stop` - the
+    one documented recovery command - hang with the deck still hijacked. A timeout is reported in
+    the same shape as a non-zero exit, because the step did not happen either way.
+    """
+    try:
+        result = adb.run(argv, capture_output=True, text=True, timeout=_ADB_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"adb timed out after {_ADB_TIMEOUT:g}s: {' '.join(argv)} (is the adb server wedged?)"
+        ) from None
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(f"adb failed ({result.returncode}): {' '.join(argv)}: {detail}")
 
 
 def _cleanup_device() -> None:
@@ -261,23 +372,34 @@ def _cleanup_device() -> None:
 
     We deliberately do not switch USB modes ourselves: the restarted stock UI performs the HID
     re-enumeration, and the project boundary forbids `functions=hid,adb` and any firmware write.
+
+    The target device is chosen by its own identity fields rather than by position, and every call
+    is bounded, so neither a second attached device (A-137) nor a wedged adb server (A-116) can make
+    this command silently fail to restore the deck.
     """
-    serial = adb.serial_from_devices()
+    serial = _deck_serial()
     if not serial:
-        raise RuntimeError("no ADB device reachable: stock UI not restored and /tmp/ghostdeck-* not cleared")
+        raise RuntimeError(
+            "no ADB device reachable: no attached device identifies as the D200, so the stock UI is "
+            "not restored and /tmp/ghostdeck-* is not cleared"
+        )
     for argv in (
         ["-s", serial, "shell", "setprop ctl.stop zkswe"],
         ["-s", serial, "shell", "setprop ctl.start zkswe"],
         ["-s", serial, "shell", "rm -f /tmp/ghostdeck-*"],
     ):
-        result = adb.run(argv, capture_output=True, text=True)
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.returncode != 0:
-            detail = (result.stderr or "").strip()
-            raise RuntimeError(f"adb failed ({result.returncode}): {' '.join(argv)}: {detail}")
-    # Informational only: an empty /tmp/ghostdeck makes `ls` exit 1, which is the success case.
-    listing = adb.run(["-s", serial, "shell", "ls /tmp/ghostdeck*"], capture_output=True, text=True)
+        _adb_mutate(argv)
+    # Informational only: an empty /tmp/ghostdeck makes `ls` exit 1, which is the success case, and a
+    # listing that times out is equally unable to change the outcome.
+    try:
+        listing = adb.run(
+            ["-s", serial, "shell", "ls /tmp/ghostdeck*"],
+            capture_output=True,
+            text=True,
+            timeout=_ADB_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return
     if listing.returncode == 0 and listing.stdout:
         print(listing.stdout, end="")
 
@@ -289,17 +411,25 @@ def stop() -> None:
     unverifiable pid is left exactly as it is (nothing signalled, nothing erased) and the cleanup
     still runs, because skipping it would leave the stock UI stopped and the staged files on the
     device with no other command able to restore them.
+
+    A-126: the player's record is erased only after the device steps have succeeded. When the deck
+    call fails, the state still describing the session that was just stopped is the only evidence a
+    user or a later run has of what happened, and `stop` is the documented recovery command.
     """
     identity_error = None
+    record_is_disposable = True
     try:
-        _kill_play()
+        _kill_play(keep_record=True)
     except RuntimeError as error:
         identity_error = error
+        record_is_disposable = False
     try:
         _cleanup_device()
     except RuntimeError as cleanup_error:
         if identity_error is None:
             raise
         raise RuntimeError(f"{cleanup_error} (as well as: {identity_error})") from cleanup_error
+    if record_is_disposable:
+        _clear_play_records()
     if identity_error is not None:
         raise identity_error

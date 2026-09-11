@@ -14,25 +14,13 @@ from pathlib import Path
 from ghostdeck import HID_PID, HID_VID
 from ghostdeck import state as gdstate
 from ghostdeck import usb
+# The report descriptor has exactly one definition, in `iohid` (A-136): this module's pyobjc
+# fallback and `iohid.create`'s ctypes path must hand the same bytes to IOHIDUserDeviceCreate,
+# and two verbatim copies had nothing tying them together.
+from ghostdeck.iohid import REPORT_DESCRIPTOR as _DESCRIPTOR
 
 _HOLD = []
 _PS_TIMEOUT = 5.0
-_DESCRIPTOR = bytes(
-    [
-        0x06, 0x00, 0xFF,
-        0x09, 0x01,
-        0xA1, 0x01,
-        0x15, 0x00,
-        0x26, 0xFF, 0x00,
-        0x75, 0x08,
-        0x95, 0x40,
-        0x09, 0x01,
-        0x81, 0x02,
-        0x09, 0x01,
-        0x91, 0x02,
-        0xC0,
-    ]
-)
 
 
 # --- keeper identity (finding A-125) ---------------------------------------
@@ -141,12 +129,22 @@ def _probe_start_time(pid):
 
 
 def _record_identity(pid) -> None:
-    """Record the pid and its start time, so a later run can tell it from a recycled pid."""
+    """Record the pid and its start time, so a later run can tell it from a recycled pid.
+
+    When the start time cannot be read, any previously recorded identity is removed rather than
+    left in place: the sidecar would otherwise keep naming a *different* process, which is the
+    divergence A-145/A-132 exploit. Removing it leaves identity undeterminable -- which `status()`
+    already reports without erasing the record -- instead of pointing at the wrong process.
+    """
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return
     lstart, _reason = _probe_start_time(pid)
     if lstart is None:
-        # Nothing trustworthy to record: identity stays undeterminable rather than a guess.
+        # Nothing trustworthy to record: identity stays undeterminable rather than a guess, and a
+        # stale sidecar naming another pid is removed so it cannot mis-identify this one.
+        recorded = _load_identity()
+        if recorded is None or recorded["pid"] != pid:
+            _remove_identity()
         return
     _write_identity({"pid": pid, "lstart": lstart})
 
@@ -175,7 +173,19 @@ def _keeper_identity(pid):
             return False, ""  # ps ran and reports no such process
         return None, "no recorded identity for this pid"
     if recorded["pid"] != pid:
-        return False, ""
+        # The sidecar names a different process, so it cannot identify THIS pid -- but a mismatch
+        # alone is not proof that this pid is a stranger (A-145, same code as play.py's A-132).
+        # The recorder can leave a stale sidecar behind (`_record_identity` returns early when ps
+        # cannot answer), and answering False here made a read-only `status()` erase vhid_pid plus
+        # the sidecar of a LIVE keeper that nothing then signalled, while `quit()` took the same
+        # branch and left the keeper unreachable. Probe this pid instead: only ps reporting no such
+        # process may discard the record.
+        lstart, reason = _probe_start_time(pid)
+        if reason is not None:
+            return None, reason
+        if lstart is None:
+            return False, ""  # ps ran and reports no such process
+        return None, f"the identity sidecar records a different pid ({recorded['pid']})"
     lstart, reason = _probe_start_time(pid)
     if reason is not None:
         return None, reason

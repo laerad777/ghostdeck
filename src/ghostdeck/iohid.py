@@ -15,7 +15,7 @@ kCFAllocatorDefault = None
 kCFStringEncodingUTF8 = 0x08000100
 kCFNumberSInt32Type = 3
 
-_DESCRIPTOR = bytes(
+REPORT_DESCRIPTOR = bytes(
     [
         0x06, 0x00, 0xFF,
         0x09, 0x01,
@@ -31,6 +31,13 @@ _DESCRIPTOR = bytes(
         0xC0,
     ]
 )
+# The single source of the 25-byte report descriptor, handed to IOHIDUserDeviceCreate by both
+# virtual-HID bindings: this module's ctypes path and `vhid._try_iohid_user_device`'s pyobjc path
+# (which imports this constant). It used to be copied verbatim into both modules with nothing tying
+# the copies together, so an edit to one side would have made only the fallback binding wrong
+# (A-136). It lives here because `vhid` can import `iohid` and not the reverse: `iohid` must stay
+# importable without objc (it is the no-pyobjc path), and `vhid` is the module that picks between
+# the two bindings.
 
 
 def _cf():
@@ -83,8 +90,8 @@ def create(vid: int = HID_VID, pid: int = HID_PID, product: str = "ulanzi") -> c
         box = c_int32(value)
         return cf.CFNumberCreate(None, kCFNumberSInt32Type, byref(box))
 
-    desc = (c_uint8 * len(_DESCRIPTOR)).from_buffer_copy(_DESCRIPTOR)
-    data = cf.CFDataCreate(None, desc, len(_DESCRIPTOR))
+    desc = (c_uint8 * len(REPORT_DESCRIPTOR)).from_buffer_copy(REPORT_DESCRIPTOR)
+    data = cf.CFDataCreate(None, desc, len(REPORT_DESCRIPTOR))
     keys = (c_void_p * 5)(
         cstr("VendorID"),
         cstr("ProductID"),

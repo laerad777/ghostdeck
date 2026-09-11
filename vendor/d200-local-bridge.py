@@ -40,6 +40,15 @@ SESSION_DIR_PREFIX = '/tmp/.d200-zkgui-'
 SESSION_DIR_TOKEN_HEX = 16
 SESSION_DIR_PROXY = 'proxy'
 SESSION_DIR_PRELOAD = 'preload.so'
+# A blocking `input` request (timeoutMs -1) is served in windows of this length
+# instead of parking until a report arrives. The macOS shim enforces one
+# host-side transport budget per request (D200_RPC_BUDGET_MS, 15 s), so a peer
+# that only ever answers real reports turns a healthy but idle deck into a
+# caller-visible ETIMEDOUT every 15 s; answering the same empty report that an
+# expired positive timeout already returns means "no report in this window",
+# which the shim's parser accepts. It also keeps this handler from outliving a
+# closing handle by more than one window.
+INPUT_IDLE_TICK_SECONDS = 0.5
 # One line per staged entry: '<directory>|<name>|<bytes>'. `ls -A` so a hidden
 # extra entry cannot pass for a clean session directory, and `wc -c` so no
 # stat(1) is required on the deck. Unparseable output is never treated as proof
@@ -359,10 +368,13 @@ class DeviceProxy:
 
         Holding it for the whole reap is what turns "no live bridge owns a sibling"
         into a proof rather than a guess. A missing lock file means no bridge was
-        ever admitted, and an unreadable one is not proof either way.
+        ever admitted, and an unreadable one -- including a planted symlink, which
+        `O_NOFOLLOW` refuses to follow -- is not proof either way, so the reap is
+        skipped rather than run unguarded.
         """
+        check = getattr(os, 'O_NOFOLLOW', 0)
         try:
-            descriptor = os.open(admission_lock_path(), os.O_RDWR)
+            descriptor = os.open(admission_lock_path(), os.O_RDWR | check)
         except FileNotFoundError:
             return True
         except OSError:
@@ -1290,7 +1302,11 @@ class DeviceProxy:
     def input(self, endpoint, timeout_ms, cancelled):
         if endpoint not in (0, 1):
             raise ProtocolError('invalid HID interface')
-        deadline = None if timeout_ms < 0 else time.monotonic() + timeout_ms / 1000
+        # A negative timeout is a blocking wait, but never an unbounded one: see
+        # INPUT_IDLE_TICK_SECONDS for why the caller's own budget must not be
+        # reached before this handler answers.
+        window = timeout_ms / 1000 if timeout_ms >= 0 else INPUT_IDLE_TICK_SECONDS
+        deadline = time.monotonic() + window
         with self.condition:
             generation = self.connection_generation
             while True:
@@ -1304,13 +1320,10 @@ class DeviceProxy:
                     report = self.inputs[endpoint].popleft()
                     self.condition.notify_all()
                     return report
-                if deadline is None:
-                    self.condition.wait(0.1)
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return b''
-                    self.condition.wait(min(remaining, 0.1))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return b''
+                self.condition.wait(min(remaining, 0.1))
 
     def close(self):
         if self.video is not None:

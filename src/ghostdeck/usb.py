@@ -90,6 +90,15 @@ def enable_adb(*, timeout: float = 15.0) -> dict:
         written = device.write(packet)
     finally:
         device.close()
+    # ADB-mode enumeration can only be observed through pyusb (`detect` -> `_adb_device` ->
+    # `_usb_find`, which returns None without it), so with pyusb missing the poll below can never
+    # succeed and its timeout would be reported as "the deck did not switch" -- a hardware verdict
+    # for what is really a missing package (A-108). Same rule as the `info is None` branch above:
+    # never report a missing package as a missing deck. Checked before the poll so the user is not
+    # made to wait out the timeout for the wrong answer.
+    hint = missing_dependency()
+    if hint is not None:
+        raise MissingDependency(hint)
     # The deck detaches from HID as the switch report lands, so hidapi usually reports a
     # short or -1 write for a switch that worked. Only a deck that never appears through
     # ADB is an error, and then the short write is the more specific one to report.
