@@ -112,6 +112,39 @@ export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 hidshim 브리지의 표준 출력·오류를 `/tmp/d200-local-bridge.log`에
 덧붙이고, 다른 로그는 터미널로 나옵니다.
 
+## 덱이 붙어 있는데 응답하지 않을 때
+
+USB에는 ADB로 열거되는데 `adbd`가 응답하지 않는 상태가 될 수 있습니다.
+그러면 `adb devices -l`은 `device`가 아닌 상태로, 보통 `offline`으로
+나타냅니다.
+
+```
+<serial>      offline usb:18092032X transport_id:1
+```
+
+호스트 쪽에서는 이것을 되살릴 수 없습니다. 이 프로젝트를 개발한 덱에서
+160초 대기, `adb kill-server`/`start-server` 3회, `adb reconnect`,
+USB 리셋을 모두 시도했지만 어느 것도 통하지 않았습니다.
+**덱의 전원을 껐다 켜거나 USB 케이블을 다시 꽂은 뒤 명령을 다시
+실행하십시오.** `offline`인 덱은 없는 덱과 다른 상태이며, 케이블
+문제가 아닙니다.
+
+`ghostdeck`은 세 가지 상태를 구분합니다.
+
+| 상태 | `detect` | `status` | `stop` |
+| --- | --- | --- | --- |
+| 사용 가능 | 종료 `0`, `mode=adb` | 종료 `0`, `usb=adb` | 덱을 복원 |
+| 붙어 있지만 adb 전송이 응답하지 않음 | 종료 `3`, `mode=adb (offline)` | 종료 `3`, `usb=adb (offline)` | 시리얼과 상태를 알리고 거부하며, 덱에 아무것도 보내지 않음 |
+| 없음 | 종료 `1`, `no device` | 종료 `0`, `usb=none` | 종료 `1`, 덱이 없다고 알림 |
+
+종료 코드: `0` 성공, `1` 덱 없음 또는 기타 실패, `2` 파이썬 환경을 쓸 수
+없음 (`hidapi`/`pyusb` 누락), `3` 덱은 붙어 있지만 adb 전송이 명령을
+실행할 수 없음.
+
+`detect`와 `status`는 보고 명령이며 `adb devices`만 읽습니다. adb
+서버를 재시작하지 않고, 덱으로 식별되지 않은 기기에는 아무것도 보내지
+않습니다.
+
 ## 플러그인
 
 스크립트를 `~/.ghostdeck/plugins`에 둡니다. 0.1.0은 폴더만 문서화하며

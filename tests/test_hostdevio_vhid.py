@@ -345,7 +345,7 @@ def _state_lock_is_held() -> bool:
     deterministic question instead of a timing one.
     """
     state.ensure_dirs()
-    fd = os.open(state.HOME / state.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.open(state.STATE_PATH.parent / state.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

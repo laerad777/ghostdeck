@@ -542,6 +542,39 @@ def test_the_named_error_is_not_an_errno_type(state_path):
     assert str(state.HOME) in str(excinfo.value)
 
 
+def test_the_whole_state_tree_follows_the_state_path_alone(tmp_path, monkeypatch):
+    """C-148/C-154: redirecting `STATE_PATH` must isolate this module completely.
+
+    The tree `ensure_dirs()` creates, the lock file `locked()` opens and the atomic temp file
+    `_write_state()` stages are all derived from `STATE_PATH`, so one patched name is enough. They
+    used to come from the import-time `HOME`/`PLUGIN_DIR`/`BIN_DIR` siblings, which other modules
+    read and a fixture can therefore patch independently: with the state file redirected but those
+    siblings left alone, `load()` still created -- and `locked()` still locked -- the operator's real
+    `~/.ghostdeck`. Measured before this fix on the committed tree: 736 mkdir calls into the real
+    tree in a single three-file test run, with the suite reporting green.
+
+    The two decoy roots below are the tripwire. Nothing may appear under either.
+    """
+    root = tmp_path / "elsewhere" / ".ghostdeck"
+    decoy_home = tmp_path / "decoy-home"
+    decoy_siblings = tmp_path / "decoy-siblings"
+    monkeypatch.setattr(state, "HOME", decoy_home)
+    monkeypatch.setattr(state, "HOME_DIR", decoy_home)
+    monkeypatch.setattr(state, "PLUGIN_DIR", decoy_siblings / "plugins")
+    monkeypatch.setattr(state, "BIN_DIR", decoy_siblings / "bin")
+    monkeypatch.setattr(state, "STATE_PATH", root / "state.json")
+
+    assert state.load()["play_pid"] is None
+    state.update(play_pid=4242)
+
+    assert json.loads((root / "state.json").read_text())["play_pid"] == 4242
+    assert (root / state.LOCK_NAME).is_file(), "the lock did not land beside the state file"
+    assert (root / "plugins").is_dir() and (root / "bin").is_dir()
+    assert not decoy_home.exists(), "the state tree followed HOME instead of STATE_PATH"
+    assert not decoy_siblings.exists(), "the tree followed the frozen PLUGIN_DIR/BIN_DIR siblings"
+    assert not [n for n in os.listdir(root) if n.startswith(".state.json")], "a temp file leaked"
+
+
 # --------------------------------------------------------------------------- A-107
 # `load()` materialises both shapes from the nested record, so after any load both keys exist and
 # `_normalized()` -- flat key for the pid, nested one for the flags -- could not tell which side the

@@ -10,10 +10,14 @@ processes, so the official /Applications/Ulanzi Studio.app is never observed or 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -121,3 +125,143 @@ def test_official_studio_app_is_never_matched(tmp_path, monkeypatch):
     official = "/Applications/Ulanzi Studio.app/Contents/MacOS/UlanziDeck"
     assert marker != official
     assert studio._copy_pids() == []
+
+
+# --- A-115: the bridge log is predictable and lives in world-writable /tmp ---------------
+
+
+def test_bridge_log_is_private_and_refuses_a_planted_symlink(tmp_path, monkeypatch):
+    """A-115: a bare `open(..., "ab")` wrote through a symlink and used the ambient umask.
+
+    Observed on this host before the fix: `/tmp/d200-local-bridge.log` was mode 0644, 213 KB. The
+    path is monkeypatched so this test never touches the real log.
+    """
+    import stat as stat_module
+
+    from ghostdeck import studio
+
+    log = tmp_path / "bridge.log"
+    monkeypatch.setattr(studio, "BRIDGE_LOG", log)
+
+    handle = studio._open_bridge_log()
+    try:
+        assert stat_module.S_IMODE(log.stat().st_mode) == 0o600, oct(log.stat().st_mode)
+    finally:
+        handle.close()
+
+    # A pre-existing world-readable file is remediated rather than inherited.
+    log.chmod(0o644)
+    handle = studio._open_bridge_log()
+    handle.close()
+    assert stat_module.S_IMODE(log.stat().st_mode) == 0o600, oct(log.stat().st_mode)
+
+    # A planted symlink is refused, and the file it points at is never written through.
+    victim = tmp_path / "victim.txt"
+    victim.write_text("operator data\n", encoding="utf-8")
+    planted = tmp_path / "planted.log"
+    planted.symlink_to(victim)
+    monkeypatch.setattr(studio, "BRIDGE_LOG", planted)
+    with pytest.raises(RuntimeError) as excinfo:
+        studio._open_bridge_log()
+    assert "refusing to write through" in str(excinfo.value), excinfo.value
+    assert "Traceback" not in str(excinfo.value)
+    assert victim.read_text(encoding="utf-8") == "operator data\n", "the symlink target was written"
+
+
+# --- A-133: a live listener is not necessarily OUR bridge --------------------------------
+
+
+@pytest.fixture
+def scratch():
+    """A short /tmp scratch dir: pytest's tmp_path exceeds the AF_UNIX path limit on macOS."""
+    directory = Path(tempfile.mkdtemp(prefix="gd-br-"))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _bare_listener(path):
+    """A listener that is NOT our bridge — exactly what a foreign process looks like.
+
+    The backlog is deliberately not 1: `_socket_state()` only ever `connect()`s and closes, and it
+    never `accept()`es, so on macOS each probe leaves its connection in the queue forever and
+    permanently consumes one backlog slot. Measured on this host with a bare listener:
+
+        backlog=1: LIVE, ConnectionRefusedError, ConnectionRefusedError   <- this test does 3 probes
+        backlog=4: LIVE, LIVE, LIVE, LIVE
+
+    A bare listener that stops accepting is not what this test is about, so the queue is made deep
+    enough that the number of probes stays irrelevant.
+    """
+    import socket as socket_module
+
+    listener = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(64)
+    return listener
+
+
+def test_launch_refuses_a_listener_that_is_not_our_bridge(scratch, monkeypatch):
+    """A-133: any successful connect was treated as our bridge, so Studio opened against a stranger.
+
+    `_socket_state()` still reports `live` (that verdict answers "may this path be unlinked?", which
+    is A-114's question, and FIX-2's tests pin it). Ownership is decided in `launch()`, the only place
+    that opens Studio.
+    """
+    from ghostdeck import studio
+
+    sock = scratch / "b.sock"
+    listener = _bare_listener(sock)
+    try:
+        monkeypatch.setattr(studio, "SOCKET", sock)
+        monkeypatch.setattr(studio, "BRIDGE_STATE", scratch / "absent-state.pid")
+        monkeypatch.setattr(studio, "ensure_copy", lambda: None)
+        monkeypatch.setattr(studio.devicebuild, "ensure", lambda: None)
+
+        # The endpoint verdict itself is unchanged: it is still a live listener.
+        assert studio._socket_state() == (studio._ENDPOINT_LIVE, "")
+        assert studio._socket_live() is True
+        # But it is not provably ours, so launch refuses instead of opening Studio.
+        assert studio._bridge_owner_live() is False
+        with pytest.raises(RuntimeError) as excinfo:
+            studio.launch()
+        message = str(excinfo.value)
+        assert str(sock) in message, message
+        assert "unidentified bridge" in message, message
+        assert "\n" not in message, message
+        assert sock.exists(), "the endpoint was touched"
+    finally:
+        listener.close()
+
+
+def test_bridge_owner_live_requires_a_live_record_with_our_bridge_argv(tmp_path, monkeypatch):
+    """Ownership needs a live pid whose argv names our bridge script — a recycled pid cannot pass."""
+    from ghostdeck import studio
+
+    state = tmp_path / "state.pid"
+    monkeypatch.setattr(studio, "BRIDGE_STATE", state)
+
+    assert studio._bridge_owner_live() is False  # nothing recorded
+
+    for junk in ("not json", "[]", '{"pid": true}', '{"pid": 0}', '{"pid": -1}', '{"pid": "5"}'):
+        state.write_text(junk, encoding="utf-8")
+        assert studio._bridge_owner_live() is False, junk
+
+    # A pid that is not running, however plausible the record looks.
+    state.write_text('{"pid": 999999}', encoding="utf-8")
+    assert studio._bridge_owner_live() is False
+
+    # Our own test process IS alive but its argv is not the bridge script, so it is not the owner.
+    state.write_text(f'{{"pid": {os.getpid()}}}', encoding="utf-8")
+    assert studio._bridge_owner_live() is False
+
+    # Now a live process whose argv really is the bridge script: the owner.
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", str(studio.BRIDGE)])
+    try:
+        time.sleep(0.4)
+        state.write_text(f'{{"pid": {owner.pid}}}', encoding="utf-8")
+        assert studio._bridge_owner_live() is True
+    finally:
+        owner.kill()
+        owner.wait()

@@ -382,7 +382,14 @@ def test_status_reports_playing_no_for_a_recycled_pid(tmp_path):
         # The two properties this test exists for: an unclassifiable pid is not a running player, and
         # `status` is a read-only command that never touches the device.
         assert "playing=no" in result.stdout, result.stdout
-        assert len(calls) == 0, f"status contacted the device through adb: {calls}"
+        # T16 made `status` consult `adb devices -l`, because it cannot report a wedged transport
+        # otherwise, so the original `len(calls) == 0` no longer describes the command. The property it
+        # protected is KEPT and made more precise than it was: the only adb invocation is that
+        # host-side inventory read, nothing is addressed to a device with `-s`, and `playing` is still
+        # decided from local state alone rather than by asking the deck. (A-134 - `vhid.status()`
+        # rewriting state.json - is a different mechanism and is untouched by this.)
+        assert calls == [DEVICES_ARGV], f"status must not go beyond the device inventory: {calls}"
+        assert not any("-s " in call for call in calls), f"nothing may be sent to a device: {calls}"
         # The exit code follows the reason (A-102). It is 0 here because `_cli` stubs the USB layer
         # with a positive deck verdict, so this child is never on the missing-backend path - the
         # expectation must track the CHILD's environment, not the pytest interpreter's.
@@ -1015,6 +1022,123 @@ def test_stop_refuses_when_no_attached_device_is_the_deck(tmp_path):
     assert "D200" in result.stderr, result.stderr  # names the deck as the missing device
     assert calls == [DEVICES_ARGV], f"nothing may be sent to an unidentified device: {calls}"
     assert not any("PHONE123" in call for call in calls), calls
+
+
+# --- T16: a deck that is attached but whose adb transport is not answering ---------------
+
+# The wedged shape, captured from the attached hardware: the serial IS listed, in the state `adb`
+# reports as `offline` (enumerated on USB as ADB, adbd not answering). It differs from DEVICE_LINE in
+# that one token and nothing else, which the guard below pins so neither fixture can drift.
+OFFLINE_LINE = DEVICE_LINE.replace("device usb:", "offline usb:")
+
+OFFLINE_ADB = _adb(f"""case "$1" in
+  devices) printf '{OFFLINE_LINE}'; exit 0 ;;
+esac
+exit 0
+""")
+
+# A phone in `device` state first, then the wedged deck: A-137's ordering crossed with T16's state.
+WEDGED_DECK_AFTER_PHONE_ADB = _adb(f"""case "$1" in
+  devices) printf 'List of devices attached\\nPHONE123      device usb:10000001X transport_id:1\\n{SERIAL}      offline usb:18092032X transport_id:2\\n'; exit 0 ;;
+esac
+exit 0
+""")
+
+
+def _device_line(text: str) -> list[str]:
+    """The device line of a fake `devices` banner, as tokens (the header and blank lines dropped)."""
+    return [line for line in text.splitlines() if line.strip()][-1].split()
+
+
+def test_the_offline_fixture_is_the_online_one_with_only_the_state_changed():
+    """Guard the pair below the way T15's guard protects DEVICE_LINE.
+
+    The two tests that follow are only a comparison of "usable" against "attached but wedged" if the
+    fixtures are otherwise identical. A future edit that changed the serial or the fields in one of
+    them would make that comparison meaningless while both tests still passed.
+    """
+    online = _device_line(DEVICE_LINE)
+    offline = _device_line(OFFLINE_LINE)
+    assert len(online) == len(offline), (online, offline)
+    assert (online[1], offline[1]) == ("device", "offline"), (online, offline)
+    assert [online[0], *online[2:]] == [offline[0], *offline[2:]], (online, offline)
+
+
+def test_stop_names_a_wedged_deck_instead_of_calling_it_absent(tmp_path):
+    """T16 (HIGH): on the real deck `stop` exited 1 with "no attached device identifies as the D200"
+    while the deck WAS attached and WAS listed - as `offline`. That message sent the user to check a
+    cable for a deck that is enumerated on USB and only needs a power cycle.
+
+    The message half of the fix: name the transport and the one remedy that works. Nothing host-side
+    restored the wedged deck, so a hint that does not say "power-cycle/replug" is not a recovery
+    path.
+    """
+    result, calls, _ = _cli(OFFLINE_ADB, tmp_path, deck_serial=SERIAL)
+    assert result.returncode != 0, result.stdout
+    assert SERIAL in result.stderr, result.stderr
+    assert "offline" in result.stderr, result.stderr
+    assert "power-cycle" in result.stderr and "replug" in result.stderr, result.stderr
+    assert "no attached device identifies as the D200" not in result.stderr, result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
+    # Not just the wording: a transport that cannot run a command must not be sent one.
+    assert calls == [DEVICES_ARGV], f"nothing may be sent to a wedged transport: {calls}"
+
+
+def test_stop_distinguishes_an_offline_deck_from_an_absent_one(tmp_path):
+    """The defect was a misdiagnosis, so the two states must not produce the same message.
+
+    Before this, `_parse_devices()` dropped every line whose state was not exactly `device`, so a
+    wedged deck and no deck at all were indistinguishable to every caller.
+    """
+    wedged, _, _ = _cli(OFFLINE_ADB, tmp_path / "wedged", deck_serial=SERIAL)
+    absent, _, _ = _cli(NO_DEVICE_ADB, tmp_path / "absent", deck_serial=None)
+    assert wedged.returncode != 0 and absent.returncode != 0
+    assert "offline" in wedged.stderr and "offline" not in absent.stderr, (wedged.stderr, absent.stderr)
+    assert "no attached device identifies as the D200" in absent.stderr, absent.stderr
+    assert wedged.stderr != absent.stderr
+
+
+def test_stop_reports_an_unattributable_offline_device_truthfully(tmp_path):
+    """With no USB verdict the deck cannot be positively identified - but something IS attached.
+
+    This is the real venv, which has neither hidapi nor pyusb: `usb.detect()` has no verdict, so the
+    deck cannot be proven, and the old message claimed nothing was attached while `adb` was listing
+    it. The honest form names what is attached, refuses to touch it, and still gives the remedy.
+    """
+    result, calls, _ = _cli(OFFLINE_ADB, tmp_path, deck_serial=None)
+    assert result.returncode != 0, result.stdout
+    assert SERIAL in result.stderr, result.stderr
+    assert "offline" in result.stderr, result.stderr
+    assert "positively identified" in result.stderr, result.stderr
+    assert "no attached device identifies as the D200" not in result.stderr, result.stderr
+    assert "power-cycle" in result.stderr, result.stderr
+    # It must say that it did not act, and it must not have acted.
+    assert "Nothing is sent to an unidentified device" in result.stderr, result.stderr
+    assert calls == [DEVICES_ARGV], calls
+
+
+def test_stop_refuses_without_mutating_the_phone_when_the_wedged_deck_is_listed_second(tmp_path):
+    """A-137 held with a phone first AND the deck wedged: the phone must not become the target.
+
+    The distinction added for T16 must not weaken the protection: the offline state is a diagnosis,
+    never a reason to act on whatever line happens to be first.
+    """
+    result, calls, _ = _cli(WEDGED_DECK_AFTER_PHONE_ADB, tmp_path, deck_serial=SERIAL)
+    assert result.returncode != 0, result.stdout
+    assert calls == [DEVICES_ARGV], f"nothing may be sent: {calls}"
+    assert not any("PHONE123" in call for call in calls), f"the phone was mutated: {calls}"
+    assert SERIAL in result.stderr and "offline" in result.stderr, result.stderr
+
+
+def test_the_healthy_path_is_unchanged_by_the_transport_distinction(tmp_path):
+    """The other half of the pair: a `device`-state deck still restores, unchanged.
+
+    T16 must not turn a working deck into an error; the state token is the only gate.
+    """
+    result, calls, _ = _cli(HAPPY_ADB, tmp_path, deck_serial=SERIAL)
+    assert result.returncode == 0, result.stderr
+    assert calls == STOP_ARGV, calls
+    assert result.stderr == "", result.stderr
 
 
 # --- A-126: the session record must outlive the deck's effects ----------------

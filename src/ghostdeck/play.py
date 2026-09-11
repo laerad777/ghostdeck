@@ -29,6 +29,10 @@ _PLAY_GRACE = 1.0
 # `<serial>      device usb:18092032X transport_id:4`), so the primary signal is the USB
 # layer's VID/PID-matched verdict in `_deck_serial()`.
 _DECK_FIELDS = ("product:d200", "model:D200", "device:d200")
+# The only `adb devices` transport state that can execute a command. Every other state means the deck
+# is attached but its adbd is not answering - `offline` is the one the wedged deck reported - and T16
+# showed that state being reported to the user as "no attached device identifies as the D200".
+TRANSPORT_READY = "device"
 
 
 _TOOL_HINTS = {
@@ -60,11 +64,14 @@ def _validate_source(source: str) -> None:
         raise RuntimeError(f"source is not a file and is not a URL: {source}")
 
 
-def _adb_devices() -> list[tuple[str, list[str]]]:
-    """Every device `adb devices -l` lists, as ``(serial, remaining fields)``, in adb's order.
+def _adb_entries() -> list[tuple[str, str, list[str]]]:
+    """Every device `adb devices -l` lists, as ``(serial, state, remaining fields)``, in adb's order.
 
-    The per-line fields are kept because the line's shape is firmware-dependent: the attached deck
-    emits only ``usb:<...> transport_id:<n>`` (T15), while other builds report product/model/device.
+    The transport state is kept rather than filtered on, because the caller has to tell a usable
+    device from one that is attached but not answering (T16): both are listed by `adb`, they are
+    different user-visible problems, and their remedies are different. The per-line fields are kept
+    because the line's shape is firmware-dependent: the attached deck emits only
+    ``usb:<...> transport_id:<n>`` (T15), while other builds report product/model/device.
     """
     try:
         result = adb.run(["devices", "-l"], capture_output=True, text=True, timeout=_ADB_TIMEOUT)
@@ -74,64 +81,101 @@ def _adb_devices() -> list[tuple[str, list[str]]]:
         ) from None
     except OSError as error:
         raise RuntimeError(f"adb could not be run: {error}") from None
-    devices = []
+    entries = []
     for line in (result.stdout or "").splitlines():
         fields = line.split()
-        # `serial  device  <fields...>`; a header or a non-device state is not a candidate.
-        if len(fields) < 2 or fields[1] != "device":
+        # `serial  state  <fields...>`. The `List of devices attached` header is skipped by name, the
+        # same way `adb.serial_from_devices()` skips it; a device-less line is not a candidate.
+        if len(fields) < 2 or fields[0] == "List":
             continue
-        devices.append((fields[0], fields[1:]))
-    return devices
+        entries.append((fields[0], fields[1], fields[2:]))
+    return entries
 
 
-def _deck_serial() -> str | None:
-    """The serial of the attached D200, or None when nothing positively identifies it.
+def _transport_state(entries: list[tuple[str, str, list[str]]], serial: str) -> str:
+    """The transport state `adb` reports for `serial`, or "" when it lists no such device."""
+    for listed, state, _ in entries:
+        if listed == serial:
+            return state
+    return ""
+
+
+def deck_transport(*, restart: bool = True) -> tuple[str | None, str, list[tuple[str, str]]]:
+    """``(serial, state, blocked)`` for one `adb devices -l` listing.
+
+    Three outcomes, which T16 showed were being collapsed into "no device":
+
+    * ``(serial, "device", [])`` - the deck is attached and usable.
+    * ``(serial, "<other>", [])`` - the deck is attached, identified by its own USB identity (or its
+      own `-l` fields), and listed by `adb`, but its transport cannot run a command. The wedged deck
+      on the real host reported ``offline``: enumerated on USB as ADB with adbd not answering, and no
+      host-side action recovered it (a 160s wait, three `kill-server`/`start-server` cycles, `adb
+      reconnect` and a USB reset all failed; only a physical power cycle did).
+    * ``(None, "", blocked)`` - the deck was not positively identified. `blocked` still lists every
+      device that is attached but not answering, so a caller can tell the truth instead of claiming
+      nothing is attached. It is a diagnosis only: nothing is ever sent to those serials (A-137).
 
     The deck is identified by what it reports about *itself*, never by its position in the device
-    list - positional selection was A-137, where the cleanup went to a phone and still exited 0.
+    list - positional selection was A-137, where the cleanup went to a phone and still exited 0. So a
+    phone attached alongside is never classified as the deck, whatever the order of the lines, and
+    `blocked` is never used as a fallback for acting on a device.
 
-    Accepted signals, and why each is safe when a phone is attached alongside the deck:
+    Accepted signals, unchanged from `_deck_serial()`:
 
-    1. **The USB layer's verdict.** `usb.detect()` matches the deck on its USB identity
-       (VID/PID 2207:0019 HID or 18d1:d002 ADB), so an unrelated device cannot produce it. The serial
-       must also appear in `adb devices`, because a serial the server does not know cannot be
-       addressed with `adb -s`. This is the signal that works on the real deck.
+    1. **The USB layer's verdict.** `usb.detect()` matches the deck on its USB identity (VID/PID
+       2207:0019 HID or 18d1:d002 ADB), so an unrelated device cannot produce it. The serial must
+       also appear in `adb devices`, because a serial the server does not know cannot be addressed
+       with `adb -s`. This is the signal that works on the real deck.
     2. **The deck's own `-l` identity fields**, for firmware that reports them. The attached deck does
-       NOT: its line is `<serial>      device usb:18092032X transport_id:4` (T15). So this
-       can only ever be an *additional* accepted path, never the only one - treating it as the only
-       one is what broke `stop` on hardware while 465 green tests used fixtures that fabricated the
-       fields the deck never emits.
-    3. Nothing else. When neither signal fires this returns None and the caller refuses, because
-       sending a firmware-adjacent command to an unidentified device is worse than not restoring the
-       deck.
+       NOT: its line is `<serial>      device usb:18092032X transport_id:4` (T15). So this can only
+       ever be an *additional* accepted path, never the only one.
 
-    A momentarily empty `adb devices` while the USB layer reports the deck in ADB is the H3
-    stale-server case, observed repeatedly on this host, so it gets one bounded server restart before
-    refusing rather than an immediate failure.
+    `restart=False` skips the bounded H3 server restart below. The read-only reporting commands
+    (`detect`, `status`) pass it, because a diagnostic that resets the adb server changes the state
+    it is reporting on (A-134); `stop()` keeps the restart, since a stale server there means the deck
+    never gets restored.
     """
-    devices = _adb_devices()
+    entries = _adb_entries()
     try:
         found = usb.detect()
     except Exception:  # a USB backend that cannot answer is simply no verdict
         found = None
-    deck_serial = found.get("serial") if found and found.get("mode") == "adb" else None
-    if deck_serial:
-        if any(serial == deck_serial for serial, _ in devices):
-            return str(deck_serial)
-        # H3: the USB layer has the deck in ADB but the host server has no transport for it. Exactly
-        # one restart, never a loop; a restart that cannot run is no help rather than a fatal error.
-        try:
-            adb.restart_server()
-        except RuntimeError as error:
-            print(f"adb server restart unavailable: {error}", file=sys.stderr)
-        else:
-            devices = _adb_devices()
-            if any(serial == deck_serial for serial, _ in devices):
-                return str(deck_serial)
-    for serial, fields in devices:
+    deck = found.get("serial") if found and found.get("mode") == "adb" else None
+    if deck:
+        state = _transport_state(entries, str(deck))
+        if state:
+            return str(deck), state, []
+        if restart:
+            # H3: the USB layer has the deck in ADB but the host server lists no transport for it at
+            # all - not even an `offline` one - so the server has not picked the deck up. Exactly one
+            # restart, never a loop; a restart that cannot run is no help rather than a fatal error.
+            try:
+                adb.restart_server()
+            except RuntimeError as error:
+                print(f"adb server restart unavailable: {error}", file=sys.stderr)
+            else:
+                entries = _adb_entries()
+                state = _transport_state(entries, str(deck))
+                if state:
+                    return str(deck), state, []
+    for serial, state, fields in entries:
         if any(field in _DECK_FIELDS for field in fields):
-            return serial
-    return None
+            return serial, state, []
+    blocked = [(serial, state) for serial, state, _ in entries if state != TRANSPORT_READY]
+    return None, "", blocked
+
+
+def _deck_serial() -> str | None:
+    """The serial of a *usable* attached D200, or None when nothing positively identifies one.
+
+    Delegates the identification and the attached-but-unusable distinction to `deck_transport()`; the
+    `state` test below is the whole difference, and it is what keeps a wedged deck from being handed
+    to a caller that is about to send it a command.
+    """
+    serial, state, _ = deck_transport()
+    if serial is None or state != TRANSPORT_READY:
+        return None
+    return serial
 
 
 def _identity_path() -> Path:
@@ -424,13 +468,40 @@ def _cleanup_device() -> None:
 
     The target device is chosen by its own identity fields rather than by position, and every call
     is bounded, so neither a second attached device (A-137) nor a wedged adb server (A-116) can make
-    this command silently fail to restore the deck.
+    this command silently fail to restore the deck. A deck that is attached but not answering is
+    named as such rather than reported as absent (T16).
     """
-    serial = _deck_serial()
-    if not serial:
+    serial, state, blocked = deck_transport()
+    if serial is None:
+        if blocked:
+            # T16: something IS attached, so "no attached device identifies as the D200" would be
+            # false and would send the user to check a cable. Name what is attached, say plainly that
+            # nothing was sent to it (it is not positively identified as the deck), and give the only
+            # remedy that exists. This branch is reached on the real host whenever the USB backend is
+            # unusable - the venv has neither hidapi nor pyusb - with a wedged deck on the bus.
+            listed = ", ".join(f"{found_serial} ({found_state})" for found_serial, found_state in blocked)
+            raise RuntimeError(
+                f"no attached device is positively identified as the D200, but {listed} is attached "
+                f"with a transport that cannot run a command. Nothing is sent to an unidentified "
+                f"device, so the stock UI is not restored and /tmp/ghostdeck-* is not cleared. If "
+                f"that is the deck, no host-side step recovers it (measured on the wedged deck: a "
+                f"160s wait, three kill-server/start-server cycles, `adb reconnect` and a USB reset "
+                f"all failed) - power-cycle or replug the deck, then re-run `ghostdeck stop`"
+            )
         raise RuntimeError(
             "no ADB device reachable: no attached device identifies as the D200, so the stock UI is "
             "not restored and /tmp/ghostdeck-* is not cleared"
+        )
+    if state != TRANSPORT_READY:
+        # The deck IS attached and IS identified; its adb transport just cannot run a command. Saying
+        # "no attached device identifies as the D200" here was false and sent the user to check a
+        # cable. The remedy is physical: measured on the wedged deck, nothing host-side restored it.
+        raise RuntimeError(
+            f"the deck ({serial}) is attached in ADB mode but its adb transport is {state}, so it "
+            f"cannot run a command: the stock UI is not restored and /tmp/ghostdeck-* is not cleared. "
+            f"No host-side step recovers this (measured on the wedged deck: a 160s wait, three "
+            f"kill-server/start-server cycles, `adb reconnect` and a USB reset all failed) - "
+            f"power-cycle or replug the deck, then re-run `ghostdeck stop`"
         )
     for argv in (
         ["-s", serial, "shell", "setprop ctl.stop zkswe"],

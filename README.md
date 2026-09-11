@@ -98,8 +98,7 @@ written or shipped.
 
 | Command | Purpose |
 | --- | --- |
-| `ghostdeck detect` | Print serial, VID/PID, and USB mode (HID `2207:0019` or ADB `18d1:d002`). Fails if no deck is found. Serial is discovered at runtime; it is not baked into the source. |
-| `ghostdeck play FILE\|URL` | ADB JPEG play. Optional IOHID attempt does not block play. |
+| `ghostdeck detect` | Print serial, VID/PID, and USB mode (HID `2207:0019` or ADB `18d1:d002`). Fails if no deck is found. Serial is discovered at runtime; it is not baked into the source. || `ghostdeck play FILE\|URL` | ADB JPEG play. Optional IOHID attempt does not block play. |
 | `ghostdeck studio` | Launch the **local** hidshim copy (`~/Applications/Ulanzi Studio ADB.app`). Official `/Applications/Ulanzi Studio.app` is not written. |
 | `ghostdeck stop` | Stop playback, restore stock UI, clear `/tmp/ghostdeck-*` on the deck. |
 | `ghostdeck quit` | Tear down the IOHID keeper if any. |
@@ -111,6 +110,39 @@ URL sources fail; local files still play.
 Host state lives in `~/.ghostdeck/state.json`. `ghostdeck studio` appends
 the hidshim bridge's stdout and stderr to `/tmp/d200-local-bridge.log`;
 other logs go to the terminal.
+
+## If the deck is attached but stops answering
+
+A deck can end up enumerated on USB as ADB while its `adbd` does not
+answer. `adb devices -l` then lists it in a state that is not `device`,
+usually `offline`:
+
+```
+<serial>      offline usb:18092032X transport_id:1
+```
+
+Nothing on the host recovers this. On the deck this project was developed
+against, a 160-second wait, three `adb kill-server`/`start-server` cycles,
+`adb reconnect`, and a USB reset were all tried, and none of them worked.
+**Power-cycle the deck, or replug its USB cable, and then re-run the
+command.** An attached deck that is merely `offline` is not the same thing
+as a deck that is absent, and it is not a cabling problem.
+
+`ghostdeck` distinguishes the three states instead of reporting `no device`:
+
+| State | `detect` | `status` | `stop` |
+| --- | --- | --- | --- |
+| usable | exit `0`, `mode=adb` | exit `0`, `usb=adb` | restores the deck |
+| attached, adb transport not answering | exit `3`, `mode=adb (offline)` | exit `3`, `usb=adb (offline)` | refuses, names the serial and the state, sends nothing to the deck |
+| absent | exit `1`, `no device` | exit `0`, `usb=none` | exit `1`, names the deck as absent |
+
+Exit codes: `0` success, `1` no deck or another failure, `2` the Python
+environment is unusable (a missing `hidapi` or `pyusb`), `3` the deck is
+attached but its adb transport cannot run a command.
+
+`detect` and `status` are reporting commands and only read `adb devices`:
+they never restart the adb server, and no command is ever sent to a device
+that could not be identified as the deck.
 
 ## Plugins
 

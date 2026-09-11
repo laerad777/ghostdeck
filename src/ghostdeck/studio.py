@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -17,6 +18,11 @@ from ghostdeck import adb, devicebuild, usb
 ORIGINAL = Path("/Applications/Ulanzi Studio.app")
 COPY = Path.home() / "Applications" / "Ulanzi Studio ADB.app"
 SOCKET = Path("/tmp/d200-adb-bridge.sock")
+# The bridge's own state file. `_spawn_bridge` has always passed this path and, until A-133, nothing
+# ever read it back; it is the only on-disk record of which process is serving SOCKET.
+BRIDGE_STATE = Path("/tmp/d200-local-bridge.pid")
+# Documented in README.md: `ghostdeck studio` appends the bridge's stdout/stderr here.
+BRIDGE_LOG = Path("/tmp/d200-local-bridge.log")
 ROOT = Path(__file__).resolve().parents[2]
 VENDOR = ROOT / "vendor"
 BRIDGE = VENDOR / "d200-local-bridge.py"
@@ -122,6 +128,16 @@ def launch() -> None:
         # Refuse before touching the copy: quitting a healthy shim for a bridge that then cannot
         # be started would leave the user with neither.
         raise _undeterminable_endpoint(reason)
+    if endpoint == _ENDPOINT_LIVE and not _bridge_owner_live():
+        # A-133: something is listening on our predictable socket path, and it is not the bridge we
+        # spawn (no live record of it in BRIDGE_STATE). Opening Studio here would point the shim at a
+        # stranger's socket and silently report success. Refuse instead — and note that the A-114
+        # property is untouched: nothing is unlinked, and no second bridge is spawned over it.
+        raise RuntimeError(
+            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to open "
+            f"Studio against an unidentified bridge. Stop that process, or remove {SOCKET} if it is "
+            f"a leftover, and retry"
+        )
     if endpoint == _ENDPOINT_DEAD:
         # Studio holds HID interface 0 while it runs, so the HID-to-ADB switch needs
         # the copy stopped first; a restarted bridge also leaves an already running
@@ -200,6 +216,80 @@ def ensure_copy() -> None:
         check=True,
         timeout=120,
     )
+
+
+def _open_bridge_log():
+    """Open the bridge log privately: 0600, and never through a planted symlink (A-115).
+
+    The path is predictable and lives in world-writable `/tmp`, so a bare `open(..., "ab")` happily
+    writes through a symlink somebody planted there and creates the file at the ambient umask. Both
+    were observed on this host: `/tmp/d200-local-bridge.log` was mode 0644, 213 KB.
+
+    `O_NOFOLLOW` refuses to traverse a symlink, and the mode (plus `fchmod`, so an older
+    world-readable file is remediated rather than inherited) makes the file private. A path that
+    cannot be opened safely is refused rather than written through — the same rule the endpoint probe
+    already follows for a path it cannot classify.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(BRIDGE_LOG, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot open the bridge log {BRIDGE_LOG} ({type(error).__name__}: {error}); refusing to "
+            f"write through a path that is not a regular file"
+        ) from error
+    os.fchmod(descriptor, 0o600)
+    return os.fdopen(descriptor, "ab", buffering=0)
+
+
+def _pid_argv(pid: int) -> str:
+    """The live argv of `pid`, or "" when it cannot be read. `-ww` + LC_ALL=C, as in `_copy_pids`."""
+    try:
+        listed = subprocess.check_output(
+            ["ps", "-ww", "-axo", "pid=,command="],
+            text=True,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return ""
+    for line in listed.splitlines():
+        found, _, command = line.strip().partition(" ")
+        if found.isdigit() and int(found) == pid:
+            return command.strip()
+    return ""
+
+
+def _bridge_owner_live() -> bool:
+    """True only when OUR bridge is alive and therefore serving SOCKET (A-133).
+
+    `_socket_state()` cannot tell our bridge from any other listener: a successful `connect()` is all
+    it has, and that verdict is deliberately ownership-agnostic because it exists to answer "may this
+    path be unlinked?" (A-114), not "who owns it?". Every listener therefore looked like our bridge,
+    so `launch()` opened Studio against a stranger.
+
+    Ownership comes from the bridge's own `--state-file`, which `_spawn_bridge` has always passed and
+    nothing read until now: it records the bridge's pid. The pid must be alive AND its argv must name
+    our bridge script — the same argv discipline `play._player_identity` and `_copy_pids` use, so a
+    recycled pid cannot satisfy it, and a live bridge that refused to bind (it exits with
+    `bridge_socket_in_use` when another listener holds the path) is not live at all.
+
+    Residual, stated rather than hidden: a bridge started by hand WITHOUT `--state-file` writes no
+    record, so this returns False and `launch()` refuses. That is the safe direction (refusing beats
+    opening Studio against an unidentified socket) and the message says what to do about it.
+    """
+    try:
+        record = json.loads(BRIDGE_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    argv = _pid_argv(pid)
+    return bool(argv) and str(BRIDGE) in argv
 
 
 def _socket_state() -> tuple[str, str]:
@@ -331,7 +421,7 @@ def _spawn_bridge(serial: str, log) -> subprocess.Popen:
             "--serial",
             serial,
             "--state-file",
-            "/tmp/d200-local-bridge.pid",
+            str(BRIDGE_STATE),
         ],
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -360,7 +450,7 @@ def _ensure_bridge() -> None:
         raise _undeterminable_endpoint(probe_reason)
     if not BRIDGE.is_file():
         raise RuntimeError(f"bridge missing: {BRIDGE}")
-    log = open("/tmp/d200-local-bridge.log", "ab", buffering=0)
+    log = _open_bridge_log()
     reason = "hidshim bridge socket did not come up"
     server_restarted = False
     try:

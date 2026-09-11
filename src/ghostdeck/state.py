@@ -38,6 +38,23 @@ def default_state() -> dict:
     }
 
 
+def _state_root() -> Path:
+    """The directory the state tree hangs off: `STATE_PATH`'s parent.
+
+    Everything this module creates -- the tree `ensure_dirs()` makes, the lock file, the atomic temp
+    file -- is derived here, from the one path whose redirection fully isolates the module. It used
+    to come from the frozen `HOME`/`PLUGIN_DIR`/`BIN_DIR` siblings instead, which are read by other
+    modules (`devicebuild`, `play`, `vhid`) and are therefore patchable independently: a caller that
+    redirected the state file but not those siblings still made `ensure_dirs()` create, and `locked()`
+    lock, the *operator's* real `~/.ghostdeck` (C-148/C-154: 736 mkdir calls into the real tree in a
+    single three-file test run, with the suite reporting green).
+
+    It is also what `os.replace()` needs: a temp file on a different device from its target cannot be
+    renamed over it, so the staging directory has to be the target's own.
+    """
+    return STATE_PATH.parent
+
+
 def ensure_dirs() -> None:
     """Create the state directories, naming a path that is unusable instead of a bare errno.
 
@@ -45,7 +62,8 @@ def ensure_dirs() -> None:
     explicit check because `exist_ok=True` still raises FileExistsError when the path exists as a
     *file* -- a bare errno out of a read-only `ghostdeck status` (A-127).
     """
-    for directory in (HOME, PLUGIN_DIR, BIN_DIR):
+    root = _state_root()
+    for directory in (root, root / "plugins", root / "bin"):
         # Checked before mkdir: `exist_ok=True` raises FileExistsError for a path that exists as a
         # *file*, so the explanatory message below would never be reached.
         if directory.exists() and not directory.is_dir():
@@ -94,7 +112,7 @@ def load() -> dict:
 def locked():
     """Serialize a whole load-mutate-save sequence against other ghostdeck writers."""
     ensure_dirs()
-    fd = os.open(HOME / LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.open(_state_root() / LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
@@ -109,7 +127,7 @@ def _write_state(data: dict) -> None:
     """Unique temp, 0600, atomic replace. The caller must hold `locked()`."""
     ensure_dirs()
     text = json.dumps(_normalized(data), indent=2, sort_keys=True) + "\n"
-    fd, tmp = tempfile.mkstemp(dir=HOME, prefix=".state.json.")
+    fd, tmp = tempfile.mkstemp(dir=_state_root(), prefix=".state.json.")
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(text)

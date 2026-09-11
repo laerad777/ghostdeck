@@ -110,6 +110,16 @@ class StagingError(RuntimeError):
     """
 
 
+class StateFileError(RuntimeError):
+    """The bridge could not publish its own ``--state-file``.
+
+    Raised instead of whichever ``OSError`` failed underneath, because this write
+    happens before any device effect and its message is shown to the user verbatim
+    at the top level, next to ``bridge_socket_in_use`` / ``bridge_stage_failed``.
+    Callers catching ``RuntimeError`` keep working.
+    """
+
+
 def diagnostic_errno(error):
     try:
         number = error.errno if isinstance(error, OSError) else None
@@ -142,10 +152,23 @@ def write_private_state_file(path, text):
     received the record (an arbitrary write, at the temp's 0644, carrying the
     control token). A destination that is not a regular file is dropped instead of
     followed, so the record only ever lands in a file this call just created.
+
+    A destination that cannot be dropped -- a directory at the path, or a parent
+    that cannot be written -- is reported as one ``StateFileError`` rather than
+    escaping as a traceback from ``path.unlink()`` / ``tempfile.mkstemp``: the
+    record is not published, and the path is left exactly as it was.
     """
     if _state_kind(path) == 'foreign':
-        path.unlink()
-    _write_private_file(path, text)
+        try:
+            path.unlink()
+        except OSError as error:
+            raise StateFileError(
+                f'{path} is not an owned regular file and cannot be replaced'
+            ) from error
+    try:
+        _write_private_file(path, text)
+    except OSError as error:
+        raise StateFileError(f'cannot write {path}: {error.strerror or error}') from error
 
 
 def own_state_record(path):
@@ -341,10 +364,10 @@ class DeviceProxy:
     def _reap_stale_remote_dirs(self):
         """Best-effort removal of sibling session directories that are dead leftovers.
 
-        A sibling is removed only when it can be *positively* classified as this
-        bridge's own leftover: the session-directory name shape, and exactly the
-        staged ``proxy`` / ``preload.so`` entries, each with the byte size of the
-        binary this bridge pushes. The name shape alone is not proof -- a foreign
+        A sibling is removed only when it can be *positively* classified as a
+        session directory of this bridge: the session-directory name shape, and
+        exactly the staged ``proxy`` / ``preload.so`` entries, each with a readable
+        non-empty size. The name shape alone is not proof -- a foreign
         ``deadbeefdeadbeef`` matches it -- so this is deliberately not a wildcard
         removal, and anything it cannot classify is left alone.
 
@@ -390,13 +413,24 @@ class DeviceProxy:
         """The directories in a `STALE_SIBLING_LIST_COMMAND` listing that are ours.
 
         Fail closed: an entry whose name or size cannot be read poisons its whole
-        directory, and a directory that is not byte-for-byte a staged pair is not
-        a leftover this bridge can claim.
+        directory, and a directory that is not exactly a staged pair is not a
+        leftover this bridge can claim.
+
+        The byte sizes are deliberately not compared with this build's binaries. A
+        leftover is by definition left behind by an *earlier* revision -- the deck's
+        measured backlog was staged on Sep 5/7 while this host's artifacts are
+        today's -- and nothing on the deck records which build wrote a directory.
+        Requiring equality with the current binary made every older leftover
+        unclassifiable, so the reap that H2 asked for removed none of the seven
+        directories it was measured on. What is left is the proof the deck can
+        actually give: a session-directory name, exactly the two staged entry names
+        (enumerated with `ls -A`, so a hidden third entry disqualifies it), and a
+        readable, non-empty size for each entry.
         """
-        expected = self._staged_entry_sizes()
         stdout = getattr(listing, 'stdout', None)
-        if not stdout or expected is None:
+        if not stdout:
             return []
+        staged = sorted((SESSION_DIR_PROXY, SESSION_DIR_PRELOAD))
         contents = {}
         for line in stdout.decode('utf-8', 'replace').splitlines():
             fields = line.strip().split('|')
@@ -405,24 +439,18 @@ class DeviceProxy:
             try:
                 if len(fields) != 3 or entries is None:
                     raise ValueError
-                entries[fields[1]] = int(fields[2])
+                size = int(fields[2])
+                if size <= 0:
+                    raise ValueError
+                entries[fields[1]] = size
             except ValueError:
                 contents[directory] = None
         return sorted(
             directory for directory, entries in contents.items()
-            if entries == expected and directory != self.remote_dir
+            if entries is not None and sorted(entries) == staged
+            and directory != self.remote_dir
             and self._session_dir_shape(directory)
         )
-
-    def _staged_entry_sizes(self):
-        """What a session directory staged by this bridge contains, or None."""
-        try:
-            return {
-                SESSION_DIR_PROXY: self.proxy_binary.stat().st_size,
-                SESSION_DIR_PRELOAD: self.preload_library.stat().st_size,
-            }
-        except OSError:
-            return None
 
     def _stage(self):
         if (not self.proxy_binary.is_file() or not self.preload_library.is_file() or
@@ -2273,10 +2301,14 @@ def main():
     try:
         if arguments.state_file:
             # 0600, unique temp, atomic replace -- see write_private_state_file.
-            write_private_state_file(
-                arguments.state_file,
-                json.dumps({'pid': os.getpid(), 'control': stop_endpoint.state()}),
-            )
+            try:
+                write_private_state_file(
+                    arguments.state_file,
+                    json.dumps({'pid': os.getpid(), 'control': stop_endpoint.state()}),
+                )
+            except StateFileError as error:
+                print(f'bridge_state_file_failed error={error}', file=sys.stderr, flush=True)
+                raise SystemExit(1)
         try:
             transport.start()
         except DeviceAdmissionError as error:

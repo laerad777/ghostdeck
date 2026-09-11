@@ -22,10 +22,15 @@ sys.path.insert(0, str(SRC))
 HINT = "hidapi is not installed (pip install hidapi)"
 # `detect`/`status`/`play` return this for an unusable environment. Not 1, which means "no deck".
 ENV_EXIT = 2
+# T16: a deck that is attached but whose adb transport cannot run a command. Its own code, so a
+# script can tell "replug the deck" apart from "install hidapi" (2) and "no deck attached" (1).
+OFFLINE_EXIT = 3
 
 NO_BACKEND = {"serial": None, "vid": None, "pid": None, "mode": "none", "dependency": HINT}
 NO_DECK = {"serial": None, "vid": None, "pid": None, "mode": "none"}
 REAL_DECK = {"serial": "ABC123XYZ", "vid": 0x2207, "pid": 0x0019, "mode": "hid"}
+# The wedged deck's USB verdict, from the real host: enumerated as ADB, adbd not answering.
+WEDGED_DECK = {"serial": "ABC123XYZ", "vid": 0x18D1, "pid": 0xD002, "mode": "adb"}
 
 
 @pytest.fixture
@@ -138,3 +143,86 @@ def test_main_maps_a_missing_backend_to_the_environment_exit_code(monkeypatch, c
     assert code == ENV_EXIT, (code, captured)
     assert HINT in captured.err, captured
     assert "Traceback" not in captured.err + captured.out
+
+
+# --- T16: `detect`/`status` must not report an unusable deck as a healthy one -------------
+
+
+def _stub_transport(monkeypatch, serial, state, blocked=()):
+    """Replace `play.deck_transport`, returning the recorded keyword arguments.
+
+    `detect`/`status` consult the transport only for an ADB-mode verdict, so any test here that
+    stubs `usb.detect` to ADB MUST stub this too: otherwise the CLI would run the operator's real
+    `adb`, and this host has a real deck attached.
+    """
+    from ghostdeck import play
+
+    calls = []
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return serial, state, list(blocked)
+
+    monkeypatch.setattr(play, "deck_transport", spy)
+    return calls
+
+
+def test_detect_does_not_report_a_wedged_deck_as_healthy(monkeypatch, capsys):
+    """T16: `detect` exited 0 with `mode=adb` for a deck that could not run a single command."""
+    calls = _stub_transport(monkeypatch, "ABC123XYZ", "offline")
+    code = _run(monkeypatch, WEDGED_DECK, "detect")
+    captured = capsys.readouterr()
+    assert code == OFFLINE_EXIT, (code, captured)
+    assert "mode=adb (offline)" in captured.err, captured
+    assert "power-cycle" in captured.err and "replug" in captured.err, captured
+    assert "no device" not in captured.err + captured.out, captured
+    # A diagnostic must not reset the adb server it is reporting on (A-134).
+    assert calls == [{"restart": False}], calls
+
+
+def test_detect_still_reports_a_usable_deck(monkeypatch, capsys):
+    """The distinction must not turn a healthy ADB deck into an error."""
+    _stub_transport(monkeypatch, "ABC123XYZ", "device")
+    code = _run(monkeypatch, WEDGED_DECK, "detect")
+    captured = capsys.readouterr()
+    assert code == 0, (code, captured)
+    assert "mode=adb" in captured.out, captured
+    assert "offline" not in captured.out + captured.err, captured
+    assert captured.err == "", captured
+
+
+def test_detect_reports_an_offline_device_it_cannot_attribute(monkeypatch, capsys):
+    """No USB verdict (the venv has neither hidapi nor pyusb), but `adb` lists a wedged device.
+
+    The deck cannot be proven, so the state is reported without claiming which device it is, and
+    without falling back to `no device` - that fallback is what told a user to check a cable.
+    """
+    _stub_transport(monkeypatch, None, "", blocked=[("SAMPLE0000000001", "offline")])
+    code = _run(monkeypatch, WEDGED_DECK, "detect")
+    captured = capsys.readouterr()
+    assert code == OFFLINE_EXIT, (code, captured)
+    assert "mode=adb (offline)" in captured.err, captured
+    assert "SAMPLE0000000001" in captured.err, captured
+    assert "not identified as the D200" in captured.err, captured
+    assert "power-cycle" in captured.err, captured
+
+
+def test_status_annotates_an_offline_transport(monkeypatch, capsys, home):
+    """T16: `usb=adb` alone read as healthy. The mode is real, so it is kept and annotated."""
+    _stub_transport(monkeypatch, "ABC123XYZ", "offline")
+    code = _run(monkeypatch, WEDGED_DECK, "status")
+    captured = capsys.readouterr()
+    assert code == OFFLINE_EXIT, (code, captured)
+    assert "usb=adb (offline)" in captured.out, captured
+    assert "release_gate=" in captured.out, captured
+    assert "power-cycle" in captured.err, captured
+
+
+def test_status_still_exits_zero_for_a_usable_deck(monkeypatch, capsys, home):
+    _stub_transport(monkeypatch, "ABC123XYZ", "device")
+    code = _run(monkeypatch, WEDGED_DECK, "status")
+    captured = capsys.readouterr()
+    assert code == 0, (code, captured)
+    assert "usb=adb" in captured.out, captured
+    assert "offline" not in captured.out + captured.err, captured
+    assert captured.err == "", captured

@@ -247,3 +247,59 @@ def test_the_cli_publishes_a_private_state_file_while_it_runs(deckless_bridge, s
     finally:
         process.wait(timeout=30)
     assert "Traceback" not in process.stdout.read()
+
+
+# --- C-139: an unusable destination is one reported line, not a traceback ---------
+
+def test_a_directory_at_the_destination_is_reported_not_followed(tmp_path):
+    """`_state_kind` classifies a directory as 'foreign', and `unlink()` cannot drop one."""
+    parent = tmp_path / "scratch"
+    parent.mkdir()
+    destination = parent / "state.pid"
+    destination.mkdir()
+
+    with pytest.raises(bridge.StateFileError) as raised:
+        bridge.write_private_state_file(destination, json.dumps(RECORD))
+
+    assert "cannot be replaced" in str(raised.value)
+    assert isinstance(raised.value, RuntimeError), "callers catching RuntimeError keep working"
+    assert isinstance(raised.value.__cause__, OSError)
+    assert destination.is_dir(), "the foreign entry is left exactly as it was"
+    assert temp_siblings(parent) == []
+
+
+@pytest.mark.parametrize("shape", ["directory", "missing-parent", "unwritable-parent"])
+def test_the_cli_reports_an_unusable_state_path_in_one_line(deckless_bridge, scratch,
+                                                           isolated_home, shape):
+    """The state file is written before `transport.start()`, outside any handler.
+
+    A raw traceback here also meant the bridge went on to stage to the deck even
+    though it could not publish the record it was asked for.
+    """
+    state_file = scratch / "state.pid"
+    restore = None
+    if shape == "directory":
+        state_file.mkdir()
+    elif shape == "missing-parent":
+        state_file = scratch / "nope" / "state.pid"
+    else:
+        parent = scratch / "ro"
+        parent.mkdir()
+        parent.chmod(0o500)
+        restore = parent
+        state_file = parent / "state.pid"
+
+    try:
+        result = run_bridge(deckless_bridge, scratch, state_file, home=isolated_home)
+    finally:
+        if restore is not None:
+            restore.chmod(0o700)
+
+    assert result.returncode == 1, result.stderr
+    assert "bridge_state_file_failed" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "bridge_stage_failed" not in result.stderr, (
+        "the record could not be published, so the bridge must refuse before any device effect"
+    )
+    if shape == "directory":
+        assert state_file.is_dir()

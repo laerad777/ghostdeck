@@ -46,7 +46,15 @@ PROXY_BYTES = b"p" * 96
 PRELOAD_BYTES = b"l" * 48
 STALE = "/tmp/.d200-zkgui-0123456789abcdef"
 FOREIGN = "/tmp/.d200-zkgui-deadbeefdeadbeef"
-STAGED_FILES = (("proxy", len(PROXY_BYTES)), ("preload.so", len(PRELOAD_BYTES)))
+# Captured hardware fact (tasks/FIX-5-T10.md): the seven session directories the
+# master's real-deck run found hold `preload.so` 14,216 B + `proxy` 53,572 B, i.e.
+# they were staged by an EARLIER build than this host's artifacts (14,656 / 62,140
+# B when this file was written). The listing below uses those deck sizes on
+# purpose: a fixture that generated both the binaries and the listing from one
+# constant could only ever test the classifier against numbers this code produced
+# (C-152).
+DECK_PRELOAD_BYTES = 14216
+DECK_PROXY_BYTES = 53572
 BUILD_ARTIFACTS = ("d200-zkgui-proxy", "d200-color-agent", "libd200-zkgui-preload.so")
 
 
@@ -61,7 +69,7 @@ def isolated_home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def staged(tmp_path):
-    """The local binaries a session stages, at their real sizes."""
+    """The local build artifacts, at stand-in sizes unrelated to the deck listing."""
     proxy_binary = tmp_path / "d200-zkgui-proxy"
     preload_library = tmp_path / "libd200-zkgui-preload.so"
     proxy_binary.write_bytes(PROXY_BYTES)
@@ -91,12 +99,12 @@ def make_proxy(staged, listing=""):
     )
 
 
-def staged_listing(*directories, size=None):
+def staged_listing(*directories, proxy_bytes=DECK_PROXY_BYTES, preload_bytes=DECK_PRELOAD_BYTES):
     """A deck listing holding another session's staged pair, as the device prints it."""
     return "".join(
-        f"{directory}|{name}|{len(size) if size is not None else default}\n"
+        f"{directory}|{name}|{size}\n"
         for directory in directories
-        for name, default in STAGED_FILES
+        for name, size in (("proxy", proxy_bytes), ("preload.so", preload_bytes))
     )
 
 
@@ -146,9 +154,33 @@ def test_a_hidden_extra_entry_disqualifies_a_sibling(staged):
     ]
 
 
-def test_a_sibling_from_another_build_is_left_alone(staged):
-    """Only the binaries *this* bridge pushes are claimed; an unclassifiable pair is not."""
-    proxy = make_proxy(staged, staged_listing(STALE, size=b"p" * 64))
+def test_a_sibling_from_an_earlier_build_is_reaped(staged):
+    """The deck's measured pair is 53,572/14,216 B while this build stages 96/48 B.
+
+    C-142/C-152: comparing the listing against the CURRENT build's byte sizes made
+    every pre-existing leftover unclassifiable, so the reap removed none of the
+    seven directories H2 was dispatched for.
+    """
+    listing = f"{STALE}|proxy|{DECK_PROXY_BYTES}\n{STALE}|preload.so|{DECK_PRELOAD_BYTES}\n"
+    proxy = make_proxy(staged, listing)
+    proxy.remote_dir_staged = True
+
+    proxy._remove_remote_dir()
+
+    assert (
+        proxy.proxy_binary.stat().st_size, proxy.preload_library.stat().st_size,
+    ) != (DECK_PROXY_BYTES, DECK_PRELOAD_BYTES), "the fixture must not derive both sides"
+    assert issued(proxy) == [
+        ("shell", f"rm -rf {proxy.remote_dir}"),
+        ("shell", bridge.STALE_SIBLING_LIST_COMMAND),
+        ("shell", f"rm -rf {STALE}"),
+    ]
+
+
+def test_a_sibling_with_an_empty_entry_is_not_reaped(staged):
+    """An empty file is not a pushed artifact; the pair must hold real bytes."""
+    listing = staged_listing(STALE, proxy_bytes=0)
+    proxy = make_proxy(staged, listing)
     proxy.remote_dir_staged = True
 
     proxy._remove_remote_dir()
@@ -161,7 +193,7 @@ def test_a_sibling_from_another_build_is_left_alone(staged):
 
 def test_a_missing_or_unmeasured_file_is_not_reaped(staged):
     """A pair with no readable size cannot be classified at all."""
-    listing = f"{STALE}|proxy|{len(PROXY_BYTES)}\n{STALE}|preload.so|\n"
+    listing = f"{STALE}|proxy|{DECK_PROXY_BYTES}\n{STALE}|preload.so|\n"
     proxy = make_proxy(staged, listing)
     proxy.remote_dir_staged = True
 

@@ -119,19 +119,31 @@ def test_studio_preflight_passes_with_all_tools_present(tmp_path, monkeypatch):
 
 
 def test_studio_preflight_skipped_when_copy_already_usable(tmp_path, monkeypatch):
-    """No build happens, so a missing toolchain must not block a working copy."""
+    """No build happens, so a missing toolchain must not block a working copy.
+
+    Every path `copy_exists()` consults is redirected, not just `COPY`. `SHIM`, `REAL` and `EXE`
+    are derived from `COPY` at import time, so patching only `COPY` left `copy_exists()` reading
+    the operator's real `~/Applications` copy: this test then passed on a host where the master had
+    already built one, and failed under an isolated HOME. Measured at HEAD with a temp HOME and the
+    toolchain stubbed out -> `RuntimeError: ditto not on PATH`, from the preflight this test exists
+    to prove is skipped. The `copy_exists()` assertion below keeps the redirect honest, so an
+    incomplete one fails here instead of silently reading the real $HOME.
+    """
     from ghostdeck import studio
 
     copy = tmp_path / "Ulanzi Studio ADB.app"
-    for relative in (
-        "Contents/Frameworks/libhidapi.0.dylib",
-        "Contents/Frameworks/libhidapi.0.real.dylib",
-        "Contents/MacOS/UlanziDeck",
-    ):
-        target = copy / relative
+    shim = copy / "Contents/Frameworks/libhidapi.0.dylib"
+    real = copy / "Contents/Frameworks/libhidapi.0.real.dylib"
+    exe = copy / "Contents/MacOS/UlanziDeck"
+    for target in (shim, real, exe):
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("")
+        target.write_text("", encoding="utf-8")
     monkeypatch.setattr(studio, "COPY", copy)
+    monkeypatch.setattr(studio, "SHIM", shim)
+    monkeypatch.setattr(studio, "REAL", real)
+    monkeypatch.setattr(studio, "EXE", exe)
     monkeypatch.setattr(studio, "ORIGINAL", tmp_path / "original-does-not-exist.app")
     monkeypatch.setattr(studio.shutil, "which", lambda name: None)
+
+    assert studio.copy_exists() is True, "the redirect is incomplete; this would read the real $HOME"
     studio.ensure_copy()  # returns early; must not raise
