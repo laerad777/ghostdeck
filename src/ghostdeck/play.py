@@ -95,9 +95,11 @@ def _probe_start_time(pid):
     * ``(None, reason)`` – ps itself could not answer, so identity is undeterminable.
 
     ``LC_ALL=C`` is forced so a recorded string cannot diverge from a later reading by locale, and
-    ``-ww`` prevents truncation.
+    ``TZ=UTC`` so it cannot diverge by timezone: `ps -o lstart=` renders a LOCAL-time string, so a
+    record taken under, say, Asia/Seoul and a read under UTC would otherwise disagree by 9 hours and
+    make a still-running player look like a recycled pid. `-ww` prevents truncation.
     """
-    env = dict(os.environ, LC_ALL="C")
+    env = dict(os.environ, LC_ALL="C", TZ="UTC")
     try:
         result = subprocess.run(
             ["ps", "-o", "lstart=", "-ww", "-p", str(pid)],
@@ -247,8 +249,8 @@ def playing() -> bool:
     return _is_our_player(gdstate.load().get("play_pid")) is True
 
 
-def stop() -> None:
-    _kill_play()
+def _cleanup_device() -> None:
+    """Restore the stock UI and clear the deck's staging dir. Raises on any fatal step."""
     serial = adb.serial_from_devices()
     if not serial:
         raise RuntimeError("no ADB device reachable: stock UI not restored and /tmp/ghostdeck-* not cleared")
@@ -266,3 +268,26 @@ def stop() -> None:
     listing = adb.run(["-s", serial, "shell", "ls /tmp/ghostdeck*"], capture_output=True, text=True)
     if listing.returncode == 0 and listing.stdout:
         print(listing.stdout, end="")
+
+
+def stop() -> None:
+    """Stop our player, then restore the deck.
+
+    The player's identity decides the exit code only, never whether the deck is restored: an
+    unverifiable pid is left exactly as it is (nothing signalled, nothing erased) and the cleanup
+    still runs, because skipping it would leave the stock UI stopped and the staged files on the
+    device with no other command able to restore them.
+    """
+    identity_error = None
+    try:
+        _kill_play()
+    except RuntimeError as error:
+        identity_error = error
+    try:
+        _cleanup_device()
+    except RuntimeError as cleanup_error:
+        if identity_error is None:
+            raise
+        raise RuntimeError(f"{cleanup_error} (as well as: {identity_error})") from cleanup_error
+    if identity_error is not None:
+        raise identity_error

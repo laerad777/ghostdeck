@@ -26,6 +26,9 @@ PID_MAX = 2 ** 31 - 1
 ADMISSION_LOCK_NAME = "device-admission.lock"
 # Identity oracle shared with src/ghostdeck/play.py, which records the same pair.
 _PS_TIMEOUT = 5
+# The published record's owner identity, beside the record: {"pid", "lstart"}.
+# It is a *separate* file because the published record's JSON schema is fixed.
+OWNER_SUFFIX = ".owner"
 
 
 class DeviceAdmissionError(RuntimeError):
@@ -155,8 +158,10 @@ def _process_start_time(pid):
 
     ``LC_ALL=C`` keeps a recorded string from diverging from a later reading by
     locale and ``-ww`` prevents truncation, exactly as ``src/ghostdeck/play.py``
-    proves ownership. An out-of-range pid cannot be asked about, so it is reported
-    as "no such process" rather than handed to ps.
+    proves ownership. Both identity users in this module -- the device-admission
+    lock holder and the published record's owner -- go through this one oracle, so
+    the two lanes agree on how identity is proven. An out-of-range pid cannot be
+    asked about, so it is reported as "no such process" rather than handed to ps.
     """
     if type(pid) is not int or not 0 < pid <= PID_MAX:
         return None, None
@@ -233,7 +238,97 @@ def _state_kind(path):
     return "regular" if stat.S_ISREG(info.st_mode) else "foreign"
 
 
+def _write_private_file(path, text):
+    """Unique temp in the destination directory, 0600, atomic replace."""
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _owner_path(path):
+    return path.with_name(path.name + OWNER_SUFFIX)
+
+
+def _read_owner(path):
+    """The recorded ``{"pid", "lstart"}`` owner, or None when it is unusable."""
+    recorded = _read_state(_owner_path(path))
+    if recorded is None:
+        return None
+    pid, lstart = recorded.get("pid"), recorded.get("lstart")
+    if type(pid) is not int or not 0 < pid <= PID_MAX:
+        return None
+    if not isinstance(lstart, str) or not lstart.strip():
+        return None
+    return {"pid": pid, "lstart": " ".join(lstart.split())}
+
+
+def _record_owner(path, updated):
+    """Bind the published pid to a start time, so a recycled pid cannot pass for it.
+
+    Only the process that *is* the published pid can record its own start time; a
+    publisher writing a record about some other process leaves the identity alone.
+    A failure here is not an error: the identity is advisory, and losing it only
+    makes a later foreign publication more cautious.
+    """
+    pid = updated.get("pid")
+    if pid != os.getpid():
+        return
+    recorded = _read_owner(path)
+    if recorded is not None and recorded["pid"] == pid:
+        return  # already bound; a live process's start time cannot change
+    lstart, _reason = _process_start_time(pid)
+    if lstart is None:
+        return  # nothing trustworthy to record, so identity stays unprovable
+    try:
+        _write_private_file(_owner_path(path), json.dumps({"pid": pid, "lstart": lstart}) + "\n")
+    except OSError:
+        pass
+
+
+def _owner_is_live_elsewhere(current, path):
+    """True when the record is provably held by another process that still runs.
+
+    Liveness alone is not identity: a recycled pid answers ``os.kill(pid, 0)`` just
+    as the previous owner did. The recorded start time is what distinguishes them.
+    Everything that cannot be proven -- no recorded identity for the pid, a ps that
+    cannot answer -- counts as owned, because the alternative is clobbering a live
+    owner's record, and a skipped publication costs diagnostics only.
+    """
+    pid = current.get("pid")
+    if not _pid_alive(pid):
+        return False
+    recorded = _read_owner(path)
+    if recorded is None or recorded["pid"] != pid:
+        return True
+    live, reason = _process_start_time(pid)
+    if reason is not None:
+        return True
+    if live is None:
+        return False  # ps ran and reports no such process
+    return live == recorded["lstart"]
+
+
 def publish_video_state(state, *, claim=False, state_path=HOST_STATE):
+    """Publish the advisory record, or skip the publication.
+
+    A non-claim publication runs inside the media send loop (the player's
+    ``on_progress``), so it never raises: an unwritable state root, a destination
+    that cannot be taken over, and an owner that cannot be proven gone all skip the
+    publication and let the send continue. The published JSON schema, the phase
+    names and the parameters are unchanged; a skipped publication leaves the file
+    exactly as it was and returns the payload that was not written, so the caller's
+    own state is never replaced by another process's record.
+
+    ``claim=True`` is the deliberate startup takeover: it still raises, so a broken
+    state root or a foreign destination is reported at startup rather than silently.
+    """
     path = Path(state_path)
     updated = json.loads(json.dumps(state))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,23 +341,22 @@ def publish_video_state(state, *, claim=False, state_path=HOST_STATE):
         try:
             path.unlink()
         except OSError as error:
-            raise RuntimeError("state path is not an owned regular file") from error
+            if claim:
+                raise RuntimeError("state path is not an owned regular file") from error
+            return updated
         kind = "absent"
     if not claim:
         current = _read_state(path) if kind == "regular" else None
         if current is not None and current.get("pid") != updated.get("pid"):
-            if _pid_alive(current.get("pid")):
-                raise RuntimeError("playback publication ownership lost")
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
-    temporary = Path(temporary)
+            if _owner_is_live_elsewhere(current, path):
+                return updated
     try:
-        with os.fdopen(descriptor, "w") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(json.dumps(updated) + "\n")
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+        _write_private_file(path, json.dumps(updated) + "\n")
+    except OSError:
+        if claim:
+            raise
+        return updated
+    _record_owner(path, updated)
     return updated
 
 

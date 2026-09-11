@@ -274,6 +274,10 @@ def test_vhid_status_observes_persisted_iohid_while_the_pid_lives(state_path, mo
     attached to the host running the suite, and `vhid.status()` reaches `usb.virtual_hid_enumerated()`
     on the `ghostdeck status` path; stubbing keeps the assertion identical while guaranteeing zero
     device contact under any interpreter.
+
+    The live pid also has to be *verifiably* ours (A-125), so its start time is recorded the way
+    `vhid.start()` records a keeper it really spawned; a bare live pid is no longer enough to be
+    reported as up, which is the whole point of the identity check.
     """
     from ghostdeck import usb, vhid
 
@@ -291,6 +295,7 @@ def test_vhid_status_observes_persisted_iohid_while_the_pid_lives(state_path, mo
             }
         }
     )
+    vhid._record_identity(os.getpid())
     record = vhid.status()
     assert record["status"] == "up"
     assert record["iohid"] is True

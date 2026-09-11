@@ -227,19 +227,6 @@ def test_recipe_rejects_a_host_static_library(tmp_path):
     assert "Mach-O" in combined
 
 
-def test_recipe_leaves_no_temp_files_behind(tmp_path):
-    before = {p.name for p in Path("/tmp").glob("tjprobe*")}
-    subprocess.run(
-        ["/bin/sh", str(RECIPE)],
-        capture_output=True,
-        text=True,
-        env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", "HOME": str(tmp_path)},
-        cwd=str(ROOT),
-    )
-    after = {p.name for p in Path("/tmp").glob("tjprobe*")}
-    assert after - before == set()
-
-
 def test_ensure_agent_error_names_the_recipe_and_the_prerequisite(monkeypatch, tmp_path):
     monkeypatch.setattr(devicebuild.gdstate, "BIN_DIR", tmp_path / "bin")
     monkeypatch.setattr(devicebuild, "ROOT", tmp_path / "repo")
@@ -481,3 +468,42 @@ def test_the_agent_is_linked_dynamically_with_a_documented_reason():
     assert "-static" not in compile_line, "-static around dlopen() is the defect B-107 flagged"
     assert "-ldl" in text
     assert "in statically linked applications requires at runtime" in text
+
+
+# The member probe is a `mktemp -d "${TMPDIR}/tjprobe.XXXXXX"` removed by a trap. These two
+# tests assert on a *private* TMPDIR rather than on `/tmp/tjprobe*`: every worker runs this same
+# recipe from `pytest tests/ -q` on this one host, so a global count around the subprocess cannot
+# tell a recipe leak from a neighbour's in-flight probe. Holding an empty `/tmp/tjprobe.<random>`
+# for the duration of the test is enough to red the global version.
+def test_recipe_leaves_no_temp_files_behind(tmp_path):
+    """The probe directory is created before the archiver is consulted, so this die path has to
+    clean it up as well."""
+    probe_root = tmp_path / "private-tmp"
+    probe_root.mkdir()
+    fake_ar = tmp_path / "fake-ar"
+    fake_ar.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_ar.chmod(0o755)
+    archive = tmp_path / "lib.a"
+    archive.write_bytes(b"!<arch>\n" + b"\x00" * 16)
+    result = _run_recipe(
+        "--check-abi",
+        str(archive),
+        home=tmp_path,
+        extra_env={"TMPDIR": str(probe_root), "AR": str(fake_ar)},
+    )
+    assert result.returncode != 0
+    assert list(probe_root.iterdir()) == [], "the recipe leaked its member-probe directory"
+
+
+@needs_cross_toolchain
+def test_the_accepting_path_leaves_no_temp_files_behind(tmp_path):
+    """Same hygiene check on the path that succeeds and runs to completion."""
+    probe_root = tmp_path / "private-tmp-accept"
+    probe_root.mkdir()
+    archive = _gnu_arm_archive(tmp_path)
+    path = _tool_path(tmp_path, [*RECIPE_TOOLS, "armv7-linux-gnueabihf-ar"])
+    result = _run_recipe(
+        "--check-abi", str(archive), path=path, home=tmp_path, extra_env={"TMPDIR": str(probe_root)}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert list(probe_root.iterdir()) == [], "the recipe leaked its member-probe directory"

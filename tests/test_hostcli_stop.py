@@ -106,6 +106,7 @@ def _cli(
     pre_state: dict | None = None,
     sidecar: dict | str | None = None,
     system_path: str = "/usr/bin:/bin",
+    tz: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str], Path]:
     """Run the CLI with a temp HOME and an explicit PATH.
 
@@ -133,6 +134,8 @@ def _cli(
         PYTHONPATH=str(SRC),
         FAKE_ADB_LOG=str(log),
     )
+    if tz is not None:
+        env["TZ"] = tz
     result = subprocess.run(
         [sys.executable, "-m", "ghostdeck.cli", *(args or ("stop",))],
         cwd=str(ROOT),
@@ -300,10 +303,10 @@ def test_stop_does_not_kill_a_recycled_pid(tmp_path):
         assert result.returncode != 0, result.stdout
         assert "cannot verify" in result.stderr
         assert _alive(victim), "stop() killed an unrelated process holding a recycled pid"
-        # The abort happens in `_kill_play()` before any device work, so adb is never invoked. This
-        # is a real assertion because HAPPY_ADB logs every invocation (see
-        # test_every_fake_adb_logs_its_invocations).
-        assert len(calls) == 0, f"stop() contacted the device despite unknown identity: {calls}"
+        # A-101: the identity problem decides the exit code, never whether the deck is restored.
+        # The cleanup runs in full even here, which is a real assertion because HAPPY_ADB logs
+        # every invocation (see test_every_fake_adb_logs_its_invocations).
+        assert calls == STOP_ARGV, f"the deck was left unrestored: {calls}"
         state = json.loads((home / ".ghostdeck" / "state.json").read_text())
         assert state["play_pid"] == victim.pid  # unclassifiable pid must not be erased
     finally:
@@ -569,15 +572,20 @@ def test_identity_helpers_reject_junk_and_survive_a_missing_record(tmp_path, mon
 
 
 def test_stop_does_not_signal_recycled_pid_even_when_no_device(tmp_path):
-    """`_kill_play()` runs before the ADB check, so the victim must survive the no-device path too."""
+    """`_kill_play()` still decides nothing about signalling; the cleanup is merely attempted.
+
+    A-101: discovery runs (so the deck is reached) even though the identity is unknown; without a
+    serial nothing further may be attempted, and both problems are reported on the one exit path.
+    """
     victim = _victim()
     try:
         time.sleep(0.2)
         result, calls, _ = _cli(NO_DEVICE_ADB, tmp_path, "stop", pre_state={"play_pid": victim.pid})
         assert result.returncode != 0, result.stdout
         assert "cannot verify" in result.stderr
+        assert "no ADB device" in result.stderr, result.stderr
         assert _alive(victim)
-        assert len(calls) == 0, f"stop() contacted the device despite unknown identity: {calls}"
+        assert calls == [DEVICES_ARGV], f"discovery must run, and nothing past it without a serial: {calls}"
     finally:
         victim.kill()
         victim.wait()
@@ -597,3 +605,111 @@ def test_stale_dead_pid_is_cleared_without_ps_noise(tmp_path):
     assert result.returncode == 0, result.stderr
     assert calls  # the adb cleanup still ran
     assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
+
+
+# --- A-124: identity must not depend on the caller's timezone ------------------
+
+
+def test_start_time_is_timezone_independent(tmp_path, monkeypatch):
+    """A-124: `ps -o lstart=` prints local time, so the probe must pin the zone, not just the locale.
+
+    Without `TZ=UTC` in the child env the two readings differ by the host's offset (9 hours here)
+    and a still-running player is misread as a recycled pid. This is the unit-level half: the same
+    pid must produce the same string whatever the caller's TZ is.
+    """
+    from ghostdeck import play
+
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        monkeypatch.setenv("TZ", "Asia/Seoul")
+        under_seoul = play._probe_start_time(ours.pid)
+        monkeypatch.setenv("TZ", "UTC")
+        under_utc = play._probe_start_time(ours.pid)
+        monkeypatch.setenv("TZ", "America/New_York")
+        under_ny = play._probe_start_time(ours.pid)
+        assert under_seoul[1] is None and under_utc[1] is None and under_ny[1] is None
+        assert under_seoul == under_utc == under_ny, (under_seoul, under_utc, under_ny)
+        assert under_utc[0], "the probe returned no start time for a live pid"
+    finally:
+        ours.kill()
+        ours.wait()
+
+
+def test_identity_survives_a_timezone_change_between_record_and_stop(tmp_path, monkeypatch):
+    """A-124 end to end: a player recorded under one zone must still be recognised under another.
+
+    The bug's full shape: `play` records the sidecar under the ambient zone, `stop` later runs under
+    `TZ=UTC` (an exported TZ, a launchd job, a cron wrapper), the strings disagree, the verdict is
+    the 'stale record' False branch, and the live player is both left running and erased. Here the
+    record happens under TZ=Asia/Seoul and the stop under TZ=UTC, so the verdict must be unchanged.
+    """
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        monkeypatch.setenv("TZ", "Asia/Seoul")
+        recorded = _record(ours.pid, tmp_path / "home")
+        assert recorded["pid"] == ours.pid
+
+        result, calls, home = _cli(
+            HAPPY_ADB,
+            tmp_path,
+            "stop",
+            pre_state={"play_pid": ours.pid},
+            sidecar=recorded,
+            tz="UTC",
+        )
+        assert result.returncode == 0, result.stderr
+        assert not _alive(ours), "a TZ difference made stop() miss its own running player"
+        assert calls == STOP_ARGV
+        assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
+        assert not (home / ".ghostdeck" / "play.pid").exists()
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+        ours.wait()
+
+
+# --- A-101: an unverifiable pid must not strand the deck -----------------------
+
+
+def test_stop_runs_the_device_cleanup_even_when_the_identity_is_unknown(tmp_path):
+    """A-101: the identity result decides the exit code, never whether the deck is restored.
+
+    Before the fix `stop()` aborted inside `_kill_play()` and made zero adb calls, so the stock UI
+    stayed stopped and the staged files stayed on the device - the one documented recovery command
+    did nothing to the deck. The pid must still be preserved and nothing signalled.
+    """
+    victim = _victim()
+    try:
+        time.sleep(0.3)
+        # A live pid with no recorded identity: the genuinely undeterminable case.
+        result, calls, home = _cli(HAPPY_ADB, tmp_path, "stop", pre_state={"play_pid": victim.pid})
+        assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+        assert "cannot verify" in result.stderr, result.stderr
+        assert "not signalling" in result.stderr, result.stderr
+        assert "Traceback" not in result.stdout + result.stderr
+        assert _alive(victim), "an unclassifiable pid was signalled"
+        assert calls == STOP_ARGV, f"the deck was left exactly as it was: {calls}"
+        saved = json.loads((home / ".ghostdeck" / "state.json").read_text())
+        assert saved["play_pid"] == victim.pid, "the only handle on the player was erased"
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_stop_reports_both_the_identity_and_a_failed_cleanup(tmp_path):
+    """The two failures are independent: neither may hide the other."""
+    victim = _victim()
+    try:
+        time.sleep(0.3)
+        result, calls, _ = _cli(FAILING_ADB, tmp_path, "stop", pre_state={"play_pid": victim.pid})
+        assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+        assert "adb: device offline" in result.stderr, result.stderr
+        assert "cannot verify" in result.stderr, result.stderr
+        assert "Traceback" not in result.stdout + result.stderr
+        assert _alive(victim)
+        assert calls == [DEVICES_ARGV, SETPROP_ARGV]
+    finally:
+        victim.kill()
+        victim.wait()

@@ -19,22 +19,56 @@ import sys
 import threading
 import time
 
-from d200_jpeg import JpegFramer
+from d200_jpeg import JpegFramer, JpegFramingError
 from d200_process_control import StopEndpoint, emit_diagnostic, publish_video_state, video_bridge_request
 import d200_video_stream as wire
 
 import shutil as _shutil
 ADB = _shutil.which("adb") or "adb"
 SERIAL = __import__("os").environ.get("GHOSTDECK_SERIAL") or ""
-MAX_JPEG_BYTES = 1024 * 1024
+# The framer's budget is the deck's own cap, taken from the wire module so the two
+# cannot drift; align_jpeg_payload applies the stricter padded budget below.
+MAX_JPEG_BYTES = wire.MAX_JPEG
 HOST_STATE = Path("/tmp/d200-color-host.json")
 BRIDGE_SOCKET = Path("/tmp/d200-adb-bridge.sock")
 # Keep FRAME records under 12KiB; 14387-byte records stalled at upHave=12288.
 FRAME_JPEG_CHUNK = 12288 - wire.HEADER_SIZE - 16
+
+
 def align_jpeg_payload(frame):
+    """Return the bytes to fragment into FRAME records for one JPEG.
+
+    Two branches, and the distinction is the whole point of this helper:
+
+    * The frame's own length must fit the deck. `total` is at least the frame
+      length, and `d200_vs_validate_payload` case 3 requires
+      `total <= D200_VS_MAX_JPEG`, so a longer frame is refused here by name.
+    * Otherwise the frame is padded up to a whole `FRAME_JPEG_CHUNK` fragment
+      *only while the padded total still fits the cap*. Past that the frame is
+      returned unpadded, which costs nothing: the device completes a frame by
+      accumulated offset (`d200_vs_state_accept`, kind 3:
+      `s->partial_offset += h->payload_length - 16; if (s->partial_offset ==
+      total)`), and the reader's own bound is the inequality
+      `n - 16 <= total - offset`, i.e. a short final fragment is explicitly
+      allowed. Padding was never a protocol requirement; the comment above this
+      chunk size records a stall caused by records that were TOO BIG, and a
+      shorter final record cannot re-introduce that.
+
+    So for every frame whose padded length fits, the bytes returned are identical
+    to the padded-only revision; only frames that used to be refused change, and
+    they change from "error" to "sent with a short final fragment".
+    """
+    if len(frame) > wire.MAX_JPEG:
+        raise JpegFramingError(
+            f"JPEG frame of {len(frame)} bytes exceeds the {wire.MAX_JPEG}-byte deck cap; "
+            "reduce tile size or check ffmpeg output"
+        )
     remainder = len(frame) % FRAME_JPEG_CHUNK
-    if remainder:
-        frame += b'\x00' * (FRAME_JPEG_CHUNK - remainder)
+    if not remainder:
+        return frame
+    padding = FRAME_JPEG_CHUNK - remainder
+    if len(frame) + padding <= wire.MAX_JPEG:
+        return frame + b'\x00' * padding
     return frame
 
 

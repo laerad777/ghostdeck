@@ -27,6 +27,12 @@ EXE = COPY / "Contents/MacOS/UlanziDeck"
 
 _BUILD_TOOLS = ("ditto", "xcrun", "clang", "install_name_tool", "codesign")
 
+# Endpoint probe outcomes. `dead` is the only state that permits removing the path.
+_ENDPOINT_LIVE = "live"
+_ENDPOINT_DEAD = "dead"
+_ENDPOINT_UNDETERMINABLE = "undeterminable"
+_PROBE_TIMEOUT = 0.4
+
 # A deck that has just re-enumerated through ADB answers device commands late, the HID-to-ADB
 # switch report itself is flaky, and the bridge exits on the first rejected device command, so
 # bridge bring-up is prepared and retried instead of reported from a single attempt.
@@ -93,7 +99,12 @@ def _quit_copy(*, timeout: float = 15.0) -> None:
 def launch() -> None:
     ensure_copy()
     devicebuild.ensure()
-    if not _socket_live():
+    endpoint, reason = _socket_state()
+    if endpoint == _ENDPOINT_UNDETERMINABLE:
+        # Refuse before touching the copy: quitting a healthy shim for a bridge that then cannot
+        # be started would leave the user with neither.
+        raise _undeterminable_endpoint(reason)
+    if endpoint == _ENDPOINT_DEAD:
         # Studio holds HID interface 0 while it runs, so the HID-to-ADB switch needs
         # the copy stopped first; a restarted bridge also leaves an already running
         # copy holding a dead shim, so it is relaunched either way.
@@ -173,18 +184,51 @@ def ensure_copy() -> None:
     )
 
 
-def _socket_live() -> bool:
+def _socket_state() -> tuple[str, str]:
+    """Classify the bridge endpoint: ``("live" | "dead" | "undeterminable", reason)``.
+
+    Same discipline as `socket_listener_live` in vendor/d200-local-bridge.py: only a refused
+    connection or a missing path proves that no listener owns the endpoint. Every other failure
+    (EMFILE, a drain timeout, EACCES, a path that is not a socket) means liveness cannot be
+    excluded, so a caller must not unlink the path.
+
+    The socket construction sits inside the `try`, so fd exhaustion cannot escape as a raise: this
+    is a probe, and its answer is a state, not an exception.
+    """
     if not SOCKET.exists():
-        return False
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        return _ENDPOINT_DEAD, "endpoint is absent"
+    probe = None
     try:
-        client.settimeout(0.4)
-        client.connect(str(SOCKET))
-        return True
-    except OSError:
-        return False
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(_PROBE_TIMEOUT)
+        probe.connect(str(SOCKET))
+        return _ENDPOINT_LIVE, ""
+    except (ConnectionRefusedError, FileNotFoundError):
+        return _ENDPOINT_DEAD, "no listener accepted the connection"
+    except OSError as error:
+        return _ENDPOINT_UNDETERMINABLE, f"{type(error).__name__}: {error}"
     finally:
-        client.close()
+        if probe is not None:
+            probe.close()
+
+
+def _socket_live() -> bool:
+    """True only when a probe reached a listening bridge. Undeterminable is not live.
+
+    Only for callers whose question really is "is the bridge up yet?" — the post-spawn readiness
+    poll. Every decision that can *destroy* something (reclaiming the path, spawning a second
+    bridge) goes through `_socket_state()`, because collapsing undeterminable into False is what
+    let the caller remove a live endpoint.
+    """
+    return _socket_state()[0] == _ENDPOINT_LIVE
+
+
+def _undeterminable_endpoint(reason: str) -> RuntimeError:
+    """One-line refusal used wherever the endpoint cannot be classified."""
+    return RuntimeError(
+        f"cannot verify whether a bridge is already listening on {SOCKET} ({reason}); "
+        f"leaving the endpoint alone and not starting a second bridge"
+    )
 
 
 def _bus_serial() -> str:
@@ -274,8 +318,11 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
 
 
 def _ensure_bridge() -> None:
-    if _socket_live():
+    endpoint, probe_reason = _socket_state()
+    if endpoint == _ENDPOINT_LIVE:
         return
+    if endpoint == _ENDPOINT_UNDETERMINABLE:
+        raise _undeterminable_endpoint(probe_reason)
     if not BRIDGE.is_file():
         raise RuntimeError(f"bridge missing: {BRIDGE}")
     log = open("/tmp/d200-local-bridge.log", "ab", buffering=0)
@@ -292,8 +339,17 @@ def _ensure_bridge() -> None:
             if not _device_ready(serial, timeout=BRIDGE_READY_TIMEOUT):
                 reason = "D200 stopped answering device commands after switching to ADB"
                 continue
-            if SOCKET.exists():
+            # Re-probe immediately before spawning: a bridge that came up meanwhile is used as
+            # is, an unclassifiable endpoint refuses, and only a proven-dead path is reclaimed.
+            endpoint, probe_reason = _socket_state()
+            if endpoint == _ENDPOINT_LIVE:
+                return
+            if endpoint == _ENDPOINT_UNDETERMINABLE:
+                raise _undeterminable_endpoint(probe_reason)
+            try:
                 SOCKET.unlink()
+            except FileNotFoundError:
+                pass
             child = _spawn_bridge(serial, log)
             deadline = time.monotonic() + BRIDGE_WAIT
             while time.monotonic() < deadline:

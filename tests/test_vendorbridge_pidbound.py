@@ -77,12 +77,19 @@ def test_undecodable_or_non_dict_records_are_treated_as_absent(state_dir, conten
     assert json.loads(path.read_text()) == {"phase": "active", "pid": 1}
 
 
-def test_ownership_guard_still_rejects_a_live_foreign_pid(state_dir):
-    """Treating junk as absent must not weaken the real ownership check."""
+def test_ownership_guard_still_protects_a_live_foreign_pid(state_dir):
+    """Treating junk as absent must not weaken the real ownership check.
+
+    FIX-5-T8 changed *how* the guard reports a live foreign owner: this call is the
+    advisory publication inside the media send loop, so it now skips the write
+    instead of raising (see tests/test_vendorbridge_ownership.py). The protection is
+    the same -- the other process's record is not overwritten.
+    """
     path = state_dir / "host.json"
-    path.write_text(json.dumps({"phase": "terminal", "pid": os.getpid()}))
-    with pytest.raises(RuntimeError, match="playback publication ownership lost"):
-        publish_video_state({"phase": "active", "pid": 999999}, state_path=path)
+    original = json.dumps({"phase": "terminal", "pid": os.getpid()})
+    path.write_text(original)
+    publish_video_state({"phase": "active", "pid": 999999}, state_path=path)
+    assert path.read_text() == original
 
 
 def test_a_live_foreign_pid_does_not_block_a_claim(state_dir):
