@@ -5,6 +5,7 @@ import argparse
 import collections
 from contextlib import contextmanager, ExitStack
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,14 +22,33 @@ import threading
 import time
 
 from d200_process_control import (
-    DeviceAdmissionError, StopEndpoint, emit_diagnostic, managed_device_admission,
+    DeviceAdmissionError, StopEndpoint, admission_lock_path, emit_diagnostic,
+    managed_device_admission,
 )
+# FIX-5-T1's private-file/symlink discipline, reused rather than re-implemented:
+# the bridge's own --state-file writer must not be a second, weaker scheme.
+from d200_process_control import _state_kind, _write_private_file
 import d200_video_stream as video_wire
 
 DEFAULT_SOCKET = Path('/tmp/d200-adb-bridge.sock')
 # Fixed device path the stock zkgui proxy execs for video sessions; staged by
 # this bridge and removed again by its teardown.
 STAGED_AGENT = '/tmp/d200-color-agent'
+# Per-session staging directory on the deck: this prefix plus half the session
+# token, so two sessions never share one.
+SESSION_DIR_PREFIX = '/tmp/.d200-zkgui-'
+SESSION_DIR_TOKEN_HEX = 16
+SESSION_DIR_PROXY = 'proxy'
+SESSION_DIR_PRELOAD = 'preload.so'
+# One line per staged entry: '<directory>|<name>|<bytes>'. `ls -A` so a hidden
+# extra entry cannot pass for a clean session directory, and `wc -c` so no
+# stat(1) is required on the deck. Unparseable output is never treated as proof
+# of ownership; see DeviceProxy._stale_siblings.
+STALE_SIBLING_LIST_COMMAND = (
+    f'for d in {SESSION_DIR_PREFIX}*; do [ -d "$d" ] || continue; '
+    'for n in $(ls -A "$d" 2>/dev/null); do '
+    'echo "$d|$n|$(wc -c < "$d/$n" 2>/dev/null)"; done; done'
+)
 ADB_SERIAL = ""
 MAX_MESSAGE = 4096
 MAX_PAYLOAD = 64 * 1024
@@ -71,6 +91,16 @@ class DeviceCommandError(RuntimeError):
                            -(2 ** 31) <= returncode < 2 ** 31 else None)
 
 
+class StagingError(RuntimeError):
+    """The bridge could not be staged on the deck.
+
+    Raised instead of whatever failed underneath, because the message is shown to
+    the user verbatim at the top level: it names the step that failed, while the
+    device command, its output and its exit status stay internal. Callers that
+    only need to know the session is dead catch RuntimeError as before.
+    """
+
+
 def diagnostic_errno(error):
     try:
         number = error.errno if isinstance(error, OSError) else None
@@ -88,6 +118,40 @@ def endpoint_identity(path):
     if not stat.S_ISSOCK(information.st_mode):
         return None
     return (information.st_dev, information.st_ino)
+
+
+def write_private_state_file(path, text):
+    """Publish the bridge's state file under FIX-5-T1's discipline.
+
+    The write itself is `d200_process_control._write_private_file`, imported rather
+    than copied: a unique temp beside the destination, 0600 before the rename, an
+    atomic replace, and the temp removed if any step fails.
+
+    The guard in front of it is what the destination needs, because `--state-file`
+    is operator-supplied. The previous revision wrote a fixed `state.tmp` sibling
+    with `write_text`, so a planted symlink on that path chose the file that
+    received the record (an arbitrary write, at the temp's 0644, carrying the
+    control token). A destination that is not a regular file is dropped instead of
+    followed, so the record only ever lands in a file this call just created.
+    """
+    if _state_kind(path) == 'foreign':
+        path.unlink()
+    _write_private_file(path, text)
+
+
+def own_state_record(path):
+    """The state record at `path` when it is readable, else None -- read safely.
+
+    Only a regular file is read, never through a symlink, a fifo or a device, and
+    junk is simply not ours rather than an error thrown out of a `finally` block.
+    """
+    if _state_kind(path) != 'regular':
+        return None
+    try:
+        stored = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return stored if isinstance(stored, dict) else None
 
 
 def socket_listener_live(path):
@@ -182,7 +246,11 @@ class DeviceProxy:
         self.proxy_binary = Path(proxy_binary)
         self.preload_library = Path(preload_library)
         self.session_token = secrets.token_hex(16)
-        self.remote_dir = f'/tmp/.d200-zkgui-{self.session_token[:16]}'
+        self.remote_dir = f'{SESSION_DIR_PREFIX}{self.session_token[:SESSION_DIR_TOKEN_HEX]}'
+        # True from the first staging command until this instance has removed the
+        # directory again, i.e. while a session directory of its own may exist on
+        # the deck. close() must not short-circuit past the removal while it is set.
+        self.remote_dir_staged = False
         self.process = None
         self.transport_socket = None
         self.reader_stream = None
@@ -232,28 +300,139 @@ class DeviceProxy:
         return result
 
     def _remove_remote_dir(self):
-        path = self.remote_dir
-        prefix = '/tmp/.d200-zkgui-'
-        if (type(path) is not str or not path.startswith(prefix) or
-                len(path) != len(prefix) + 16 or
-                any(c not in '0123456789abcdef' for c in path[len(prefix):])):
-            return
+        """Remove this instance's staging directory, then provable dead leftovers.
+
+        Validated as strictly as before, and it keeps removing its own directory
+        first. The siblings come second because a bridge that dies (SIGKILL, host
+        crash, a failed stage) never removes its own, and nothing else ages them
+        out, so they accumulate on the deck's /tmp forever.
+        """
+        try:
+            path = self.remote_dir
+            if self._session_dir_shape(path):
+                self._remove_staging_dir(path)
+            self._reap_stale_remote_dirs()
+        finally:
+            self.remote_dir_staged = False
+
+    @staticmethod
+    def _session_dir_shape(path):
+        """True only for this bridge's own directory name: prefix + 16 hex digits."""
+        if (type(path) is not str or not path.startswith(SESSION_DIR_PREFIX) or
+                len(path) != len(SESSION_DIR_PREFIX) + SESSION_DIR_TOKEN_HEX):
+            return False
+        return all(c in '0123456789abcdef' for c in path[len(SESSION_DIR_PREFIX):])
+
+    def _remove_staging_dir(self, path):
         try:
             self._run('shell', f'rm -rf {path}', timeout=5)
         except (DeviceCommandError, OSError, subprocess.SubprocessError):
             pass
 
+    def _reap_stale_remote_dirs(self):
+        """Best-effort removal of sibling session directories that are dead leftovers.
+
+        A sibling is removed only when it can be *positively* classified as this
+        bridge's own leftover: the session-directory name shape, and exactly the
+        staged ``proxy`` / ``preload.so`` entries, each with the byte size of the
+        binary this bridge pushes. The name shape alone is not proof -- a foreign
+        ``deadbeefdeadbeef`` matches it -- so this is deliberately not a wildcard
+        removal, and anything it cannot classify is left alone.
+
+        While this instance holds the deck admission it is also the only admitted
+        bridge, so every classified sibling must belong to a session that is gone.
+        Without that admission the reap takes the lock first and holds it, so no
+        live bridge can appear halfway through.
+        """
+        with ExitStack() as guard:
+            if self.admission is None and not self._lock_out_other_bridges(guard):
+                return
+            try:
+                listing = self._run('shell', STALE_SIBLING_LIST_COMMAND, timeout=5)
+            except (DeviceCommandError, OSError, subprocess.SubprocessError):
+                return
+            for path in self._stale_siblings(listing):
+                self._remove_staging_dir(path)
+
+    def _lock_out_other_bridges(self, guard):
+        """Take the admission lock into `guard`; False when another bridge owns it.
+
+        Holding it for the whole reap is what turns "no live bridge owns a sibling"
+        into a proof rather than a guess. A missing lock file means no bridge was
+        ever admitted, and an unreadable one is not proof either way.
+        """
+        try:
+            descriptor = os.open(admission_lock_path(), os.O_RDWR)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        guard.callback(os.close, descriptor)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    def _stale_siblings(self, listing):
+        """The directories in a `STALE_SIBLING_LIST_COMMAND` listing that are ours.
+
+        Fail closed: an entry whose name or size cannot be read poisons its whole
+        directory, and a directory that is not byte-for-byte a staged pair is not
+        a leftover this bridge can claim.
+        """
+        expected = self._staged_entry_sizes()
+        stdout = getattr(listing, 'stdout', None)
+        if not stdout or expected is None:
+            return []
+        contents = {}
+        for line in stdout.decode('utf-8', 'replace').splitlines():
+            fields = line.strip().split('|')
+            directory = fields[0] if fields else ''
+            entries = contents.setdefault(directory, {})
+            try:
+                if len(fields) != 3 or entries is None:
+                    raise ValueError
+                entries[fields[1]] = int(fields[2])
+            except ValueError:
+                contents[directory] = None
+        return sorted(
+            directory for directory, entries in contents.items()
+            if entries == expected and directory != self.remote_dir
+            and self._session_dir_shape(directory)
+        )
+
+    def _staged_entry_sizes(self):
+        """What a session directory staged by this bridge contains, or None."""
+        try:
+            return {
+                SESSION_DIR_PROXY: self.proxy_binary.stat().st_size,
+                SESSION_DIR_PRELOAD: self.preload_library.stat().st_size,
+            }
+        except OSError:
+            return None
+
     def _stage(self):
         if (not self.proxy_binary.is_file() or not self.preload_library.is_file() or
                 not self.proxy_binary.with_name('d200-color-agent').is_file()):
-            raise RuntimeError('build d200-zkgui-proxy, d200-color-agent and libd200-zkgui-preload.so first')
-        self._run('shell', f'rm -rf {self.remote_dir}; mkdir -m 700 {self.remote_dir}')
-        self._run('push', str(self.proxy_binary), f'{self.remote_dir}/proxy')
-        self._run('push', str(self.preload_library), f'{self.remote_dir}/preload.so')
-        self._run(
-            'shell',
-            f'chmod 700 {self.remote_dir}/proxy; chmod 600 {self.remote_dir}/preload.so',
-        )
+            raise StagingError('build d200-zkgui-proxy, d200-color-agent and libd200-zkgui-preload.so first')
+        self.remote_dir_staged = True
+        for step, arguments in (
+            ('create the session directory',
+             ('shell', f'rm -rf {self.remote_dir}; mkdir -m 700 {self.remote_dir}')),
+            ('push the proxy',
+             ('push', str(self.proxy_binary), f'{self.remote_dir}/{SESSION_DIR_PROXY}')),
+            ('push the preload library',
+             ('push', str(self.preload_library), f'{self.remote_dir}/{SESSION_DIR_PRELOAD}')),
+            ('set the staged file modes',
+             ('shell', f'chmod 700 {self.remote_dir}/{SESSION_DIR_PROXY}; '
+                       f'chmod 600 {self.remote_dir}/{SESSION_DIR_PRELOAD}')),
+        ):
+            try:
+                self._run(*arguments)
+            except DeviceCommandError as error:
+                status = '' if error.returncode is None else f' (exit {error.returncode})'
+                raise StagingError(f'could not {step} on the device: {error}{status}') from error
 
     def _stage_video_agent(self, deadline):
         """Push the native agent to its fixed path; record that this instance owns it."""
@@ -1138,9 +1317,12 @@ class DeviceProxy:
             self.video.interrupt()
         with self.condition:
             if (self.closed and self.transport_socket is None and
-                    self.process is None and self.forward_port is None):
+                    self.process is None and self.forward_port is None and
+                    not self.remote_dir_staged):
                 # Already torn down (a second close, or a failed start that
                 # unwound): nothing device-side is left for this instance to own.
+                # `remote_dir_staged` keeps a start that died *during* staging on
+                # the long path, so its half-staged directory is still removed.
                 self._release_admission()
                 return
         try:
@@ -2091,13 +2273,21 @@ def main():
     stop_endpoint = StopEndpoint('bridge', stop)
     try:
         if arguments.state_file:
-            temporary = arguments.state_file.with_suffix('.tmp')
-            temporary.write_text(json.dumps({'pid': os.getpid(), 'control': stop_endpoint.state()}))
-            temporary.replace(arguments.state_file)
+            # 0600, unique temp, atomic replace -- see write_private_state_file.
+            write_private_state_file(
+                arguments.state_file,
+                json.dumps({'pid': os.getpid(), 'control': stop_endpoint.state()}),
+            )
         try:
             transport.start()
         except DeviceAdmissionError as error:
             print(f'bridge_device_in_use error={error}', file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        except StagingError as error:
+            # The session is already unwound by the time this is raised (the
+            # caller's cleanup ran), so the user gets one line and a status, not
+            # a traceback naming a device command they cannot act on.
+            print(f'bridge_stage_failed error={error}', file=sys.stderr, flush=True)
             raise SystemExit(1)
         if stopping.is_set():
             return
@@ -2135,8 +2325,8 @@ def main():
         finally:
             try:
                 if arguments.state_file:
-                    stored = json.loads(arguments.state_file.read_text())
-                    if stored.get('control') == stop_endpoint.state():
+                    stored = own_state_record(arguments.state_file)
+                    if stored is not None and stored.get('control') == stop_endpoint.state():
                         arguments.state_file.unlink()
             except FileNotFoundError:
                 pass

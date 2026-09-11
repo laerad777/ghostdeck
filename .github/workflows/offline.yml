@@ -11,4 +11,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install pytest
-      - run: PYTHONPATH=src python -m pytest tests/test_ghostdeck_offline.py -q
+      # Run the whole device-free suite, not a single file. The host CLI, vendor
+      # bridge and build-recipe tests are all offline and install nothing beyond
+      # pytest, so they belong in CI; running only test_ghostdeck_offline.py left
+      # hundreds of assertions unverified on every push. Tests that need the ARM
+      # cross toolchain or a real deck skip themselves.
+      - run: PYTHONPATH=src python -m pytest tests/ -q

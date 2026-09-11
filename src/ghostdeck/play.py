@@ -250,11 +250,23 @@ def playing() -> bool:
 
 
 def _cleanup_device() -> None:
-    """Restore the stock UI and clear the deck's staging dir. Raises on any fatal step."""
+    """Restore the stock UI and clear the deck's staging dir. Raises on any fatal step.
+
+    The restore is `ctl.stop zkswe` followed by `ctl.start zkswe`, not a bare start. A start on an
+    already-running service is a no-op that never re-initialises the USB gadget, so the master's
+    real-deck run (2026-09-11) observed `ghostdeck stop` exit 0 while
+    `cat /sys/class/zkswe_usb/zkswe0/functions` still read `adb`; `detect` reported `mode=adb` 30s
+    later with `zkgui_ui` running the whole time. Stopping and restarting the service is what
+    returned the gadget to HID (`functions=<empty>`, `detect -> mode=hid` within 5s).
+
+    We deliberately do not switch USB modes ourselves: the restarted stock UI performs the HID
+    re-enumeration, and the project boundary forbids `functions=hid,adb` and any firmware write.
+    """
     serial = adb.serial_from_devices()
     if not serial:
         raise RuntimeError("no ADB device reachable: stock UI not restored and /tmp/ghostdeck-* not cleared")
     for argv in (
+        ["-s", serial, "shell", "setprop ctl.stop zkswe"],
         ["-s", serial, "shell", "setprop ctl.start zkswe"],
         ["-s", serial, "shell", "rm -f /tmp/ghostdeck-*"],
     ):

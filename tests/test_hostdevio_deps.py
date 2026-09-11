@@ -8,6 +8,7 @@ against a real backend, and no test writes to a device.
 from __future__ import annotations
 
 
+import re
 import shutil
 import stat
 import subprocess
@@ -350,7 +351,11 @@ def test_check_abi_rejects_a_64_bit_arm_object(tmp_path):
     obj.write_bytes(ELF_AARCH64_OBJECT)
     result = _run_recipe("--check-abi", str(obj), home=tmp_path)
     assert result.returncode != 0
-    assert "ARM64" in result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "ARM64" in combined
+    # "ARM64" must come from the parsed header (class/data/machine at offsets 4/5/18),
+    # not from a static hint string that would appear even for an unparsed object.
+    assert "ELF 64-bit little-endian ARM64 relocatable object" in combined
 
 
 def _recipe_code():
@@ -362,12 +367,28 @@ def _recipe_code():
     )
 
 
+def _command_words(line):
+    """The command-position words of one shell line, split on pipelines/lists/`$(`.
+
+    Catches a bare `file` in `file -b x`, `kind=$(file x)`, `... | file`, `a && file x`.
+    """
+    for segment in re.split(r"\|\||&&|[|;]|\$\(", line):
+        words = segment.split()
+        if words:
+            yield words[0]
+
+
 def test_the_recipe_never_consults_file():
     """The old guards were gated on the `file` utility being installed, which silently
     skipped them; no executable line may bring that back."""
     code = _recipe_code()
     assert "command -v file" not in code
     assert "file -b" not in code
+    # Those are just two spellings; a bare `file` in command position is the same
+    # dependency, so the check must be on the utility rather than on two strings.
+    for number, line in enumerate(code.splitlines(), start=1):
+        for word in _command_words(line):
+            assert word != "file", f"line {number} calls the `file` utility: {line.strip()}"
 
 
 def test_the_guard_fails_closed_when_od_is_missing(tmp_path):

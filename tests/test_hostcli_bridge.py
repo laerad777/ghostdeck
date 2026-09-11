@@ -303,3 +303,133 @@ def test_fd_exhaustion_is_reported_and_never_raised(scratch, monkeypatch):
         assert spawned == []
     finally:
         listener.close()
+
+
+# --- H3: a stale host adb server is restarted, once, and only on the stale path ---------
+# Observed on the physical deck: `usb.detect()` reports the deck in ADB mode while the host
+# `adb` server has no transport for it, so `adb devices` is empty and every allowlisted device
+# command fails. Waiting cannot fix that server, and the bridge's own staging then fails.
+
+
+def _usb_says(monkeypatch, mode: str, restarts: list, *, serial: str = "SERIAL"):
+    """Report `mode` for the deck and record server restarts. Touches no hardware."""
+    monkeypatch.setattr(studio.usb, "detect", lambda: {"serial": serial, "mode": mode})
+    monkeypatch.setattr(studio.adb, "restart_server", lambda: restarts.append("restart"))
+
+
+def test_a_stale_adb_server_is_restarted_once_and_the_wait_is_rerun(scratch, monkeypatch):
+    """The measured H3 path: USB says ADB, readiness fails, the restart is what makes it answer."""
+    sock = scratch / "b.sock"
+    restarts: list = []
+    _usb_says(monkeypatch, "adb", restarts)
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, endpoint=sock)
+    waits = []
+
+    def ready_only_after_the_restart(serial, *, timeout):
+        waits.append(serial)
+        return len(waits) > 1
+
+    monkeypatch.setattr(studio, "_device_ready", ready_only_after_the_restart)
+    studio._ensure_bridge()
+    assert restarts == ["restart"], "the stale adb server was not restarted exactly once"
+    assert len(waits) == 2, "the readiness wait was not re-run after the restart"
+    assert len(spawned) == 1, "the restart did not let bring-up proceed"
+    spawned[0]._close()
+
+
+def test_an_answering_deck_never_restarts_the_adb_server(scratch, monkeypatch):
+    """Requirement: no restart on the healthy path."""
+    sock = scratch / "b.sock"
+    restarts: list = []
+    _usb_says(monkeypatch, "adb", restarts)
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, endpoint=sock)
+    studio._ensure_bridge()
+    assert restarts == [], "a working server was restarted"
+    assert len(spawned) == 1
+    spawned[0]._close()
+
+
+def test_a_deck_that_usb_does_not_report_as_adb_never_restarts_the_server(scratch, monkeypatch):
+    """Only `usb.detect()` reporting ADB proves the server is stale; anything else is not a case."""
+    for mode in ("none", "hid"):
+        restarts: list = []
+        spawned = []
+        monkeypatch.setattr(studio, "SOCKET", scratch / f"b-{mode}.sock")
+        _usb_says(monkeypatch, mode, restarts)
+        _stub_device_chain(monkeypatch, spawned, endpoint=None)
+        monkeypatch.setattr(studio, "_device_ready", lambda serial, *, timeout: False)
+        with pytest.raises(RuntimeError):
+            studio._ensure_bridge()
+        assert restarts == [], f"restarted the server for a deck reported as {mode!r}"
+
+
+def test_the_restart_is_bounded_to_one_per_bring_up(scratch, monkeypatch):
+    """A dead deck must not make the retry loop kill a shared server once per attempt."""
+    sock = scratch / "b.sock"
+    restarts: list = []
+    _usb_says(monkeypatch, "adb", restarts)
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, endpoint=None)
+    monkeypatch.setattr(studio, "BRIDGE_ATTEMPTS", 3)
+    attempts = []
+    monkeypatch.setattr(
+        studio, "_device_ready", lambda serial, *, timeout: attempts.append(serial) or False
+    )
+    with pytest.raises(RuntimeError):
+        studio._ensure_bridge()
+    assert len(restarts) == 1, f"the restart was not bounded: {len(restarts)} restarts"
+    assert len(attempts) == 4, "one wait per attempt plus the one after the restart"
+    assert spawned == []
+
+
+def test_the_failure_message_says_the_restart_was_tried(scratch, monkeypatch):
+    """Requirement: the existing message is kept, and it now names what was tried."""
+    sock = scratch / "b.sock"
+    restarts: list = []
+    _usb_says(monkeypatch, "adb", restarts)
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, endpoint=None)
+    monkeypatch.setattr(studio, "_device_ready", lambda serial, *, timeout: False)
+    with pytest.raises(RuntimeError) as excinfo:
+        studio._ensure_bridge()
+    message = str(excinfo.value)
+    assert message.startswith("D200 stopped answering device commands after switching to ADB")
+    assert "adb kill-server; adb start-server" in message
+    assert "\n" not in message, "the message a user sees must stay one line"
+
+
+def test_the_recovery_did_not_widen_the_device_allowlist():
+    """Requirement 2: the recovery is a named call, not a new device-shell permission."""
+    assert callable(studio.adb.restart_server)
+    for argv in (["kill-server"], ["start-server"], ["-s", "SERIAL", "kill-server"]):
+        assert studio.adb.allowed(argv) is False, f"the device allowlist now permits {argv}"
+        with pytest.raises(studio.adb.AdbDenied):
+            studio.adb.validate(argv)
+    # and the device surface it already had still works
+    assert studio.adb.allowed(["-s", "SERIAL", "shell", "getprop", "sys.usb.config"]) is True
+
+
+def test_a_failed_restart_is_reported_without_a_traceback(scratch, monkeypatch):
+    """`adb` refusing to restart is a reported reason, not an uncaught error out of bring-up."""
+    sock = scratch / "b.sock"
+    _usb_says(monkeypatch, "adb", [])
+
+    def boom():
+        raise RuntimeError("'adb start-server' failed with status 1: cannot bind")
+
+    monkeypatch.setattr(studio.adb, "restart_server", boom)
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, endpoint=None)
+    monkeypatch.setattr(studio, "_device_ready", lambda serial, *, timeout: False)
+    with pytest.raises(RuntimeError) as excinfo:
+        studio._ensure_bridge()
+    assert "could not be restarted" in str(excinfo.value)
+    assert "cannot bind" in str(excinfo.value)
+    assert spawned == []

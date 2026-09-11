@@ -239,6 +239,23 @@ def _bus_serial() -> str:
     return adb.serial_from_devices() or ""
 
 
+def _usb_reports_adb(serial: str) -> bool:
+    """True only when the USB layer itself reports this serial in ADB mode (H3).
+
+    Deliberately not `_bus_serial()`, which falls back to `adb devices`: a server that can
+    already see the deck is not a stale server, and restarting it would kill a healthy one.
+    An unusable backend is not evidence either, so it means "do not touch the server".
+    """
+    try:
+        found = usb.detect()
+    except Exception:
+        return False
+    if not found or found.get("mode") != "adb":
+        return False
+    reported = found.get("serial")
+    return reported is not None and str(reported) == serial
+
+
 def _adb_serial() -> str:
     """Bus serial, switching the deck off HID first.
 
@@ -327,6 +344,7 @@ def _ensure_bridge() -> None:
         raise RuntimeError(f"bridge missing: {BRIDGE}")
     log = open("/tmp/d200-local-bridge.log", "ab", buffering=0)
     reason = "hidshim bridge socket did not come up"
+    server_restarted = False
     try:
         for attempt in range(BRIDGE_ATTEMPTS):
             if attempt:
@@ -336,8 +354,29 @@ def _ensure_bridge() -> None:
             except Exception as error:
                 reason = str(error) or type(error).__name__
                 continue
-            if not _device_ready(serial, timeout=BRIDGE_READY_TIMEOUT):
+            ready = _device_ready(serial, timeout=BRIDGE_READY_TIMEOUT)
+            if not ready and not server_restarted and _usb_reports_adb(serial):
+                # H3, observed on the physical deck: the USB layer reports the deck in ADB mode
+                # while the *host adb server* still has no transport for it, so `adb devices` is
+                # empty and every allowlisted device command fails. That server will never start
+                # answering on its own, so the 25s wait above cannot succeed however often it is
+                # repeated; restarting the server is what fixed it on the deck. Bounded to one
+                # restart per bring-up: a genuinely dead deck must not make this loop kill a
+                # server that other tools are using, once per attempt.
+                server_restarted = True
+                try:
+                    adb.restart_server()
+                except Exception as error:
+                    reason = f"the host adb server could not be restarted: {error}"
+                    continue
+                ready = _device_ready(serial, timeout=BRIDGE_READY_TIMEOUT)
+            if not ready:
                 reason = "D200 stopped answering device commands after switching to ADB"
+                if server_restarted:
+                    reason += (
+                        "; the host adb server was restarted (adb kill-server; adb start-server) "
+                        "because the deck already enumerated through ADB, and it still does not answer"
+                    )
                 continue
             # Re-probe immediately before spawning: a bridge that came up meanwhile is used as
             # is, an unclassifiable endpoint refuses, and only a proven-dead path is reclaimed.

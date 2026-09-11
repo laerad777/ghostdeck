@@ -106,6 +106,35 @@ def run(argv: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
 
 execute = run
 
+# --- host adb *server* management (finding H3) ------------------------------
+# `kill-server`/`start-server` act on the host daemon, never on the deck, so they are
+# deliberately not entries in `validate()`: that allowlist gates everything that reaches
+# the deck, and a device entry is the wrong home for a host operation. This one named
+# call is the entire server-management surface — there is no general "run any adb argv".
+_SERVER_ARGV = (("kill-server",), ("start-server",))
+_SERVER_TIMEOUT = 30.0
+
+
+def restart_server(*, timeout: float = _SERVER_TIMEOUT) -> None:
+    """Restart the host adb server, for a deck the server has not picked up (H3).
+
+    A deck that switched HID -> ADB can be visible to USB while `adb devices` is still empty;
+    no amount of waiting fixes that server. Raises RuntimeError naming the failing command so
+    the caller can report what was tried rather than a bare status code.
+    """
+    binary = adb_bin()
+    for argv in _SERVER_ARGV:
+        try:
+            result = subprocess.run(
+                [binary, *argv], capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError(f"'adb {argv[0]}' could not be run: {error}") from error
+        if result.returncode != 0:
+            lines = (result.stderr or result.stdout or "").strip().splitlines()
+            tail = f": {lines[-1]}" if lines else ""
+            raise RuntimeError(f"'adb {argv[0]}' failed with status {result.returncode}{tail}")
+
 
 def serial_from_devices() -> str | None:
     result = run(["devices", "-l"], capture_output=True, text=True, timeout=30)

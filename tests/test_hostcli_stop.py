@@ -28,10 +28,14 @@ DEVICE_LINE = (
     f"{SERIAL}\tdevice product:d200 model:D200 device:d200 transport_id:1\n"
 )
 DEVICES_ARGV = "devices -l"
-SETPROP_ARGV = f"-s {SERIAL} shell setprop ctl.start zkswe"
+# The restore pair. A bare `ctl.start` on an already-running service is a no-op that never
+# re-initialises the USB gadget (hardware finding H1), so `stop()` must emit stop BEFORE start.
+CTL_STOP_ARGV = f"-s {SERIAL} shell setprop ctl.stop zkswe"
+CTL_START_ARGV = f"-s {SERIAL} shell setprop ctl.start zkswe"
 RM_ARGV = f"-s {SERIAL} shell rm -f /tmp/ghostdeck-*"
 LISTING_ARGV = f"-s {SERIAL} shell ls /tmp/ghostdeck*"
-STOP_ARGV = [DEVICES_ARGV, SETPROP_ARGV, RM_ARGV, LISTING_ARGV]
+RESTORE_ARGV = [CTL_STOP_ARGV, CTL_START_ARGV]
+STOP_ARGV = [DEVICES_ARGV, CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV, LISTING_ARGV]
 
 # Every fake adb records its own invocation FIRST, before any of its own logic runs. Without this an
 # empty `calls` list cannot be distinguished from a fake that simply never logged, which is how a
@@ -173,10 +177,11 @@ def test_stop_reports_failing_adb_and_exits_nonzero(tmp_path):
     result, calls, _ = _cli(FAILING_ADB, tmp_path)
     assert result.returncode != 0, result.stdout
     assert "adb: device offline" in result.stderr
-    assert "setprop ctl.start zkswe" in result.stderr
+    assert "setprop ctl.stop zkswe" in result.stderr
     # The first failure aborts the cleanup. Named explicitly so this cannot pass vacuously: the
     # device was reached for `devices -l` and the first mutating call, and for nothing after it.
-    assert calls == [DEVICES_ARGV, SETPROP_ARGV]
+    # That first mutating call is now the STOP, which is what makes the pairing non-negotiable.
+    assert calls == [DEVICES_ARGV, CTL_STOP_ARGV]
 
 
 def test_stop_without_device_exits_nonzero(tmp_path):
@@ -199,7 +204,7 @@ def test_stop_happy_path_exits_zero_and_keeps_command_order(tmp_path):
     result, calls = _stop(HAPPY_ADB, tmp_path)
     assert result.returncode == 0, result.stderr
     assert calls == STOP_ARGV
-    assert result.stdout.count("cleanup ok") == 2  # the two mutating calls stay visible
+    assert result.stdout.count("cleanup ok") == 3  # the three mutating calls stay visible
     assert result.stdout.count("listing ok") == 1  # and so does a successful listing
 
 
@@ -241,8 +246,37 @@ exit 0
     assert result.returncode != 0, result.stdout
     assert "rm -f /tmp/ghostdeck-*" in result.stderr
     assert "Permission denied" in result.stderr
-    # Aborts at the failed removal, before the informational listing.
-    assert calls == [DEVICES_ARGV, SETPROP_ARGV, RM_ARGV]
+    # Aborts at the failed removal, before the informational listing, and after the restore pair:
+    # a failed removal must not cost the deck its UI restart.
+    assert calls == [DEVICES_ARGV, CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV]
+
+
+# --- H1: a bare `ctl.start` never restores the deck ------------------------
+
+
+def test_stop_restarts_the_service_stop_before_start(tmp_path):
+    """H1: `setprop ctl.start zkswe` on an already-running service is a no-op.
+
+    On the master's real-deck run `stop` exited 0 while
+    `cat /sys/class/zkswe_usb/zkswe0/functions` still read `adb` and `detect` still reported
+    `mode=adb` 30s later, with `zkgui_ui` running the whole time; only `ctl.stop` followed by
+    `ctl.start` returned the gadget to HID. This asserts positionally (index), not by membership,
+    so a dropped, duplicated or reordered stop fails here instead of silently regressing.
+    """
+    from ghostdeck import adb
+
+    result, calls, _ = _cli(HAPPY_ADB, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert CTL_STOP_ARGV in calls and CTL_START_ARGV in calls, calls
+    assert calls.index(CTL_STOP_ARGV) < calls.index(CTL_START_ARGV), calls
+    # The stop is the FIRST device mutation: nothing may touch the deck before it.
+    assert calls.index(CTL_STOP_ARGV) == 1, f"the stop must lead the cleanup: {calls}"
+    assert calls == STOP_ARGV
+    # Both strings are already on the allowlist, so this fix needed no widening of adb.py.
+    for command in ("setprop ctl.stop zkswe", "setprop ctl.start zkswe"):
+        assert adb.allowed(["-s", SERIAL, "shell", command]), command
+    # And `stop` still never switches a USB mode itself: the restarted UI re-enumerates.
+    assert not any("functions" in call for call in calls), calls
 
 
 # --- A-003: a recycled pid must never be signalled -------------------------
@@ -709,7 +743,7 @@ def test_stop_reports_both_the_identity_and_a_failed_cleanup(tmp_path):
         assert "cannot verify" in result.stderr, result.stderr
         assert "Traceback" not in result.stdout + result.stderr
         assert _alive(victim)
-        assert calls == [DEVICES_ARGV, SETPROP_ARGV]
+        assert calls == [DEVICES_ARGV, CTL_STOP_ARGV]
     finally:
         victim.kill()
         victim.wait()
