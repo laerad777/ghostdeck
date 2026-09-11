@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 
 from ghostdeck import state as gdstate
+from ghostdeck import tree
 
-MANIFEST = Path(__file__).resolve().parents[2] / "manifest" / "0.1.0.json"
+MANIFEST = tree.candidate_root() / "manifest" / "0.1.0.json"
 ZERO = "0" * 64
 
 

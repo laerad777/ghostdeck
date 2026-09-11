@@ -48,7 +48,7 @@ Homebrew의 `jpeg-turbo`는 두 번째를 충족하지 **않습니다**. Mach-O 
 스크립트는 이를 감지해 exit 1과 함께 다음을 출력합니다:
 
 > build-color-agent.sh: .../libturbojpeg.a contains no ELF object members
-> (first inspected member was 'Mach-O 64-bit object arm64'). A macOS/Homebrew
+> (first inspected member: Mach-O object (magic cffaedfe)). A macOS/Homebrew
 > or Windows libturbojpeg cannot be linked into an ARM Linux binary. ...
 
 0.1.0이 제시하는 유일한 경로는 실제 ARM Linux libturbojpeg입니다(예:
@@ -111,6 +111,31 @@ export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 호스트 상태는 `~/.ghostdeck/state.json`입니다. `ghostdeck studio`는
 hidshim 브리지의 표준 출력·오류를 `/tmp/d200-local-bridge.log`에
 덧붙이고, 다른 로그는 터미널로 나옵니다.
+
+### 무엇이 무엇을 정리하는가
+
+세 가지 상태를 서로 다른 주체가 소유하며, 그중 `ghostdeck` 명령인 것은
+하나뿐입니다.
+
+| 소유자 | 소유 대상 | 해제 방법 |
+| --- | --- | --- |
+| `ghostdeck stop` | 덱의 스톡 UI, `/tmp/ghostdeck-*` | `ghostdeck stop` 실행 |
+| **브리지** (`ghostdeck studio`) | 스테이징된 에이전트 `/tmp/d200-color-agent`, `/dev/fb0` 블랙아웃, 덱을 잡고 있는 ADB 모드 | 브리지 프로세스 종료 |
+
+다른 명령을 찾아보기 전에 알아 둘 두 가지:
+
+- **`ghostdeck stop`은 브리지를 멈추지 않고 `/tmp/d200-color-agent`도
+  지우지 않습니다.** 브리지를 멈추는 `ghostdeck` 명령은 없습니다. 브리지는
+  별도의 장기 실행 프로세스이며, 브리지가 살아 있으면 `stop`이 스톡 UI를
+  복원한 뒤에도 덱은 ADB 모드로 남습니다. 스테이징된 에이전트는 브리지
+  자신의 정리 단계에서 제거됩니다.
+- **덱은 브리지가 사라진 뒤에만 HID로 돌아갑니다.** `stop`이 종료 `0`으로
+  끝났는데도 덱이 ADB로 남아 있다면 정상입니다. `stop`을 다시 실행하지 말고
+  브리지(hidshim Studio 복사본)를 종료하십시오.
+
+이 프로젝트가 브리지를 대신 멈추지 않는 이유는, 자기가 시작하지 않은
+브리지가 다른 주체(테스트나 다른 도구)의 것일 수 있기 때문입니다. 브리지를
+시작한 도구는 자기가 만든 프로세스만 소유하고, 그것만 해제합니다.
 
 ## 덱이 붙어 있는데 응답하지 않을 때
 

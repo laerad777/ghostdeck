@@ -9,10 +9,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ghostdeck import adb, devicebuild, state as gdstate, usb, vhid
+from ghostdeck import adb, devicebuild, state as gdstate, tree, usb, vhid
 
-VENDOR_PLAY = Path(__file__).resolve().parents[2] / "vendor" / "d200-color-play.py"
-VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor"
+VENDOR_PLAY = tree.candidate_root() / "vendor" / "d200-color-play.py"
+VENDOR_DIR = tree.candidate_root() / "vendor"
 
 _PS_TIMEOUT = 5.0
 # A wedged adb server must not turn `stop` - the one documented recovery command - into a hang
@@ -33,6 +33,16 @@ _DECK_FIELDS = ("product:d200", "model:D200", "device:d200")
 # is attached but its adbd is not answering - `offline` is the one the wedged deck reported - and T16
 # showed that state being reported to the user as "no attached device identifies as the D200".
 TRANSPORT_READY = "device"
+
+# Signal 3 (C-153/C-155): the deck's own sysfs node, already on the adb allowlist (`_EXACT_SHELL`).
+# A phone does not expose it, so a read that answers is a POSITIVE identification - A-137 still holds,
+# because the probe asks each device about itself instead of picking one by position. This is what
+# lets `stop` find the deck with `adb` alone, on a host without the optional Python extras (no
+# hidapi/pyusb, so no USB verdict) and with the field-less real deck line (T15, so no `-l` identity).
+_DECK_PROBE = ("cat", "/sys/class/zkswe_usb/zkswe0/functions")
+# Bounded so a host with many attached devices cannot turn `stop` - the recovery command - into a
+# probe loop. Only candidates adb calls `device` are probed at all.
+_PROBE_LIMIT = 4
 
 
 _TOOL_HINTS = {
@@ -100,6 +110,35 @@ def _transport_state(entries: list[tuple[str, str, list[str]]], serial: str) -> 
     return ""
 
 
+def _probe_is_deck(serial: str) -> bool:
+    """True when `serial` answers the deck-only zkswe sysfs node (signal 3, C-153/C-155).
+
+    The node is queried with the command already on the adb allowlist, so this reaches the device
+    through the same default-deny gate as every other device command, and it is a read: nothing is
+    changed on a candidate that turns out not to be the deck. That is the whole point of the probe -
+    identification without mutation, so a phone attached alongside is tested and then left alone.
+
+    Success requires BOTH a zero exit and non-empty output. Exit 0 alone is not proof that the node
+    answered: a remote shell that swallows the failure, or an `adb` that does not propagate the
+    remote status, also exits 0. The node prints its function list (the master observed `adb` on the
+    attached deck while it was in ADB mode), and a device with no such node prints nothing.
+
+    Any failure to run the probe at all is "this candidate did not answer". The probe is an
+    identification attempt, so it must never be what makes `stop` - the documented recovery command -
+    raise.
+    """
+    try:
+        result = adb.run(
+            ["-s", serial, "shell", *_DECK_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=_ADB_TIMEOUT,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and bool((result.stdout or "").strip())
+
+
 def deck_transport(*, restart: bool = True) -> tuple[str | None, str, list[tuple[str, str]]]:
     """``(serial, state, blocked)`` for one `adb devices -l` listing.
 
@@ -129,6 +168,11 @@ def deck_transport(*, restart: bool = True) -> tuple[str | None, str, list[tuple
     2. **The deck's own `-l` identity fields**, for firmware that reports them. The attached deck does
        NOT: its line is `<serial>      device usb:18092032X transport_id:4` (T15). So this can only
        ever be an *additional* accepted path, never the only one.
+    3. **The deck's own sysfs node, read over `adb` alone** (`_probe_is_deck`, C-153/C-155). This is
+       the signal that still works when the extras are absent (no USB verdict) AND the line is
+       field-less (no `-l` identity): the two signals above both need something more than `adb`.
+       Only candidates adb calls `device` are probed, at most `_PROBE_LIMIT`, and it is a read, so an
+       unidentified candidate is never mutated (A-137).
 
     `restart=False` skips the bounded H3 server restart below. The read-only reporting commands
     (`detect`, `status`) pass it, because a diagnostic that resets the adb server changes the state
@@ -161,6 +205,23 @@ def deck_transport(*, restart: bool = True) -> tuple[str | None, str, list[tuple
     for serial, state, fields in entries:
         if any(field in _DECK_FIELDS for field in fields):
             return serial, state, []
+    # Signal 3: ask each usable candidate about its own deck-only node. Nothing here falls back to
+    # "the first attached device" - a candidate is accepted only when it positively answers, so a
+    # phone attached alongside (whatever the order of the lines) is probed and then rejected.
+    probed = 0
+    for serial, state, _ in entries:
+        if probed >= _PROBE_LIMIT:
+            break
+        if state != TRANSPORT_READY:
+            continue
+        probed += 1
+        if _probe_is_deck(serial):
+            # Name the signal in the diagnosis: before T17 this path did not exist, and a future
+            # "which signal saw it?" must not be another mystery.
+            print(f"deck identified by the zkswe sysfs probe: {serial}", file=sys.stderr)
+            return serial, state, []
+    # adb-only, so this works with the extras absent too: the T16 distinction between "attached but
+    # not answering" and "absent" must not depend on the USB layer that just failed to answer.
     blocked = [(serial, state) for serial, state, _ in entries if state != TRANSPORT_READY]
     return None, "", blocked
 

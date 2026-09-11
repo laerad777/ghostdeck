@@ -122,7 +122,10 @@ def test_detect_source_has_no_hardcoded_serial():
 
 def test_public_tree_has_no_lab_identity():
     skip = {".pyc", ".png"}
-    skip_dirs = {".git", ".gjc", ".venv", "__pycache__", ".pytest_cache"}
+    # `build`/`dist` are setuptools output: they hold stale COPIES of the tracked package
+    # sources, so scanning them adds no signal and only noise (the same reason `.egg-info`
+    # is skipped). They are gitignored; a leak in real source is still caught.
+    skip_dirs = {".git", ".gjc", ".venv", "__pycache__", ".pytest_cache", "build", "dist"}
     home = "/Users/" + "mose"
     for path in ROOT.rglob("*"):
         if not path.is_file() or path.suffix in skip:

@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from ghostdeck import adb, devicebuild, usb
+from ghostdeck import adb, devicebuild, tree, usb
 
 ORIGINAL = Path("/Applications/Ulanzi Studio.app")
 COPY = Path.home() / "Applications" / "Ulanzi Studio ADB.app"
@@ -23,7 +23,7 @@ SOCKET = Path("/tmp/d200-adb-bridge.sock")
 BRIDGE_STATE = Path("/tmp/d200-local-bridge.pid")
 # Documented in README.md: `ghostdeck studio` appends the bridge's stdout/stderr here.
 BRIDGE_LOG = Path("/tmp/d200-local-bridge.log")
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = tree.candidate_root()
 VENDOR = ROOT / "vendor"
 BRIDGE = VENDOR / "d200-local-bridge.py"
 HIDSHIM_SRC = ROOT / "reference" / "hidshim.c"

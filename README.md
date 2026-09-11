@@ -48,7 +48,7 @@ Mach-O arm64 archive, which cannot be linked into an ARM Linux binary. The
 script detects this and exits 1, printing:
 
 > build-color-agent.sh: .../libturbojpeg.a contains no ELF object members
-> (first inspected member was 'Mach-O 64-bit object arm64'). A macOS/Homebrew
+> (first inspected member: Mach-O object (magic cffaedfe)). A macOS/Homebrew
 > or Windows libturbojpeg cannot be linked into an ARM Linux binary. ...
 
 The only path 0.1.0 offers is a real ARM Linux libturbojpeg, such as
@@ -98,7 +98,8 @@ written or shipped.
 
 | Command | Purpose |
 | --- | --- |
-| `ghostdeck detect` | Print serial, VID/PID, and USB mode (HID `2207:0019` or ADB `18d1:d002`). Fails if no deck is found. Serial is discovered at runtime; it is not baked into the source. || `ghostdeck play FILE\|URL` | ADB JPEG play. Optional IOHID attempt does not block play. |
+| `ghostdeck detect` | Print serial, VID/PID, and USB mode (HID `2207:0019` or ADB `18d1:d002`). Fails if no deck is found. Serial is discovered at runtime; it is not baked into the source. |
+| `ghostdeck play FILE\|URL` | ADB JPEG play. Optional IOHID attempt does not block play. |
 | `ghostdeck studio` | Launch the **local** hidshim copy (`~/Applications/Ulanzi Studio ADB.app`). Official `/Applications/Ulanzi Studio.app` is not written. |
 | `ghostdeck stop` | Stop playback, restore stock UI, clear `/tmp/ghostdeck-*` on the deck. |
 | `ghostdeck quit` | Tear down the IOHID keeper if any. |
@@ -110,6 +111,32 @@ URL sources fail; local files still play.
 Host state lives in `~/.ghostdeck/state.json`. `ghostdeck studio` appends
 the hidshim bridge's stdout and stderr to `/tmp/d200-local-bridge.log`;
 other logs go to the terminal.
+
+### Who cleans up what
+
+Three different things own three different pieces of state, and only one of
+them is a `ghostdeck` command:
+
+| Owner | Owns | Released by |
+| --- | --- | --- |
+| `ghostdeck stop` | the stock UI on the deck, and `/tmp/ghostdeck-*` | running `ghostdeck stop` |
+| the **bridge** (`ghostdeck studio`) | the staged agent `/tmp/d200-color-agent`, the `/dev/fb0` black-out, and the ADB-mode hold on the deck | the bridge process exiting |
+
+Two consequences worth knowing before you go looking for the wrong command:
+
+- **`ghostdeck stop` does not stop the bridge and does not remove
+  `/tmp/d200-color-agent`.** No `ghostdeck` command stops the bridge: it is a
+  separate long-lived process, and a running bridge keeps the deck in ADB mode
+  after `stop` has restored the stock UI. The staged agent is cleaned up by the
+  bridge's own teardown.
+- **The deck returns to HID only once the bridge is gone.** If `stop` exited `0`
+  and the deck still enumerates as ADB, that is expected: end the bridge
+  (quit the hidshim Studio copy) rather than re-running `stop`.
+
+The bridge is not stopped on your behalf because a bridge it did not start may
+be someone else's — including one a test or another tool is using. Any tool
+that starts a bridge owns exactly the process it created, and releases only
+that one.
 
 ## If the deck is attached but stops answering
 

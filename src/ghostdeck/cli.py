@@ -5,7 +5,7 @@ import sys
 
 from ghostdeck import devicebuild
 from ghostdeck import play as playmod
-from ghostdeck import studio, usb, vhid
+from ghostdeck import studio, tree, usb, vhid
 
 # A missing optional backend is not a hardware verdict, so it gets its own exit code (A-102).
 # Before this, `detect` printed "no device" and exited 1 for both "no deck is attached" and
@@ -20,6 +20,17 @@ _OFFLINE_EXIT = 3
 # Shared by `detect` and `status`: both must name what the user can actually do about a wedged
 # transport, because nothing on the host can reset it.
 _RECOVERY_HINT = "power-cycle or replug the deck (ghostdeck cannot recover it from the host)"
+# 0.1.0 is checkout-only (C-158): these commands execute assets that live in the source tree
+# (`vendor/`, `device/`, `reference/`), and a wheel ships none of them. They are checked up front so
+# the user gets one line naming the real problem, instead of the four unrelated missing-file errors
+# that `parents[2]` used to produce (`missing hidshim source: .../reference/hidshim.c`, `device
+# sources missing under .../device`, ...).
+#
+# `stop` and `quit` are deliberately NOT here. They restore the deck and clean up the host, and that
+# is exactly what a user needs when `play` cannot run -- refusing them for a missing checkout would
+# take away the one command that undoes a hijacked deck. `detect`/`status` are host-side diagnostics
+# that read state only, and they stay informative in an installed copy.
+_NEEDS_TREE = ("play", "studio", "build")
 
 
 def _describe(error: BaseException) -> str:
@@ -49,6 +60,10 @@ def main(argv: list[str] | None = None) -> int:
     p_play.add_argument("source")
     args = parser.parse_args(argv)
     try:
+        if args.cmd in _NEEDS_TREE:
+            # Fail fast, before any device work: one line, and the environment exit code (2) because
+            # this is the environment being wrong, not the hardware (A-102's distinction).
+            tree.root()
         if args.cmd == "detect":
             return _detect()
         if args.cmd == "status":
@@ -73,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
         # The backend, not the deck (A-102). No command can reach a hardware conclusion here, so
         # every one of them reports the environment and exits with the environment code.
         print(error, file=sys.stderr)
+        return _ENV_EXIT
+    except tree.TreeNotFound as error:
+        # Same class of problem as a missing backend -- the environment, not the deck -- so it uses
+        # the same exit code and the same one-line treatment (C-158).
+        print(_describe(error), file=sys.stderr)
         return _ENV_EXIT
     except SystemExit as error:
         # `except Exception` cannot see this, so a command that exits the process in-process ends the

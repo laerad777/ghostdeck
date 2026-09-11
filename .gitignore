@@ -7,6 +7,12 @@ __pycache__/
 *.egg-info/
 uv.lock
 .DS_Store
+# setuptools build output. `pip wheel .` / `python -m build` leave stale COPIES of the
+# package sources here; committing them would add a second, outdated copy of the product
+# to the tree (and to the privacy scan).
+build/
+dist/
+*.whl
 vendor/d200-zkgui-proxy
 vendor/d200-color-agent
 vendor/libd200-zkgui-preload.so

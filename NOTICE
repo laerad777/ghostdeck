@@ -29,8 +29,12 @@ Resolved on PATH (`shutil.which`, or a bare-name exec):
 - armv7-linux-gnueabihf-gcc (compiles the ARM device helpers)
 - clang, xcrun, install_name_tool, codesign, ditto (Xcode command-line
   tools; build and sign the local hidshim Studio copy)
-- ps (reads a process command line to identify our own player and the
-  Studio copy)
+- ps (reads a process command line or start time to identify our own player, the
+  virtual-HID keeper, and the Studio copy)
+- pgrep, kill (used only by the opt-in hardware verification harness
+  `tools/hardware_verify.py`: pgrep lists processes matching a pattern so the harness can
+  find this repository's own local bridge, and kill sends a signal to an exact pid so it
+  can stop the bridge process it started itself)
 - ar, file (binutils and the file utility, when present; `device/build-color-agent.sh`
   inspects the libturbojpeg archive with them)
 

@@ -39,6 +39,12 @@ CTL_STOP_ARGV = f"-s {SERIAL} shell setprop ctl.stop zkswe"
 CTL_START_ARGV = f"-s {SERIAL} shell setprop ctl.start zkswe"
 RM_ARGV = f"-s {SERIAL} shell rm -f /tmp/ghostdeck-*"
 LISTING_ARGV = f"-s {SERIAL} shell ls /tmp/ghostdeck*"
+# T17 signal 3: the deck-only sysfs node, read over `adb` alone. It is on the adb allowlist, and a
+# phone cannot answer it, so a successful read is a positive identification rather than a positional
+# pick (A-137). The read is the ONLY call ever sent to a candidate that is not the deck.
+CAT_FUNCTIONS = "cat /sys/class/zkswe_usb/zkswe0/functions"
+PROBE_ARGV = f"-s {SERIAL} shell {CAT_FUNCTIONS}"
+PHONE_PROBE_ARGV = f"-s PHONE123 shell {CAT_FUNCTIONS}"
 RESTORE_ARGV = [CTL_STOP_ARGV, CTL_START_ARGV]
 STOP_ARGV = [DEVICES_ARGV, CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV, LISTING_ARGV]
 
@@ -913,19 +919,11 @@ def test_deck_line_without_product_fields_still_resolves(tmp_path):
 
 
 def test_deck_is_identified_by_the_usb_layer_not_by_adb_fields(tmp_path):
-    """Both accepted signals, and the refusal when neither fires.
-
-    With the USB verdict present the field-less line resolves; with the same field-less line but no
-    USB verdict there is nothing to identify the deck, so `stop` must refuse and touch no device.
-    """
+    """Signal 1 still resolves the field-less line, and no probe is needed when it fires."""
     identified, calls, _ = _cli(HAPPY_ADB, tmp_path / "a", deck_serial=SERIAL)
     assert identified.returncode == 0, identified.stderr
     assert calls == STOP_ARGV, calls
-
-    unidentified, calls, _ = _cli(HAPPY_ADB, tmp_path / "b", deck_serial=None)
-    assert unidentified.returncode != 0, unidentified.stdout
-    assert "no ADB device" in unidentified.stderr, unidentified.stderr
-    assert calls == [DEVICES_ARGV], f"nothing may be sent without a positive identification: {calls}"
+    assert not any("zkswe0/functions" in call for call in calls), calls
 
 
 def test_adb_l_identity_fields_are_still_an_accepted_path(tmp_path):
@@ -1015,13 +1013,142 @@ def test_stop_targets_the_deck_when_a_phone_is_listed_first(tmp_path):
 
 
 def test_stop_refuses_when_no_attached_device_is_the_deck(tmp_path):
-    """With only a phone attached the deck is absent, and the command must say so rather than guess."""
+    """With only a phone attached the deck is absent, and the command must say so rather than guess.
+
+    T17 adds the read-only sysfs probe, so a `device`-state candidate IS now asked about itself.
+    That is the identification mechanism, not a positional fallback: the phone answers nothing (the
+    fake exits 0 with no output - the case where an exit code alone would have lied), so `stop` still
+    refuses, and the probe is the ONLY call that ever names the phone.
+    """
     result, calls, _ = _cli(PHONE_ONLY_ADB, tmp_path, deck_serial=None)
     assert result.returncode != 0, result.stdout
     assert "no ADB device" in result.stderr, result.stderr
     assert "D200" in result.stderr, result.stderr  # names the deck as the missing device
-    assert calls == [DEVICES_ARGV], f"nothing may be sent to an unidentified device: {calls}"
-    assert not any("PHONE123" in call for call in calls), calls
+    assert [call for call in calls if "PHONE123" in call] == [PHONE_PROBE_ARGV], calls
+    assert not any("setprop" in call or "rm -f" in call or "ls /tmp" in call for call in calls), calls
+
+
+# --- T17: identification over `adb` alone, when the extras and the `-l` fields are absent -----
+
+# The real extras-absent shape: `usb.detect()` has no verdict (no hidapi/pyusb), and the deck line is
+# field-less (T15), so neither signal 1 nor signal 2 can fire. The probe is what is left.
+PROBE_ONLY_ADB = _adb(f"""case "$1" in
+  devices) printf 'List of devices attached\\n{SERIAL}      device usb:18092032X transport_id:4\\n'; exit 0 ;;
+esac
+case "$*" in
+  *"zkswe0/functions"*) echo adb; exit 0 ;;
+esac
+exit 0
+""")
+
+# A phone FIRST and the deck second, both in `device` state, both field-less. The probe answers only
+# for the deck's serial, so identification has to come from the device's own answer.
+PROBE_DECK_AFTER_PHONE_ADB = _adb(f"""case "$1" in
+  devices) printf 'List of devices attached\\nPHONE123      device usb:10000001X transport_id:1\\n{SERIAL}      device usb:18092032X transport_id:4\\n'; exit 0 ;;
+esac
+case "$*" in
+  *"zkswe0/functions"*)
+    case "$2" in
+      {SERIAL}) echo adb; exit 0 ;;
+    esac
+    echo "cat: /sys/class/zkswe_usb/zkswe0/functions: No such file or directory" >&2
+    exit 1 ;;
+esac
+exit 0
+""")
+
+# Five usable candidates, none of which answers: the probe count must be bounded.
+FIVE_PHONES_ADB = _adb(
+    "case \"$1\" in\n"
+    "  devices) printf 'List of devices attached\\n"
+    + "\\n".join(f"PHONE{i}      device usb:1000000{i}X transport_id:{i}" for i in range(5))
+    + "\\n'; exit 0 ;;\n"
+    "esac\nexit 0\n"
+)
+
+
+def test_stop_identifies_the_deck_by_the_zkswe_probe_without_the_usb_verdict(tmp_path):
+    """T17 (C-153/C-155, HIGH): `stop` could not find the deck without the Python extras.
+
+    Before this, `deck_transport()` accepted only the USB verdict and the `-l` identity fields, and
+    neither can fire here - so the serial sitting in `adb devices` was never used and `stop`, the
+    documented recovery command, refused. The deck's own sysfs node (already on the adb allowlist) is
+    a positive, deck-only answer, so the whole cleanup now runs against it.
+    """
+    result, calls, _ = _cli(PROBE_ONLY_ADB, tmp_path, deck_serial=None)
+    assert result.returncode == 0, result.stderr
+    assert calls[0] == DEVICES_ARGV, calls
+    assert calls[1] == PROBE_ARGV, calls
+    for argv in (CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV):
+        assert argv in calls, f"{argv} never ran, so the deck was not restored: {calls}"
+    assert calls[-1] == LISTING_ARGV, calls
+    # The signal that identified it is named, so a future diagnosis is not another mystery.
+    assert "zkswe" in result.stderr and SERIAL in result.stderr, result.stderr
+
+
+def test_the_probe_never_targets_the_phone_listed_before_the_deck(tmp_path):
+    """A-137 must survive T17: the probe may READ a candidate, but never mutate one.
+
+    The phone is first and both lines are field-less, so position decides nothing: the deck is
+    accepted only because its own node answered. The phone is probed (that is how it is ruled out)
+    and is named by no other call.
+    """
+    result, calls, _ = _cli(PROBE_DECK_AFTER_PHONE_ADB, tmp_path, deck_serial=None)
+    assert result.returncode == 0, result.stderr
+    assert [call for call in calls if "PHONE123" in call] == [PHONE_PROBE_ARGV], calls
+    assert PROBE_ARGV in calls, calls
+    for argv in (CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV):
+        assert argv in calls, f"{argv} never ran, so the deck was not restored: {calls}"
+    assert calls[-1] == LISTING_ARGV, calls
+
+
+def test_stop_refuses_cleanly_when_the_probe_fails(tmp_path):
+    """A probe that cannot answer is "not the deck" - never an exception escaping `stop`."""
+    probe_errors = _adb("""case "$1" in
+  devices) printf 'List of devices attached\\nPHONE123      device usb:10000001X transport_id:1\\n'; exit 0 ;;
+esac
+case "$*" in
+  *"zkswe0/functions"*) echo "adb: device offline" >&2; exit 1 ;;
+esac
+exit 0
+""")
+    result, calls, _ = _cli(probe_errors, tmp_path, deck_serial=None)
+    assert result.returncode != 0, result.stdout
+    assert "no ADB device" in result.stderr, result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
+    assert [call for call in calls if "PHONE123" in call] == [PHONE_PROBE_ARGV], calls
+
+
+def test_a_probe_that_cannot_run_is_not_fatal(monkeypatch):
+    """The other failure shapes - a timeout, adb gone - must also be a clean "no answer".
+
+    Reproduced in-process because a real 30s timeout would dominate the suite, and the point is the
+    exception path, not the clock.
+    """
+    from ghostdeck import play
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired("adb", play._ADB_TIMEOUT)
+
+    monkeypatch.setattr(play.adb, "run", boom)
+    assert play._probe_is_deck("PHONE123") is False
+
+    def err(*args, **kwargs):
+        raise RuntimeError("adb could not be run")
+
+    monkeypatch.setattr(play.adb, "run", err)
+    assert play._probe_is_deck("PHONE123") is False
+
+
+def test_the_probe_count_is_bounded(tmp_path):
+    """Five usable candidates and no answer: at most `_PROBE_LIMIT` probes, then a plain refusal."""
+    from ghostdeck import play
+
+    result, calls, _ = _cli(FIVE_PHONES_ADB, tmp_path, deck_serial=None)
+    assert result.returncode != 0, result.stdout
+    probes = [call for call in calls if "zkswe0/functions" in call]
+    assert len(probes) == play._PROBE_LIMIT, probes
+    assert len(set(probes)) == play._PROBE_LIMIT, f"each candidate is probed once: {probes}"
 
 
 # --- T16: a deck that is attached but whose adb transport is not answering ---------------

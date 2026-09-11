@@ -82,14 +82,31 @@ def device_serial() -> str | None:
 
 
 def adb_devices() -> list[tuple[str, str]]:
-    """(serial, state) pairs from `adb devices`. State is `device`, `offline`, `unauthorized`, ..."""
-    out = subprocess.run(["adb", "devices"], capture_output=True, text=True).stdout
+    """(serial, state) pairs from `adb devices`, or [] when adb is unusable.
+
+    Total by design: this is called from `observe()` on every stage, so a missing adb must
+    not escape as an OSError from inside a diagnostic. The caller decides what a missing
+    adb means; `main()` checks for it up front.
+    """
+    try:
+        out = subprocess.run(["adb", "devices"], capture_output=True, text=True).stdout
+    except OSError:
+        return []
     rows = []
     for line in out.splitlines()[1:]:
         fields = line.split()
         if len(fields) >= 2:
             rows.append((fields[0], fields[1]))
     return rows
+
+
+def adb_available() -> bool:
+    """True when an `adb` binary can be executed at all."""
+    try:
+        subprocess.run(["adb", "version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 def own_bridges() -> list[int]:
@@ -103,10 +120,26 @@ def own_bridges() -> list[int]:
     listed = subprocess.run(["pgrep", "-f", "d200-local-bridge.py"], capture_output=True, text=True).stdout
     pids = []
     for pid in listed.split():
-        cmd = subprocess.run(["ps", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout
-        if marker in cmd:
+        if is_bridge_pid(pid):
             pids.append(int(pid))
     return pids
+
+
+def is_bridge_pid(pid) -> bool:
+    """True when this exact pid is currently one of this repository's bridge processes.
+
+    This is a pid-reuse guard, **not** an ownership test. Ownership is established as
+    "observed absent before bring-up" (see main()); between then and teardown a pid can be
+    recycled, and signalling a recycled pid would kill an unrelated process. The argv is
+    re-read immediately before signalling for exactly that reason.
+    """
+    marker = str(ROOT / "vendor" / "d200-local-bridge.py")
+    try:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return marker in cmd
 
 
 def own_bridge_count() -> int:
@@ -121,12 +154,13 @@ def stop_own_bridges(pids: list[int], *, timeout: float = 10.0) -> list[int]:
     verification run that calls `studio._ensure_bridge()` owns the bridge and has to
     release it, otherwise the deck cannot return to HID and the staged agent survives.
 
-    Only exact pids that appeared during this run are ever signalled - never a pattern
-    match - so a bridge belonging to the operator or another tool is untouched.
+    The caller passes the pids that appeared DURING this run (see main()), so a bridge
+    belonging to the operator or another tool is never in the list. Each pid is re-checked
+    against its argv before signalling to survive pid recycling.
     """
     for pid in pids:
-        if pid not in own_bridges():
-            continue  # it exited or is not ours; leave it alone
+        if not is_bridge_pid(pid):
+            continue  # exited already, or the pid was recycled; leave it alone
         subprocess.run(["kill", "-TERM", str(pid)], check=False)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -241,6 +275,25 @@ def main() -> int:
     args = parser.parse_args()
 
     print("== baseline ==")
+    # Prerequisites FIRST, before any observation, so a missing tool is a clean refusal
+    # rather than a traceback out of a diagnostic (C-168).
+    if not adb_available():
+        print("SKIP: `adb` is not usable on PATH. This harness drives the deck through adb; "
+              "install Android platform-tools and re-run.")
+        return 2
+
+    # Ownership gate, before anything else can start a bridge: this harness only ever
+    # releases a bridge IT started, so an already-running one is a refusal, never something
+    # to adopt. Adopting is what let a previous revision signal a bridge that belonged to
+    # the operator (C-167).
+    before = own_bridges()
+    if before:
+        print(f"REFUSING: bridge process(es) {before} are already running.")
+        print("          This harness only stops a bridge it started itself, so it will not")
+        print("          adopt or signal an existing one. Stop it first, then re-run.")
+        return 2
+    check("no bridge running at start", not before, f"pids={before}")
+
     observe("before")
     start_mode = device_mode()
     if start_mode not in ("hid", "adb"):
@@ -248,8 +301,6 @@ def main() -> int:
         return 2
 
     print("\n== bridge bring-up ==")
-    before_bridges = own_bridge_count()
-    check("no bridge running at start", before_bridges == 0, f"count={before_bridges}")
     began = time.monotonic()
     try:
         studio._ensure_bridge()
@@ -258,9 +309,10 @@ def main() -> int:
         print("\nRESULT: cannot continue without a bridge")
         return 1
     setup_seconds = time.monotonic() - began
-    # Record exactly which bridge processes this run created, so teardown can release
-    # only those. See stop_own_bridges for why the harness must do this itself.
-    our_bridges = own_bridges()
+    # Ownership is "absent before bring-up": only pids that were NOT there before are ours
+    # to release. The `before` set is empty by construction here (we refused otherwise), but
+    # the subtraction is kept so the rule holds even if the gate above is ever relaxed.
+    our_bridges = [pid for pid in own_bridges() if pid not in before]
     observe("after bring-up")
     check("bridge socket live", studio._socket_state()[0] == "live", str(studio._socket_state()))
     check("exactly one bridge", own_bridge_count() == 1, f"count={own_bridge_count()}")

@@ -308,3 +308,78 @@ def test_multi_token_single_parts_stay_allowed():
     ):
         assert len(command.split()) > 1, command
         assert adb.allowed(["-s", "S", "shell", command]) is True, command
+
+
+# --- C-145 residual: the host-daemon call must stay bounded -------------------
+# C-145 was filed because the whole `restart_server()` mechanism was unpinned. Its two argv mutants
+# are now killed by A-153's tests in `test_hostcli_bridge.py` (verified: deleting `start-server`, and
+# inverting the order to `start` then `kill`, each turn those tests red). One mutant still survived
+# that check -- deleting the `timeout=`. That is not cosmetic: `restart_server()` is reached from
+# `stop`'s and bring-up's stale-server recovery, so an unbounded call against a wedged adb server
+# hangs the one command that exists to recover the deck. This is the A-116 failure mode (a HIGH
+# finding) on a second call site, so the bound is pinned here rather than left to the caller.
+
+
+def test_restart_server_passes_a_bounded_timeout_to_every_command(monkeypatch):
+    """The default must reach `subprocess.run` unchanged, not just exist as a constant."""
+    monkeypatch.setattr(adb, "adb_bin", lambda: "/nonexistent/adb")
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append((list(argv), kwargs.get("timeout")))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(adb.subprocess, "run", fake_run)
+    adb.restart_server()
+
+    assert [argv[1] for argv, _ in seen] == ["kill-server", "start-server"]
+    assert [timeout for _, timeout in seen] == [adb._SERVER_TIMEOUT, adb._SERVER_TIMEOUT]
+    # A finite, positive bound: `None` (the unbounded default) and `0` are both wrong here.
+    assert isinstance(adb._SERVER_TIMEOUT, (int, float)) and adb._SERVER_TIMEOUT > 0
+
+
+def test_restart_server_honours_a_caller_supplied_timeout(monkeypatch):
+    """The override is the caller's escape hatch (a slow host, a bounded test); it must be used."""
+    monkeypatch.setattr(adb, "adb_bin", lambda: "/nonexistent/adb")
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(adb.subprocess, "run", fake_run)
+    adb.restart_server(timeout=3.0)
+    assert seen == [3.0, 3.0]
+
+
+def test_restart_server_turns_a_hung_command_into_a_named_error(monkeypatch):
+    """A timeout must surface as a RuntimeError naming the command, never as a hang.
+
+    `subprocess.TimeoutExpired` is a `SubprocessError`, and the point of catching it is that the
+    caller (`stop`, `studio`'s bring-up) prints a reason and continues instead of blocking forever.
+    """
+    monkeypatch.setattr(adb, "adb_bin", lambda: "/nonexistent/adb")
+
+    def hang(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout") or 30.0)
+
+    monkeypatch.setattr(adb.subprocess, "run", hang)
+    with pytest.raises(RuntimeError) as excinfo:
+        adb.restart_server()
+    message = str(excinfo.value)
+    assert "kill-server" in message, message
+    assert "could not be run" in message, message
+    # And it must not have gone on to try the second command after the first never answered.
+    assert "start-server" not in message, message
+
+
+def test_restart_server_never_reaches_the_device_allowlist(monkeypatch):
+    """C-145's boundary, restated where the mechanism lives: server management is host-only.
+
+    `kill-server`/`start-server` are deliberately absent from `validate()`, so they can only ever be
+    issued by this one named call. If a future edit routes them through the device path, the
+    allowlist must refuse them.
+    """
+    monkeypatch.setattr(adb, "adb_bin", lambda: "/nonexistent/adb")
+    for argv in (["kill-server"], ["start-server"], ["-s", "SERIAL", "kill-server"]):
+        assert adb.allowed(argv) is False, f"the device allowlist now permits {argv}"

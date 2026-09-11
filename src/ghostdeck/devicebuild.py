@@ -7,8 +7,9 @@ import subprocess
 from pathlib import Path
 
 from ghostdeck import state as gdstate
+from ghostdeck import tree
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = tree.candidate_root()
 DEVICE = ROOT / "device"
 VENDOR = ROOT / "vendor"
 NAMES = ("d200-zkgui-proxy", "libd200-zkgui-preload.so", "d200-color-agent")
@@ -46,6 +47,11 @@ def _stale(source: Path, output: Path) -> bool:
 
 
 def ensure() -> None:
+    # Validate the tree before anything else: `ROOT`/`DEVICE`/`VENDOR` are candidates, not proof, and
+    # without this the first symptom of an installed copy was `device sources missing under
+    # <wrong path>` -- which reads like a broken checkout rather than a wheel that ships no sources
+    # (C-158). `cli` gates this too; this keeps the library entry point honest on its own.
+    tree.root()
     gdstate.BIN_DIR.mkdir(parents=True, exist_ok=True)
     _compile_proxy_preload()
     _ensure_agent()

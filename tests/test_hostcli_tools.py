@@ -7,7 +7,6 @@ no `~/.ghostdeck` access.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -55,6 +54,21 @@ def _only_line(result: subprocess.CompletedProcess) -> str:
     return lines[0]
 
 
+def _stub_build_tools(monkeypatch, present: set[str]) -> None:
+    """Pin the build-tool lookup so the test states exactly which tools exist (C-157).
+
+    `studio._require_build_tools()` asks `shutil.which`, so stubbing that instead of the PATH makes
+    the answer independent of the host. The previous version read the ambient PATH: it passed on a
+    Mac with the Xcode tools installed and failed under `PATH=/bin`, the same class of defect as a
+    test that inherits the operator's real $HOME.
+    """
+    from ghostdeck import studio
+
+    monkeypatch.setattr(
+        studio.shutil, "which", lambda name: f"/usr/bin/{name}" if name in present else None
+    )
+
+
 def test_play_preflight_names_missing_ffmpeg(tmp_path):
     line = _only_line(_cli(tmp_path, "play", "/tmp/whatever.mov"))
     assert line.startswith("ffmpeg not on PATH")
@@ -94,10 +108,7 @@ def test_studio_preflight_names_missing_build_tool(tmp_path, monkeypatch):
 
     monkeypatch.setattr(studio, "COPY", tmp_path / "copy-does-not-exist.app")
     monkeypatch.setattr(studio, "ORIGINAL", tmp_path / "original-does-not-exist.app")
-    real_which = shutil.which
-    monkeypatch.setattr(
-        studio.shutil, "which", lambda name: None if name == "clang" else real_which(name)
-    )
+    _stub_build_tools(monkeypatch, set(studio._BUILD_TOOLS) - {"clang"})
     with pytest.raises(RuntimeError) as excinfo:
         studio.ensure_copy()
     message = str(excinfo.value)
@@ -106,11 +117,33 @@ def test_studio_preflight_names_missing_build_tool(tmp_path, monkeypatch):
     assert "\n" not in message
 
 
-def test_studio_preflight_passes_with_all_tools_present(tmp_path, monkeypatch):
+def test_studio_preflight_names_the_first_missing_build_tool_in_order(tmp_path, monkeypatch):
+    """The tool named is the first MISSING one in `_BUILD_TOOLS` order, not merely a missing one.
+
+    The test above has exactly one tool absent, so it cannot see an ordering change. Here two are
+    absent and the earlier one must be named: a reorder that put `clang` ahead of `ditto` would name
+    `clang` and fail here, rather than being caught by accident elsewhere.
+    """
     from ghostdeck import studio
 
     monkeypatch.setattr(studio, "COPY", tmp_path / "copy-does-not-exist.app")
     monkeypatch.setattr(studio, "ORIGINAL", tmp_path / "original-does-not-exist.app")
+    present = set(studio._BUILD_TOOLS) - {"ditto", "clang"}
+    _stub_build_tools(monkeypatch, present)
+    missing = [tool for tool in studio._BUILD_TOOLS if tool not in present]
+    assert missing == ["ditto", "clang"], f"the fixture no longer isolates order: {missing}"
+    with pytest.raises(RuntimeError) as excinfo:
+        studio.ensure_copy()
+    assert str(excinfo.value) == "ditto not on PATH: install it (xcode-select --install)"
+
+
+def test_studio_preflight_passes_with_all_tools_present(tmp_path, monkeypatch):
+    """With the whole toolchain present the preflight passes, so the next failure is the missing app."""
+    from ghostdeck import studio
+
+    monkeypatch.setattr(studio, "COPY", tmp_path / "copy-does-not-exist.app")
+    monkeypatch.setattr(studio, "ORIGINAL", tmp_path / "original-does-not-exist.app")
+    _stub_build_tools(monkeypatch, set(studio._BUILD_TOOLS))
     with pytest.raises(RuntimeError) as excinfo:
         studio.ensure_copy()
     message = str(excinfo.value)
@@ -143,7 +176,7 @@ def test_studio_preflight_skipped_when_copy_already_usable(tmp_path, monkeypatch
     monkeypatch.setattr(studio, "REAL", real)
     monkeypatch.setattr(studio, "EXE", exe)
     monkeypatch.setattr(studio, "ORIGINAL", tmp_path / "original-does-not-exist.app")
-    monkeypatch.setattr(studio.shutil, "which", lambda name: None)
+    _stub_build_tools(monkeypatch, set())
 
     assert studio.copy_exists() is True, "the redirect is incomplete; this would read the real $HOME"
     studio.ensure_copy()  # returns early; must not raise

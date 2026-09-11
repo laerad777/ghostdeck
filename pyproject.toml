@@ -22,6 +22,27 @@ classifiers = [
 [project.scripts]
 ghostdeck = "ghostdeck.cli:main"
 
+# ---------------------------------------------------------------------------------------------------
+# 0.1.0 IS CHECKOUT-ONLY. `pip install ghostdeck` installs a command that cannot reach any of its
+# runtime assets, so do not present installing from an index as a way to run this (C-158).
+#
+# A built wheel contains `ghostdeck/*.py` and nothing else, because the runtime half of this product
+# lives outside the package: `vendor/` (the player and the bridge), `device/` (the C sources and the
+# cross-build recipe), `reference/` (hidshim.c) and `manifest/`. They are resolved by
+# `ghostdeck.tree`, which validates the checkout and refuses with one explicit message when the tree
+# is absent, rather than guessing `parents[2]` and reporting four unrelated missing-file errors.
+#
+# The ways this is meant to be run:
+#
+#   git clone <repo> && cd ghostdeck && python -m ghostdeck ...   # from the checkout
+#   pip install -e .                                              # editable; the tree stays in place
+#
+# Making the wheel self-contained (move vendor/, reference/ and the device build inputs into
+# `ghostdeck/_vendor/` and load them via `importlib.resources`) is a real change to how the bridge
+# and the player are launched. It is not done in 0.1.0, so until it is, the honest statement is this
+# one instead of a claim of installability that does not exist.
+# ---------------------------------------------------------------------------------------------------
+
 # Optional runtime backends. Neither is a required dependency, but a deck cannot be reached
 # without both, and `ghostdeck play` is in practice a hard-hidapi + hard-pyusb program:
 # `hidapi` for HID enumeration and the 0x00ff ADB switch, and `pyusb` for ADB-mode detection
