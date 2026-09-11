@@ -137,6 +137,39 @@ out:
     errno = saved_errno;
 }
 
+/* Revalidate the private control handle against the descriptor table and the
+ * framebuffer before any restore write. The probe reads the live key, so it
+ * must never target original_color_key: a recycled number would otherwise
+ * overwrite the saved key we are restoring. */
+static int framebuffer_handle_valid(int fd)
+{
+    struct color_key probe;
+    return fd >= 0 && fcntl(fd, F_GETFD) >= 0 &&
+           ioctl(fd, FB_GET_COLOR_KEY, &probe) == 0;
+}
+
+/* The application may close a number that is, or was, our private handle:
+ * directly, via a recycled descriptor, or by dup2() overwriting it without
+ * calling close() at all. Relinquish ownership under the same lock the rest of
+ * the state uses, so teardown never ioctls or closes a descriptor we no longer
+ * own. Teardown is latched because the saved key is only valid while the
+ * original black-out is live; re-acquiring later would probe a screen that is
+ * still forced black and overwrite the true original. */
+static void release_framebuffer_fd(int fd)
+{
+    int cancel_state;
+    if (fd < 0) return;
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    pthread_mutex_lock(&framebuffer_lock);
+    if (fd == framebuffer_fd) {
+        framebuffer_fd = -1;
+        framebuffer_configured = 0;
+        framebuffer_teardown = 1;
+    }
+    pthread_mutex_unlock(&framebuffer_lock);
+    (void)pthread_setcancelstate(cancel_state, NULL);
+}
+
 static void restore_framebuffer(void)
 {
     int saved_errno = errno;
@@ -148,14 +181,38 @@ static void restore_framebuffer(void)
     /* Failed restoration stays pending between attempts. Teardown is bounded
      * even on permanent ioctl failure and releases the owned handle once. */
     for (attempt = 0; framebuffer_configured && attempt < 3; ++attempt) {
+        /* Revalidate per attempt. A number we no longer own is never written
+         * through, and an invalid handle stops the retries immediately. */
+        if (!framebuffer_handle_valid(framebuffer_fd)) break;
         if (ioctl(framebuffer_fd, FB_SET_COLOR_KEY, &original_color_key) == 0)
             framebuffer_configured = 0;
     }
-    if (framebuffer_fd >= 0) {
+    /* Release only a handle that just validated; a stale or recycled number
+     * must not be closed on someone else's behalf. */
+    if (framebuffer_handle_valid(framebuffer_fd)) {
         int control_fd = framebuffer_fd;
         framebuffer_fd = -1;
         framebuffer_configured = 0;
         (void)real_close_fn(control_fd);
+    } else {
+        /* The owned number no longer validates, so it is neither written
+         * through nor closed: if fcntl() succeeds it may be a recycled
+         * application descriptor. The black-out can still be live, so take
+         * one fresh handle we own by construction and restore through that.
+         * The reopen failure and the leftover unvalidated number are bounded:
+         * teardown runs once, and the obligation never survives it. */
+        framebuffer_fd = -1;
+        if (framebuffer_configured && real_open_fn != NULL &&
+            real_close_fn != NULL) {
+            int control_fd = real_open_fn("/dev/fb0", O_RDWR | O_CLOEXEC);
+            if (control_fd >= 0) {
+                if (framebuffer_handle_valid(control_fd) &&
+                    ioctl(control_fd, FB_SET_COLOR_KEY, &original_color_key) == 0)
+                    framebuffer_configured = 0;
+                (void)real_close_fn(control_fd);
+            }
+        }
+        framebuffer_configured = 0;
     }
     pthread_mutex_unlock(&framebuffer_lock);
     (void)pthread_setcancelstate(cancel_state, NULL);
@@ -393,6 +450,9 @@ int close(int fd)
         errno = ENOSYS;
         return -1;
     }
+    /* Relinquish the private framebuffer handle before forwarding, then keep
+     * the original pass-through errno contract for every other fd. */
+    release_framebuffer_fd(fd);
     errno = saved_errno;
     return real_close_fn(fd);
 }

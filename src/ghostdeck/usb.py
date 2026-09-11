@@ -2,12 +2,48 @@
 
 from __future__ import annotations
 
+import importlib.util
 import time
 
 from ghostdeck import ADB_PID, ADB_VID, HID_PID, HID_VID
 
 HID_SWITCH = 0x00FF
 HID_REPORT_SIZE = 1025
+
+HID_INSTALL_HINT = "hidapi is not installed (pip install hidapi)"
+USB_INSTALL_HINT = "pyusb is not installed (pip install pyusb)"
+
+
+def _importable(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def missing_dependency() -> str | None:
+    """Name the first unusable optional backend, or None when every backend imports.
+
+    `hidapi` is the primary backend for the D200 control interface; `pyusb` is only
+    used to read the descriptor serial when `hidapi` is unavailable.
+    """
+    if not _importable("hid"):
+        return HID_INSTALL_HINT
+    if not _importable("usb"):
+        return USB_INSTALL_HINT
+    return None
+
+
+class MissingDependency(RuntimeError):
+    """An optional backend package is not importable, so no hardware conclusion is possible."""
+
+
+def _hid_module():
+    try:
+        import hid
+    except ImportError as error:
+        raise MissingDependency(HID_INSTALL_HINT) from error
+    return hid
 
 
 def detect() -> dict:
@@ -17,12 +53,17 @@ def detect() -> dict:
     hid_hit = _hid_device()
     if hid_hit is not None:
         return hid_hit
-    return {"serial": None, "vid": None, "pid": None, "mode": "none"}
+    result = {"serial": None, "vid": None, "pid": None, "mode": "none"}
+    hint = missing_dependency()
+    if hint is not None:
+        # A missing backend is not a hardware verdict; the caller must not blame the deck.
+        result["dependency"] = hint
+    return result
 
 
 def virtual_hid_enumerated() -> bool:
     """True only if 2207:0019 is on the bus while the physical deck is ADB."""
-    return _adb_device() is not None and _hid_present()
+    return bool(_adb_device() is not None and _hid_present())
 
 
 def enable_adb(*, timeout: float = 15.0) -> dict:
@@ -32,29 +73,34 @@ def enable_adb(*, timeout: float = 15.0) -> dict:
         return current
     info = _hid_iface0(timeout=timeout)
     if info is None:
+        hint = missing_dependency()
+        if hint is not None:
+            # Never report a missing package as a missing deck.
+            raise MissingDependency(hint)
         raise RuntimeError("D200 HID interface 0 not found")
     packet = bytearray(HID_REPORT_SIZE)
     packet[1:3] = b"||"
     packet[3:5] = HID_SWITCH.to_bytes(2, "big")
-    try:
-        import hid
-    except ImportError as error:
-        raise RuntimeError("hidapi is required to switch HID to ADB") from error
+    hid = _hid_module()
     device = hid.device()
     path = info["path"]
+    written = None
     try:
         device.open_path(path)
         written = device.write(packet)
-        if written != len(packet):
-            raise RuntimeError(f"short HID-to-ADB write: {written}")
     finally:
         device.close()
+    # The deck detaches from HID as the switch report lands, so hidapi usually reports a
+    # short or -1 write for a switch that worked. Only a deck that never appears through
+    # ADB is an error, and then the short write is the more specific one to report.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         found = detect()
         if found["mode"] == "adb":
             return found
         time.sleep(0.25)
+    if written is not None and written != len(packet):
+        raise RuntimeError(f"short HID-to-ADB write: {written}")
     raise RuntimeError("D200 did not enumerate through ADB")
 
 
@@ -95,11 +141,12 @@ def _adb_device() -> dict | None:
     }
 
 
-def _hid_present() -> bool:
+def _hid_present() -> bool | None:
+    """True/False for the bus, None when the backend itself is unusable."""
     try:
-        import hid
-    except ImportError:
-        return False
+        hid = _hid_module()
+    except MissingDependency:
+        return None
     try:
         return bool(hid.enumerate(HID_VID, HID_PID))
     except Exception:
@@ -108,8 +155,8 @@ def _hid_present() -> bool:
 
 def _hid_serial() -> str | None:
     try:
-        import hid
-    except ImportError:
+        hid = _hid_module()
+    except MissingDependency:
         return None
     try:
         entries = hid.enumerate(HID_VID, HID_PID)
@@ -125,10 +172,7 @@ def _hid_serial() -> str | None:
 
 
 def _hid_iface0(*, timeout: float):
-    try:
-        import hid
-    except ImportError:
-        return None
+    hid = _hid_module()
     deadline = time.monotonic() + max(timeout, 0)
     while True:
         try:
@@ -152,6 +196,8 @@ def _hid_iface0(*, timeout: float):
 
 
 def _usb_find(vid: int, pid: int):
+    if not _importable("usb"):
+        return None
     try:
         import usb.core
     except ImportError:

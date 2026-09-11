@@ -1,8 +1,11 @@
 .venv/
+.gjc/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.pyo
+*.egg-info/
+uv.lock
 .DS_Store
 vendor/d200-zkgui-proxy
 vendor/d200-color-agent

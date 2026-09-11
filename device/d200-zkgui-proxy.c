@@ -623,6 +623,7 @@ static void connection_boundary(struct state *s)
     s->video.cancel_pending = false;
     s->hello = false;
     s->stdout_ok = false;
+    s->control_eof = false;
 }
 
 static volatile sig_atomic_t stop_requested;
@@ -1212,9 +1213,16 @@ int main(int argc, char **argv)
     uint64_t reconnect_deadline = 0;
     unsigned char host_capability[CAPABILITY_MAX];
     uint32_t host_capability_length = 0;
-    unsigned long host_port = argc > 2 ? strtoul(argv[2], NULL, 10) : 0;
+    unsigned long host_port = 0;
+    bool host_port_valid = false;
+    if (argc > 2) {
+        char *end;
+        host_port = strtoul(argv[2], &end, 10);
+        host_port_valid = end != argv[2] && *end == '\0';
+    }
     memset(&s, 0, sizeof(s)); s.lock_fd = s.listener[0] = s.listener[1] = s.peer[0] = s.peer[1] = -1; video_reset(&s.video); s.child = -1; s.stdout_ok = true;
-    if (argc != 7 || strcmp(argv[1], "--host-port") || !host_port || host_port > 65535 ||
+    /* Bound host_port < 65535 so host_port + 1 fits uint16_t below. */
+    if (argc != 7 || strcmp(argv[1], "--host-port") || !host_port_valid || !host_port || host_port >= 65535 ||
         strcmp(argv[3], "--session-dir") || strcmp(argv[5], "--preload") ||
         !safe_tmp_absolute(argv[4]) || !safe_tmp_absolute(argv[6]) ||
         strlen(argv[6]) < 4 || strcmp(argv[6] + strlen(argv[6]) - 3, ".so")) {

@@ -3,7 +3,9 @@
 #include <dlfcn.h>
 #endif
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +13,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <wchar.h>
 #ifdef D200_HOST_VISUAL
@@ -52,6 +55,10 @@ typedef struct hid_api_version {
 #define VPATH0 "d200-adb://2207:0019/interface/0"
 #define VPATH1 "d200-adb://2207:0019/interface/1"
 #define MAGIC 0x44323030U
+/* Host-side budget for one production transport request. The host-visual build
+ * has its own per-call deadlines (hidshim_host_transport.h) and ignores this
+ * value; the wire protocol's own timeoutMs field is unaffected by it. */
+#define D200_RPC_BUDGET_MS 15000
 
 typedef struct virtual_device {
     uint32_t magic;
@@ -60,6 +67,8 @@ typedef struct virtual_device {
     int interface_number;
     int nonblocking;
     int closing;
+    /* Set when hid_close() could not prove that every in-flight call returned. */
+    int close_uncertain;
     unsigned active_calls;
     hid_device_info *info;
     pthread_mutex_t mutex;
@@ -133,27 +142,93 @@ static int is_virtual(hid_device *device)
 }
 
 #ifndef D200_HOST_VISUAL
-static int write_all(int fd, const char *buffer, size_t length)
+/* One bounded policy for the whole production transport: every rpc() call gets an
+ * explicit host-side budget (D200_RPC_BUDGET_MS for control requests, and the
+ * peer's own timeoutMs plus D200_RPC_SLACK_MS for reads), and connect completion,
+ * the request write and the reply read are all driven by poll() against that
+ * single absolute deadline, so no wait inside rpc() can outlive it. */
+#define D200_RPC_SLACK_MS 1000
+
+/* A deadline expiry is not an I/O failure: distinct status so every entry point
+ * can report ETIMEDOUT instead of a generic transport error. */
+#define D200_TRANSPORT_TIMEOUT (-2)
+
+static int64_t monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* Host-side budget for a request whose peer-side timeoutMs is `timeout_ms`.
+ * A negative peer timeout (blocking hid_read) is still bounded here: no call may
+ * request an unbounded wait. */
+static int rpc_budget_ms(int timeout_ms)
+{
+    if (timeout_ms < 0)
+        return D200_RPC_BUDGET_MS;
+    if (timeout_ms > INT_MAX - D200_RPC_SLACK_MS)
+        return INT_MAX;
+    return timeout_ms + D200_RPC_SLACK_MS;
+}
+
+/* Wait for `events` on a non-blocking descriptor, never past `deadline`.
+ * 0 ready, D200_TRANSPORT_TIMEOUT expired, -1 error with errno set. */
+static int wait_ready(int fd, short events, int64_t deadline)
+{
+    for (;;) {
+        struct pollfd entry;
+        int64_t remaining = deadline - monotonic_ms();
+        int ready;
+        if (remaining <= 0) {
+            errno = ETIMEDOUT;
+            return D200_TRANSPORT_TIMEOUT;
+        }
+        entry.fd = fd;
+        entry.events = events;
+        entry.revents = 0;
+        ready = poll(&entry, 1, (int)(remaining > INT_MAX ? INT_MAX : remaining));
+        if (ready > 0)
+            return 0;
+        if (ready == 0) {
+            errno = ETIMEDOUT;
+            return D200_TRANSPORT_TIMEOUT;
+        }
+        if (errno != EINTR)
+            return -1;
+    }
+}
+
+static int write_all(int fd, const char *buffer, size_t length, int64_t deadline)
 {
     while (length) {
-        ssize_t written = send(fd, buffer, length, MSG_NOSIGNAL);
+        ssize_t written;
+        int waited = wait_ready(fd, POLLOUT, deadline);
+        if (waited)
+            return waited;
+        written = send(fd, buffer, length, MSG_NOSIGNAL);
         if (written > 0) {
             buffer += written;
             length -= (size_t)written;
             continue;
         }
-        if (written < 0 && errno == EINTR)
+        if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
         return -1;
     }
     return 0;
 }
 
-static int read_frame(int fd, char *buffer, size_t capacity)
+/* 0 = one framed reply line, D200_TRANSPORT_TIMEOUT = deadline expired, -1 = error. */
+static int read_frame(int fd, char *buffer, size_t capacity, int64_t deadline)
 {
     size_t used = 0;
     while (used + 1 < capacity) {
-        ssize_t received = read(fd, buffer + used, 1);
+        ssize_t received;
+        int waited = wait_ready(fd, POLLIN, deadline);
+        if (waited)
+            return waited;
+        received = recv(fd, buffer + used, 1, 0);
         if (received > 0) {
             if (buffer[used] == '\0')
                 return -1;
@@ -163,11 +238,30 @@ static int read_frame(int fd, char *buffer, size_t capacity)
             }
             continue;
         }
-        if (received < 0 && errno == EINTR)
+        if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
         return -1;
     }
     return -1;
+}
+
+/* Teardown budget for draining in-flight handle calls in hid_close(). The
+ * bridge's own longest single control round trip is a 10 s output acknowledgement
+ * and proxy readiness allows 15 s, so 15 s lets a legitimately in-flight call
+ * still finish while a deck that vanished mid-call can no longer hang the caller
+ * forever. The default pthread condition clock is CLOCK_REALTIME, so the drain
+ * deadline is built on that clock. */
+#define D200_CLOSE_DRAIN_MS 15000
+
+static void close_drain_deadline(struct timespec *deadline)
+{
+    clock_gettime(CLOCK_REALTIME, deadline);
+    deadline->tv_sec += D200_CLOSE_DRAIN_MS / 1000;
+    deadline->tv_nsec += (long)(D200_CLOSE_DRAIN_MS % 1000) * 1000000L;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec += 1;
+        deadline->tv_nsec -= 1000000000L;
+    }
 }
 #endif
 
@@ -446,7 +540,7 @@ static int parse_reply(const char *answer, size_t length, const char *operation,
 }
 
 static int rpc(const char *operation, uint64_t handle, const char *capability,
-               int interface_number, int timeout_ms,
+               int interface_number, int timeout_ms, int budget_ms,
                const unsigned char *report, size_t report_length,
                unsigned char *output, size_t *output_length,
                char opened_capability[65]
@@ -457,7 +551,9 @@ static int rpc(const char *operation, uint64_t handle, const char *capability,
 {
 #ifndef D200_HOST_VISUAL
     int fd = -1;
+    int64_t deadline;
 #else
+    (void)budget_ms;
     d200_host_state transient;
     d200_host_call call;
     int temporary = host == NULL, begun;
@@ -495,8 +591,30 @@ static int rpc(const char *operation, uint64_t handle, const char *capability,
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", SOCKET_PATH);
-    if (connect(fd, (struct sockaddr *)&address, sizeof(address)))
+    /* Non-blocking transport: the connect, the request write and the reply read
+     * are each bounded by this one absolute deadline, so a peer that accepted
+     * the connection and stopped answering cannot block the caller. */
+    deadline = monotonic_ms() + budget_ms;
+    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)) {
+        /* Without non-blocking mode there is no deadline to enforce: fail closed. */
         goto done;
+    }
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address))) {
+        if (errno != EINPROGRESS && errno != EAGAIN)
+            goto done;
+        if (wait_ready(fd, POLLOUT, deadline))
+            goto done;
+        {
+            int socket_error = 0;
+            socklen_t error_length = sizeof(socket_error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_length))
+                goto done;
+            if (socket_error) {
+                errno = socket_error;
+                goto done;
+            }
+        }
+    }
 #endif
     length = snprintf(
         message, sizeof(message),
@@ -545,13 +663,14 @@ host_done:
     }
 #else
     if (length < 0 || (size_t)length >= sizeof(message) ||
-        write_all(fd, message, (size_t)length) ||
-        read_frame(fd, answer, sizeof(answer)))
+        write_all(fd, message, (size_t)length, deadline) ||
+        read_frame(fd, answer, sizeof(answer), deadline))
         goto done;
     /* read_frame rejects raw NUL, so strlen cannot conceal a malformed tail. */
     result = parse_reply(answer, strlen(answer), operation, output, output_length,
                          opened_capability);
 done:
+    /* errno is ETIMEDOUT whenever the budget expired, otherwise the I/O error. */
     if (fd >= 0)
         close(fd);
 #endif
@@ -563,7 +682,7 @@ static int wait_for_daemon(void)
     int attempt, limit = daemon_waited ? 3 : 25;
     daemon_waited = 1;
     for (attempt = 0; attempt < limit; attempt++) {
-        if (rpc("event", 0, NULL, 0, -1, NULL, 0, NULL, NULL, NULL) == 0)
+        if (rpc("event", 0, NULL, 0, -1, D200_RPC_BUDGET_MS, NULL, 0, NULL, NULL, NULL) == 0)
             return 0;
         if (attempt + 1 < limit)
             usleep(200000);
@@ -599,8 +718,8 @@ static hid_device *virtual_open(int interface_number)
     virtual_device *device;
 #ifdef D200_HOST_VISUAL
     int64_t started = d200_host_now();
-    int initialization_error;
 #endif
+    int initialization_error;
     if (interface_number != 0 && interface_number != 1)
         return NULL;
     device = calloc(1, sizeof(*device));
@@ -626,15 +745,26 @@ static hid_device *virtual_open(int interface_number)
         goto host_initialization_failed;
     }
 #else
-    pthread_mutex_init(&device->mutex, NULL);
-    pthread_mutex_init(&device->read_mutex, NULL);
-    pthread_cond_init(&device->condition, NULL);
+    initialization_error = pthread_mutex_init(&device->mutex, NULL);
+    if (initialization_error) goto initialization_failed;
+    initialization_error = pthread_mutex_init(&device->read_mutex, NULL);
+    if (initialization_error) {
+        pthread_mutex_destroy(&device->mutex);
+        goto initialization_failed;
+    }
+    initialization_error = pthread_cond_init(&device->condition, NULL);
+    if (initialization_error) {
+        pthread_mutex_destroy(&device->read_mutex);
+        pthread_mutex_destroy(&device->mutex);
+        goto initialization_failed;
+    }
 #endif
     pthread_mutex_lock(&handle_lock);
     device->handle = next_handle++;
     pthread_mutex_unlock(&handle_lock);
     {
         int opened = rpc("open", device->handle, NULL, interface_number, -1,
+                         D200_RPC_BUDGET_MS,
                          NULL, 0, NULL, NULL, device->capability
 #ifdef D200_HOST_VISUAL
                          , &device->host, started
@@ -645,6 +775,7 @@ static hid_device *virtual_open(int interface_number)
         for (attempt = 0; attempt < 10 && opened; attempt++) {
             usleep(100000);
             opened = rpc("open", device->handle, NULL, interface_number, -1,
+                         D200_RPC_BUDGET_MS,
                          NULL, 0, NULL, NULL, device->capability);
         }
 #endif
@@ -682,6 +813,12 @@ host_initialization_failed:
     free(device);
     d200_host_error(NULL, initialization_error);
     return NULL;
+#else
+initialization_failed:
+    /* Each failure path above destroyed exactly what it had already created. */
+    free(device);
+    errno = initialization_error;
+    return NULL;
 #endif
 }
 
@@ -695,6 +832,15 @@ static int virtual_read(hid_device *opaque, unsigned char *buffer,
     virtual_device *device = (virtual_device *)opaque;
     size_t received = length;
     int result;
+#ifndef D200_HOST_VISUAL
+    int transport_error = 0;
+    /* Host-side transport budget; hid_read_timeout()'s own timeout still travels
+     * to the peer unchanged in the wire `timeoutMs` field. */
+    int budget_ms = rpc_budget_ms(timeout_ms);
+#else
+    /* The host-visual transport enforces its own per-call deadlines. */
+    int budget_ms = 0;
+#endif
     if (!opaque || (length && !buffer) || length > INT_MAX) {
         errno = EINVAL;
         return -1;
@@ -712,19 +858,24 @@ static int virtual_read(hid_device *opaque, unsigned char *buffer,
     pthread_mutex_lock(&device->read_mutex);
 #endif
     result = rpc("input", device->handle, device->capability,
-                 device->interface_number, timeout_ms,
+                 device->interface_number, timeout_ms, budget_ms,
                  NULL, 0, buffer, &received, NULL
 #ifdef D200_HOST_VISUAL
                  , &device->host, started
 #endif
                  );
 #ifndef D200_HOST_VISUAL
+    transport_error = errno;
+#endif
+#ifndef D200_HOST_VISUAL
     pthread_mutex_unlock(&device->read_mutex);
 #endif
     release_virtual(device);
     if (result) {
 #ifndef D200_HOST_VISUAL
-        errno = EIO;
+        /* A silent peer must surface as ETIMEDOUT, not as a generic failure:
+         * hid_read_timeout()'s documented timeout behavior depends on it. */
+        errno = transport_error == ETIMEDOUT ? ETIMEDOUT : EIO;
 #endif
         return -1;
     }
@@ -773,7 +924,7 @@ void hid_free_enumeration(hid_device_info *current);
 int hid_init(void)
 {
 #ifdef D200_HOST_VISUAL
-    return rpc("event", 0, NULL, 0, -1, NULL, 0, NULL, NULL, NULL, NULL, d200_host_now());
+    return rpc("event", 0, NULL, 0, -1, D200_RPC_BUDGET_MS, NULL, 0, NULL, NULL, NULL, NULL, d200_host_now());
 #else
     int (*function)(void) = sym("hid_init");
     return function ? function() : -1;
@@ -854,7 +1005,7 @@ int hid_write(hid_device *opaque, const unsigned char *buffer, size_t length)
             return -1;
         }
         result = rpc("output", device->handle, device->capability,
-                     device->interface_number, -1,
+                     device->interface_number, -1, D200_RPC_BUDGET_MS,
                      buffer, length, NULL, NULL, NULL
 #ifdef D200_HOST_VISUAL
                      , &device->host, started
@@ -948,10 +1099,11 @@ void hid_close(hid_device *opaque)
         d200_host_cancel(&device->host);
         int close_result =
 #else
-        (void)
+        struct timespec drain_deadline;
+        int close_result =
 #endif
         rpc("close", device->handle, device->capability,
-                  device->interface_number, -1, NULL, 0, NULL, NULL, NULL
+                  device->interface_number, -1, D200_RPC_BUDGET_MS, NULL, 0, NULL, NULL, NULL
 #ifdef D200_HOST_VISUAL
                   , &device->host, started
 #endif
@@ -979,10 +1131,24 @@ void hid_close(hid_device *opaque)
         }
         if (!failed_drain && !device->host.cleanup_uncertain && device->info)
 #else
-        while (device->active_calls)
-            pthread_cond_wait(&device->condition, &device->mutex);
-        if (device->info)
+        /* The close request carries an explicit budget, so a peer that accepted
+         * the connection and stopped answering cannot block teardown: on expiry
+         * close_result is -1 with errno ETIMEDOUT. That result alone is not
+         * teardown uncertainty, so it is not what marks the handle below. */
+        (void)close_result;
+        /* Bounded drain: a call that never returns must not wedge teardown. */
+        close_drain_deadline(&drain_deadline);
+        while (device->active_calls) {
+            if (pthread_cond_timedwait(&device->condition, &device->mutex, &drain_deadline))
+                break;
+        }
+        /* Only a call that really is still using the handle makes the teardown
+         * uncertain, and only that keeps hid_error() reporting it as retained. */
+        device->close_uncertain = device->active_calls != 0;
 #endif
+        /* Released unconditionally: the handle is already marked closing, so no
+         * caller can take a fresh borrow of the entry, and the process-lifetime
+         * tombstone below keeps late calls identifiable as virtual. */
         {
             hid_free_enumeration(device->info);
             device->info = NULL;
@@ -1013,7 +1179,7 @@ hid_device_info *hid_enumerate(unsigned short vendor, unsigned short product)
     int want_d200 = (!vendor || vendor == VID) && (!product || product == PID);
     if (want_d200 &&
 #ifdef D200_HOST_VISUAL
-        rpc("event", 0, NULL, 0, -1, NULL, 0, NULL, NULL, NULL, NULL, d200_host_now()) == 0
+        rpc("event", 0, NULL, 0, -1, D200_RPC_BUDGET_MS, NULL, 0, NULL, NULL, NULL, NULL, d200_host_now()) == 0
 #else
         (daemon_seen || wait_for_daemon() == 0)
 #endif
@@ -1194,8 +1360,15 @@ const wchar_t *hid_error(hid_device *device)
     default: return L"D200 HOST fixture transport failure";
     }
 #else
-    if (is_virtual(device))
-        return L"virtual D200 transport error";
+    if (is_virtual(device)) {
+        virtual_device *owner = (virtual_device *)device;
+        int uncertain;
+        pthread_mutex_lock(&owner->mutex);
+        uncertain = owner->close_uncertain;
+        pthread_mutex_unlock(&owner->mutex);
+        return uncertain ? L"virtual D200 transport cleanup uncertain; retained until process exit"
+                         : L"virtual D200 transport error";
+    }
     const wchar_t *(*function)(hid_device *) = sym("hid_error");
     return function ? function(device) : L"hidapi unavailable";
 #endif

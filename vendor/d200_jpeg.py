@@ -1,10 +1,15 @@
 """Import-safe incremental framing for concatenated JPEG byte streams.
 
 No decoding, device setup, or I/O is performed here. Consumers may supply their
-own max_frame_bytes; the default preserves HID's 16 MiB per-frame limit.
+own max_frame_bytes; the default is the deck's own cap, `D200_VS_MAX_JPEG` in
+`device/d200_video_stream.h`, which the native agent both advertises in its
+READY window and enforces in `d200_vs_validate_payload`.
 """
 
-MAX_JPEG_FRAME_BYTES = 16777216  # 16 MiB
+from d200_video_stream import MAX_JPEG
+
+# The device cap, not a host-side guess: a larger frame is rejected on the deck.
+MAX_JPEG_FRAME_BYTES = MAX_JPEG
 
 
 class JpegFramingError(ValueError):

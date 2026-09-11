@@ -17,6 +17,11 @@ _KILL = re.compile(
     r"^(?:killall(?: -9)?|kill(?: -[0-9]+| -TERM| -KILL| -INT)?) /tmp/ghostdeck-[A-Za-z0-9._+-]+$"
 )
 _RM = re.compile(r"^rm -f /tmp/ghostdeck(?:-\*|[A-Za-z0-9._+-]*)$")
+# Deny-by-default charset for tokens of the free-form shell branch.
+_TOKEN = re.compile(r"^[A-Za-z0-9._+:=/-]+$")
+# Rejected on the raw argv, before whitespace normalisation, so a token cannot
+# smuggle a second device-side command through a newline or tab.
+_UNSAFE = re.compile(r"[;&|<>$`\"'(){}\\\n\r\t]")
 _EXACT_SHELL = frozenset(
     {
         "getprop sys.usb.config",
@@ -63,7 +68,13 @@ def validate(argv: Sequence[str]) -> None:
                 raise AdbDenied("push remote must be /tmp/ghostdeck-*")
             return
         if rest and rest[0] == "shell":
-            command = " ".join(rest[1:]).strip()
+            parts = [str(part) for part in rest[1:]]
+            for part in parts:
+                if _UNSAFE.search(part):
+                    raise AdbDenied("shell argument contains a shell metacharacter")
+            if "hid,adb" in "".join(parts):
+                raise AdbDenied("composite gadget hid+adb is not allowed")
+            command = " ".join(parts).strip()
             command = " ".join(command.split())
             if not command:
                 raise AdbDenied("empty shell command")
@@ -119,11 +130,13 @@ def _shell_allowed(command: str) -> bool:
     ):
         return True
     tokens = command.split()
-    if tokens and _TMP.fullmatch(tokens[0]):
-        for token in tokens[1:]:
-            if ".." in token:
-                return False
-            if token.startswith("/") and not _TMP.fullmatch(token):
-                return False
-        return True
-    return False
+    if not tokens or not _TMP.fullmatch(tokens[0]):
+        return False
+    for token in tokens:
+        if not _TOKEN.fullmatch(token):
+            return False
+        if ".." in token:
+            return False
+        if token.startswith("/") and not _TMP.fullmatch(token):
+            return False
+    return True

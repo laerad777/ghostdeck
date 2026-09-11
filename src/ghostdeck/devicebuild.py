@@ -12,6 +12,11 @@ ROOT = Path(__file__).resolve().parents[2]
 DEVICE = ROOT / "device"
 VENDOR = ROOT / "vendor"
 NAMES = ("d200-zkgui-proxy", "libd200-zkgui-preload.so", "d200-color-agent")
+AGENT_RECIPE = DEVICE / "build-color-agent.sh"
+TURBOJPEG_HINT = (
+    "an ARM Linux static libturbojpeg is also required (Debian/Ubuntu: "
+    "libturbojpeg0-dev); a macOS/Homebrew libturbojpeg is not usable"
+)
 
 
 def gcc() -> str:
@@ -75,7 +80,14 @@ def _ensure_agent() -> None:
     if sibling.is_file():
         shutil.copy2(sibling, dest)
         return
+    gcc_hint = (
+        "Install an ARMv7 Linux hard-float toolchain"
+        if shutil.which("armv7-linux-gnueabihf-gcc") is None
+        else "An ARMv7 Linux hard-float toolchain is on PATH"
+    )
     raise RuntimeError(
-        "d200-color-agent is not built. Install armv7-linux-gnueabihf-gcc and "
-        "a static libturbojpeg, or place a built agent in ~/.ghostdeck/bin/"
+        "d200-color-agent is not built.\n"
+        f"  Run: {AGENT_RECIPE}\n"
+        f"  {gcc_hint}; {TURBOJPEG_HINT}.\n"
+        f"  Or place a prebuilt agent at {dest} (or a sibling at {sibling})."
     )

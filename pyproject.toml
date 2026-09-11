@@ -22,6 +22,16 @@ classifiers = [
 [project.scripts]
 ghostdeck = "ghostdeck.cli:main"
 
+# Optional runtime backends. Neither is a required dependency: without them the
+# host cannot talk to a deck, so `ghostdeck detect`/`play` report the missing
+# package instead of blaming the hardware. Both are imported by
+# src/ghostdeck/usb.py (`hidapi` for HID enumeration and the 0x00ff ADB switch,
+# `pyusb` for descriptor serial fallback) and required together for playback.
+[project.optional-dependencies]
+hid = ["hidapi"]
+usb = ["pyusb"]
+device = ["hidapi", "pyusb"]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 

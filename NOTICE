@@ -16,11 +16,32 @@ ownership of on-device stock software.
 
 External programs this project only executes
 --------------------------------------------
-ghostdeck invokes the following programs from PATH when present. It does
-not vendor, relicense, or redistribute them:
+ghostdeck invokes the following programs when present. It does not
+vendor, relicense, or redistribute them. Which lookup applies is stated
+per entry.
+
+Resolved on PATH (`shutil.which`, or a bare-name exec):
 
 - adb (Android SDK platform-tools)
 - ffmpeg
+- ffprobe (ships with ffmpeg; `ghostdeck play` probes the source with it first)
 - yt-dlp (optional; used only for URL sources)
+- armv7-linux-gnueabihf-gcc (compiles the ARM device helpers)
+- clang, xcrun, install_name_tool, codesign, ditto (Xcode command-line
+  tools; build and sign the local hidshim Studio copy)
+- ps (reads a process command line to identify our own player and the
+  Studio copy)
+- ar, file (binutils and the file utility, when present; `device/build-color-agent.sh`
+  inspects the libturbojpeg archive with them)
+
+Invoked by absolute path:
+
+- /bin/rm, /usr/bin/ditto (remove and copy the local Studio copy;
+  ditto is also required on PATH as above)
+- /usr/bin/open (launches the local Studio copy)
+
+Programs the device helpers exec on the deck through adb (for example
+/bin/sh, /bin/zkgui, and the staged proxy, preload, and agent) are not
+host programs and are covered by the vendor-property note above.
 
 Those programs keep their own licenses. Install them separately.

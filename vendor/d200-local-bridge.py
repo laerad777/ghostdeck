@@ -3,7 +3,7 @@
 
 import argparse
 import collections
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import errno
 import json
 import os
@@ -13,16 +13,22 @@ import select
 import signal
 import socket
 import socketserver
+import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
 
-from d200_process_control import StopEndpoint, emit_diagnostic, managed_device_admission
+from d200_process_control import (
+    DeviceAdmissionError, StopEndpoint, emit_diagnostic, managed_device_admission,
+)
 import d200_video_stream as video_wire
 
 DEFAULT_SOCKET = Path('/tmp/d200-adb-bridge.sock')
+# Fixed device path the stock zkgui proxy execs for video sessions; staged by
+# this bridge and removed again by its teardown.
+STAGED_AGENT = '/tmp/d200-color-agent'
 ADB_SERIAL = ""
 MAX_MESSAGE = 4096
 MAX_PAYLOAD = 64 * 1024
@@ -52,6 +58,10 @@ class ProtocolError(RuntimeError):
     pass
 
 
+class BridgeSocketInUse(RuntimeError):
+    """The bridge socket is served by another instance and was left bound."""
+
+
 class DeviceCommandError(RuntimeError):
     """Keep RuntimeError catch behavior without retaining command or output text."""
 
@@ -67,6 +77,35 @@ def diagnostic_errno(error):
         return number if type(number) is int and number in errno.errorcode else None
     except Exception:
         return None
+
+
+def endpoint_identity(path):
+    """(st_dev, st_ino) of an existing endpoint, or None. Never follows a symlink."""
+    try:
+        information = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(information.st_mode):
+        return None
+    return (information.st_dev, information.st_ino)
+
+
+def socket_listener_live(path):
+    """True when the AF_UNIX endpoint at `path` is served or cannot be proven dead.
+
+    Only a refused connection or a missing path proves that no listener owns the
+    endpoint. Every other failure (EMFILE, EAGAIN, a timeout, EACCES) means
+    liveness cannot be excluded, so a caller must not unlink the path.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1)
+            probe.connect(str(path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return True
 
 
 def pending_write_observation(transport):
@@ -170,6 +209,10 @@ class DeviceProxy:
         self.hid_handles = None
         self.video = None
         self.video_opening = False
+        # True only after this instance pushed the fixed-path agent itself.
+        self.agent_staged = False
+        # The device admission held for this proxy's whole session; see start().
+        self.admission = None
         self.reconnect_requested = False
         self.connected_at = 0.0
         self.ready = False
@@ -211,6 +254,42 @@ class DeviceProxy:
             'shell',
             f'chmod 700 {self.remote_dir}/proxy; chmod 600 {self.remote_dir}/preload.so',
         )
+
+    def _stage_video_agent(self, deadline):
+        """Push the native agent to its fixed path; record that this instance owns it."""
+        for arguments in (
+            ('push', str(self.proxy_binary.with_name('d200-color-agent')), STAGED_AGENT),
+            ('shell', f'chmod 700 {STAGED_AGENT}'),
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('video agent staging timed out')
+            self._run(*arguments, timeout=remaining)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('video agent staging timed out')
+        with self.condition:
+            self.agent_staged = True
+
+    def _remove_staged_agent(self):
+        """Remove the fixed-path agent, after the proxy that could exec it is gone.
+
+        The stock zkgui proxy execs /tmp/d200-color-agent by fixed path, so it
+        survives a session unless the bridge that staged it removes it. The
+        per-session directory has its own cleanup; this is the one path that had
+        none, and only the instance that pushed it removes it.
+        """
+        with self.condition:
+            if not self.agent_staged:
+                return
+        try:
+            self._run('shell', f'rm -f {STAGED_AGENT}', timeout=5)
+        except (DeviceCommandError, OSError, subprocess.SubprocessError) as error:
+            print(f'bridge_agent_remove_failed path={STAGED_AGENT} error={type(error).__name__}',
+                  file=sys.stderr, flush=True)
+            return
+        with self.condition:
+            self.agent_staged = False
+        print(f'bridge_agent_removed path={STAGED_AGENT}', file=sys.stderr, flush=True)
 
     def _read_exact(self, stream, length, deadline=None):
         output = bytearray()
@@ -315,8 +394,22 @@ class DeviceProxy:
     def start(self):
         # Rejection must precede staging AND cleanup, which itself has device
         # effects. Recovery independently rejects already-running controllers.
-        with managed_device_admission():
+        # Held for the whole session, not only for startup: two bridges that
+        # serialize just their startup still both stage to, and drive, one deck.
+        self.admission = ExitStack()
+        try:
+            self.admission.enter_context(managed_device_admission())
             self._start_with_cleanup()
+        except BaseException:
+            self._release_admission()
+            raise
+
+    def _release_admission(self):
+        """Drop the deck admission. Idempotent: start()'s failure path and close()
+        both call it, and a second close must not hold the deck forever."""
+        admission, self.admission = self.admission, None
+        if admission is not None:
+            admission.close()
 
     def _start_with_cleanup(self):
         try:
@@ -402,16 +495,7 @@ class DeviceProxy:
                 raise TimeoutError('stock zkgui proxy readiness timed out')
         # Stock service startup can clear /tmp/d200-*; stage after it is ready,
         # before publishing the host bridge socket or accepting video OPEN.
-        for arguments in (
-            ('push', str(self.proxy_binary.with_name('d200-color-agent')), '/tmp/d200-color-agent'),
-            ('shell', 'chmod 700 /tmp/d200-color-agent'),
-        ):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('video agent staging timed out')
-            self._run(*arguments, timeout=remaining)
-        if time.monotonic() >= deadline:
-            raise TimeoutError('video agent staging timed out')
+        self._stage_video_agent(deadline)
         self.connected_at = time.monotonic()
         self.heartbeat = threading.Thread(
             target=self._heartbeat_loop, name='d200-proxy-heartbeat', daemon=True,
@@ -567,14 +651,7 @@ class DeviceProxy:
                 self.ready = True
                 self.connected_at = time.monotonic()
                 self.condition.notify_all()
-            for arguments in (
-                ('push', str(self.proxy_binary.with_name('d200-color-agent')), '/tmp/d200-color-agent'),
-                ('shell', 'chmod 700 /tmp/d200-color-agent'),
-            ):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError('video agent staging timed out')
-                self._run(*arguments, timeout=remaining)
+            self._stage_video_agent(deadline)
             if self.heartbeat is None or not self.heartbeat.is_alive():
                 self.heartbeat = threading.Thread(
                     target=self._heartbeat_loop, name='d200-proxy-heartbeat', daemon=True,
@@ -1062,6 +1139,9 @@ class DeviceProxy:
         with self.condition:
             if (self.closed and self.transport_socket is None and
                     self.process is None and self.forward_port is None):
+                # Already torn down (a second close, or a failed start that
+                # unwound): nothing device-side is left for this instance to own.
+                self._release_admission()
                 return
         try:
             if self.transport_socket is not None:
@@ -1112,9 +1192,13 @@ class DeviceProxy:
                 self.condition.notify_all()
             self.process = None
             self._remove_remote_dir()
+            self._remove_staged_agent()
             self.transport_socket = None
             self.reader_stream = None
             self.forward_port = None
+            # Last: the deck is released only once this instance has removed what
+            # it staged, so the next bridge cannot race the teardown.
+            self._release_admission()
 
 
 def video_response(request, code, *, epoch=None, **extra):
@@ -1864,9 +1948,26 @@ class BridgeServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
     def __init__(self, path, state):
         self.path = Path(path)
-        self.path.unlink(missing_ok=True)
         self.state = state
-        super().__init__(str(self.path), BridgeHandler)
+        # The exact endpoint this instance bound; None until bind() succeeds.
+        self.endpoint = None
+        if socket_listener_live(self.path):
+            raise BridgeSocketInUse(
+                f'{self.path} is served by another process or cannot be proven dead; leaving it bound')
+        try:
+            super().__init__(str(self.path), BridgeHandler)
+        except OSError:
+            # bind() failed. Only a path a second probe proves has no listener is
+            # reclaimed, and only here, immediately before rebinding it ourselves.
+            if socket_listener_live(self.path):
+                raise BridgeSocketInUse(
+                    f'{self.path} is served by another process or cannot be proven dead')
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            super().__init__(str(self.path), BridgeHandler)
+        self.endpoint = endpoint_identity(self.path)
         os.chmod(self.path, 0o600)
 
     def dispatch(self, request):
@@ -1931,7 +2032,15 @@ class BridgeServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
     def server_close(self):
         super().server_close()
-        self.path.unlink(missing_ok=True)
+        # Unlink exactly the endpoint this instance bound. A second instance that
+        # lost the bind race, or an endpoint another process has already replaced,
+        # must never be deleted on this instance's way out.
+        if self.endpoint is not None and endpoint_identity(self.path) == self.endpoint:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+        self.endpoint = None
 
 
 def main():
@@ -1942,6 +2051,10 @@ def main():
     parser.add_argument('--receipt', type=Path)
     parser.add_argument('--state-file', type=Path)
     arguments = parser.parse_args()
+    # Refuse before any device effect: a live bridge keeps its endpoint.
+    if socket_listener_live(arguments.socket):
+        print(f'bridge_socket_in_use path={arguments.socket}', file=sys.stderr, flush=True)
+        raise SystemExit(1)
     if os.environ.get('D200_BRIDGE_SUPERVISE') == '1':
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
@@ -1981,11 +2094,20 @@ def main():
             temporary = arguments.state_file.with_suffix('.tmp')
             temporary.write_text(json.dumps({'pid': os.getpid(), 'control': stop_endpoint.state()}))
             temporary.replace(arguments.state_file)
-        transport.start()
+        try:
+            transport.start()
+        except DeviceAdmissionError as error:
+            print(f'bridge_device_in_use error={error}', file=sys.stderr, flush=True)
+            raise SystemExit(1)
         if stopping.is_set():
             return
         state = BridgeState(transport)
-        server = BridgeServer(arguments.socket, state)
+        try:
+            server = BridgeServer(arguments.socket, state)
+        except BridgeSocketInUse as error:
+            print(f'bridge_socket_in_use path={arguments.socket} error={error}',
+                  file=sys.stderr, flush=True)
+            raise SystemExit(1)
         if stopping.is_set():
             return
 

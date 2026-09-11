@@ -6,6 +6,7 @@ import ast
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,20 +15,34 @@ PACKAGE = SRC / "ghostdeck"
 MARKER = "02C47" + "A"
 
 
-def _env():
+def _env(home):
     env = dict(os.environ)
     env["PYTHONPATH"] = str(SRC)
+    env["HOME"] = str(home)
     return env
 
 
 def _run(*args):
-    return subprocess.run(
-        [sys.executable, "-m", "ghostdeck.cli", *args],
-        cwd=str(ROOT),
-        env=_env(),
-        capture_output=True,
-        text=True,
-    )
+    # Never let a CLI invocation read or write the operator's real ~/.ghostdeck.
+    with tempfile.TemporaryDirectory(prefix="ghostdeck-home-") as home:
+        return subprocess.run(
+            [sys.executable, "-m", "ghostdeck.cli", *args],
+            cwd=str(ROOT),
+            env=_env(home),
+            capture_output=True,
+            text=True,
+        )
+
+
+def _run_script(path, *args):
+    with tempfile.TemporaryDirectory(prefix="ghostdeck-home-") as home:
+        return subprocess.run(
+            [sys.executable, str(path), *args],
+            cwd=str(ROOT),
+            env=_env(home),
+            capture_output=True,
+            text=True,
+        )
 
 
 def test_cli_help_parses():
@@ -36,13 +51,7 @@ def test_cli_help_parses():
     out = result.stdout + result.stderr
     for name in ("play", "stop", "quit", "status", "detect", "studio", "build"):
         assert name in out
-    script = subprocess.run(
-        [sys.executable, str(PACKAGE / "cli.py"), "-h"],
-        cwd=str(ROOT),
-        env=_env(),
-        capture_output=True,
-        text=True,
-    )
+    script = _run_script(PACKAGE / "cli.py", "-h")
     assert script.returncode == 0, script.stderr
     for name in ("play", "stop", "quit", "status", "detect", "studio", "build"):
         assert name in script.stdout + script.stderr
@@ -57,11 +66,12 @@ def test_detect_source_has_no_hardcoded_serial():
 
 def test_public_tree_has_no_lab_identity():
     skip = {".pyc", ".png"}
+    skip_dirs = {".git", ".gjc", ".venv", "__pycache__", ".pytest_cache"}
     home = "/Users/" + "mose"
     for path in ROOT.rglob("*"):
         if not path.is_file() or path.suffix in skip:
             continue
-        if "__pycache__" in path.parts or ".pytest_cache" in path.parts:
+        if any(part in skip_dirs or part.endswith(".egg-info") for part in path.parts):
             continue
         if path.name == "test_ghostdeck_offline.py":
             continue
