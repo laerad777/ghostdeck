@@ -386,7 +386,13 @@ static int video_control(struct state *s, const struct packet *p)
         errno = saved_errno;
     }
     uint8_t reply[72] = {0};
-    uint32_t result = 0, epoch = p->kind == D200_VS_VIDEO_OPEN_REQUEST ? 0 : d200_vs_get_u32(p->data + 24);
+    /* The reply epoch is a validated value, not a copy of the request: the only
+     * request kinds that carry an epoch only validate when payload byte 24 is 1
+     * (d200_vs_validate_control_payload, odd kinds), and the OPEN result derives
+     * its epoch from the result code. Reading the raw byte here would echo a
+     * malformed request back into the INVALID_PARAMETERS reply, which the
+     * receiver's own validator rejects (kind 24/26 require +28 == 1). */
+    uint32_t result = 0, epoch = p->kind == D200_VS_VIDEO_OPEN_REQUEST ? 0 : 1;
     uint32_t length = d200_vs_control_length(p->kind + 1);
     if (p->kind == D200_VS_VIDEO_OPEN_REQUEST && p->data[28] != D200_VS_VERSION) result = D200_VS_UNSUPPORTED_VERSION;
     else if (!d200_vs_validate_control_payload(p->kind, p->data, p->length)) result = D200_VS_INVALID_PARAMETERS;

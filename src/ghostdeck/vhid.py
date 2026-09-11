@@ -351,21 +351,31 @@ def serve() -> None:
 
 
 def _write_vhid(pid, *, visible: bool, iohid: bool = False, status: str) -> dict:
-    data = gdstate.load()
-    data["vhid_pid"] = pid
-    data["vhid_experimental"] = True
-    data["vhid_iohid"] = iohid
-    data["vhid_visible"] = visible
-    data["vhid_vid"] = HID_VID
-    data["vhid_pid_usb"] = HID_PID
-    data["vhid"] = {
-        "pid": pid,
-        "experimental": True,
-        "iohid": iohid,
-        "visible": visible,
-        "status": status,
-    }
-    gdstate.save(data)
+    """Record the keeper as a single locked read-modify-write (A-104).
+
+    This used to be `data = gdstate.load()` ... `gdstate.save(data)`. Both of those take the lock
+    themselves, but the *load* ran outside it, so two writers could both read the same document,
+    both mutate, and the later save silently discard the other's update -- e.g. `play.start_play`
+    recording `play_pid` in the same instant this records the keeper, leaving a keeper with no
+    `play_pid` (or vice versa). `state.update()` holds the lock across the whole sequence, so the
+    read that this decision is based on cannot be stale.
+
+    `update()` merges the `vhid` section, so the docstring's promise that both spellings agree is
+    kept by the A-107 reconciliation inside `state.update()`: the nested record is authoritative for
+    `pid`/`experimental`/`iohid`/`visible`, and the two ids that have no nested counterpart
+    (`vhid_vid`, `vhid_pid_usb`) are passed as flat keys.
+    """
+    gdstate.update(
+        vhid={
+            "pid": pid,
+            "experimental": True,
+            "iohid": iohid,
+            "visible": visible,
+            "status": status,
+        },
+        vhid_vid=HID_VID,
+        vhid_pid_usb=HID_PID,
+    )
     if status == "up" and pid is not None:
         _record_identity(pid)
     else:

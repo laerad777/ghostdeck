@@ -23,8 +23,11 @@ _ADB_TIMEOUT = 30.0
 # a successful start (A-103). The window is a grace period, not a health check: it is long enough to
 # catch an interpreter that starts and exits, and short enough to stay invisible to the user.
 _PLAY_GRACE = 1.0
-# `adb devices -l` identifies the deck in its product/model/device fields (A-137), matched as whole
-# fields so `model:D200X` cannot be mistaken for the deck.
+# `adb devices -l` identifies some builds of the deck in their product/model/device fields (A-137),
+# matched as whole fields so `model:D200X` cannot be mistaken for the deck. This is an ADDITIONAL
+# accepted path only: the attached deck emits none of these fields (T15 - its line is
+# `<serial>      device usb:18092032X transport_id:4`), so the primary signal is the USB
+# layer's VID/PID-matched verdict in `_deck_serial()`.
 _DECK_FIELDS = ("product:d200", "model:D200", "device:d200")
 
 
@@ -57,18 +60,11 @@ def _validate_source(source: str) -> None:
         raise RuntimeError(f"source is not a file and is not a URL: {source}")
 
 
-def _deck_serial() -> str | None:
-    """The serial of a device that identifies itself as the D200, or None (A-137).
+def _adb_devices() -> list[tuple[str, list[str]]]:
+    """Every device `adb devices -l` lists, as ``(serial, remaining fields)``, in adb's order.
 
-    `adb.serial_from_devices()` returns the FIRST device line, so with a phone also plugged in the
-    mutating cleanup commands went to the phone - `stop` even exited 0 - and the deck was never
-    restored. The target is chosen by the deck's own product/model/device fields instead of by
-    position. Returning None makes the caller refuse and name the deck as absent: an unidentified
-    device is never sent a firmware-adjacent command.
-
-    The serial's shape is left to `adb.run`'s own validation, which already gates every call: a
-    malformed serial raises there and nothing reaches the deck either way, so the rule is not
-    restated here.
+    The per-line fields are kept because the line's shape is firmware-dependent: the attached deck
+    emits only ``usb:<...> transport_id:<n>`` (T15), while other builds report product/model/device.
     """
     try:
         result = adb.run(["devices", "-l"], capture_output=True, text=True, timeout=_ADB_TIMEOUT)
@@ -76,12 +72,65 @@ def _deck_serial() -> str | None:
         raise RuntimeError(
             f"adb timed out after {_ADB_TIMEOUT:g}s: devices -l (is the adb server wedged?)"
         ) from None
+    except OSError as error:
+        raise RuntimeError(f"adb could not be run: {error}") from None
+    devices = []
     for line in (result.stdout or "").splitlines():
         fields = line.split()
-        if not fields or line.startswith("List"):
+        # `serial  device  <fields...>`; a header or a non-device state is not a candidate.
+        if len(fields) < 2 or fields[1] != "device":
             continue
+        devices.append((fields[0], fields[1:]))
+    return devices
+
+
+def _deck_serial() -> str | None:
+    """The serial of the attached D200, or None when nothing positively identifies it.
+
+    The deck is identified by what it reports about *itself*, never by its position in the device
+    list - positional selection was A-137, where the cleanup went to a phone and still exited 0.
+
+    Accepted signals, and why each is safe when a phone is attached alongside the deck:
+
+    1. **The USB layer's verdict.** `usb.detect()` matches the deck on its USB identity
+       (VID/PID 2207:0019 HID or 18d1:d002 ADB), so an unrelated device cannot produce it. The serial
+       must also appear in `adb devices`, because a serial the server does not know cannot be
+       addressed with `adb -s`. This is the signal that works on the real deck.
+    2. **The deck's own `-l` identity fields**, for firmware that reports them. The attached deck does
+       NOT: its line is `<serial>      device usb:18092032X transport_id:4` (T15). So this
+       can only ever be an *additional* accepted path, never the only one - treating it as the only
+       one is what broke `stop` on hardware while 465 green tests used fixtures that fabricated the
+       fields the deck never emits.
+    3. Nothing else. When neither signal fires this returns None and the caller refuses, because
+       sending a firmware-adjacent command to an unidentified device is worse than not restoring the
+       deck.
+
+    A momentarily empty `adb devices` while the USB layer reports the deck in ADB is the H3
+    stale-server case, observed repeatedly on this host, so it gets one bounded server restart before
+    refusing rather than an immediate failure.
+    """
+    devices = _adb_devices()
+    try:
+        found = usb.detect()
+    except Exception:  # a USB backend that cannot answer is simply no verdict
+        found = None
+    deck_serial = found.get("serial") if found and found.get("mode") == "adb" else None
+    if deck_serial:
+        if any(serial == deck_serial for serial, _ in devices):
+            return str(deck_serial)
+        # H3: the USB layer has the deck in ADB but the host server has no transport for it. Exactly
+        # one restart, never a loop; a restart that cannot run is no help rather than a fatal error.
+        try:
+            adb.restart_server()
+        except RuntimeError as error:
+            print(f"adb server restart unavailable: {error}", file=sys.stderr)
+        else:
+            devices = _adb_devices()
+            if any(serial == deck_serial for serial, _ in devices):
+                return str(deck_serial)
+    for serial, fields in devices:
         if any(field in _DECK_FIELDS for field in fields):
-            return fields[0]
+            return serial
     return None
 
 

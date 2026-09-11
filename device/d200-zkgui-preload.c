@@ -148,13 +148,32 @@ static int framebuffer_handle_valid(int fd)
            ioctl(fd, FB_GET_COLOR_KEY, &probe) == 0;
 }
 
+/* Restore the saved key through a handle opened after the original number was
+ * released: the application may hold that number now, so it is never probed,
+ * written through or closed again. The fresh handle is ours by construction
+ * and is closed here. Caller holds framebuffer_lock and has already latched
+ * the teardown latch; the black-out obligation never survives the call. */
+static void restore_color_key_through_fresh_handle(void)
+{
+    int control_fd;
+    if (real_open_fn == NULL || real_close_fn == NULL) return;
+    control_fd = real_open_fn("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (control_fd < 0) return;
+    if (framebuffer_handle_valid(control_fd) &&
+        ioctl(control_fd, FB_SET_COLOR_KEY, &original_color_key) == 0)
+        framebuffer_configured = 0;
+    (void)real_close_fn(control_fd);
+}
+
 /* The application may close a number that is, or was, our private handle:
  * directly, via a recycled descriptor, or by dup2() overwriting it without
  * calling close() at all. Relinquish ownership under the same lock the rest of
  * the state uses, so teardown never ioctls or closes a descriptor we no longer
- * own. Teardown is latched because the saved key is only valid while the
- * original black-out is live; re-acquiring later would probe a screen that is
- * still forced black and overwrite the true original. */
+ * own. The saved key is only valid while the original black-out is live, so
+ * the obligation is discharged here, through a fresh handle, before teardown
+ * latches: re-acquiring later would probe a screen that is still forced black
+ * and overwrite the true original, while dropping it here would strand the
+ * black-out on the panel for the rest of the process. */
 static void release_framebuffer_fd(int fd)
 {
     int cancel_state;
@@ -163,8 +182,10 @@ static void release_framebuffer_fd(int fd)
     pthread_mutex_lock(&framebuffer_lock);
     if (fd == framebuffer_fd) {
         framebuffer_fd = -1;
-        framebuffer_configured = 0;
         framebuffer_teardown = 1;
+        if (framebuffer_configured)
+            restore_color_key_through_fresh_handle();
+        framebuffer_configured = 0;
     }
     pthread_mutex_unlock(&framebuffer_lock);
     (void)pthread_setcancelstate(cancel_state, NULL);
@@ -202,16 +223,8 @@ static void restore_framebuffer(void)
          * The reopen failure and the leftover unvalidated number are bounded:
          * teardown runs once, and the obligation never survives it. */
         framebuffer_fd = -1;
-        if (framebuffer_configured && real_open_fn != NULL &&
-            real_close_fn != NULL) {
-            int control_fd = real_open_fn("/dev/fb0", O_RDWR | O_CLOEXEC);
-            if (control_fd >= 0) {
-                if (framebuffer_handle_valid(control_fd) &&
-                    ioctl(control_fd, FB_SET_COLOR_KEY, &original_color_key) == 0)
-                    framebuffer_configured = 0;
-                (void)real_close_fn(control_fd);
-            }
-        }
+        if (framebuffer_configured)
+            restore_color_key_through_fresh_handle();
         framebuffer_configured = 0;
     }
     pthread_mutex_unlock(&framebuffer_lock);

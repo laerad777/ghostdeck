@@ -23,9 +23,14 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 SERIAL = "ABC123XYZ"
+# The deck line shape, captured from the ATTACHED HARDWARE in FIX-1-T15. It carries only
+# `usb:<...> transport_id:<n>` and NO product/model/device fields. Do not add them: fixtures that
+# fabricated those fields were written to satisfy `_deck_serial()`'s old filter, which is exactly how
+# 465 green tests certified a `stop` that could not work on the real deck. Deck identity now comes
+# from the USB layer (stubbed per test below), so the shape here must stay the real one.
 DEVICE_LINE = (
     "List of devices attached\n"
-    f"{SERIAL}\tdevice product:d200 model:D200 device:d200 transport_id:1\n"
+    f"{SERIAL}      device usb:18092032X transport_id:4\n"
 )
 DEVICES_ARGV = "devices -l"
 # The restore pair. A bare `ctl.start` on an already-running service is a no-op that never
@@ -111,12 +116,18 @@ def _cli(
     sidecar: dict | str | None = None,
     system_path: str = "/usr/bin:/bin",
     tz: str | None = None,
+    deck_serial: str | None = SERIAL,
 ) -> tuple[subprocess.CompletedProcess, list[str], Path]:
-    """Run the CLI with a temp HOME and an explicit PATH.
+    """Run the CLI with a temp HOME, an explicit PATH, and a stubbed USB layer.
 
     PATH is always REPLACED (never appended to the operator PATH): a real deck is attached to this
     host, so the real `adb` must be unreachable from every test. `system_path` keeps the OS tools
     such as `ps` available unless a test deliberately removes them.
+
+    `deck_serial` is what `usb.detect()` reports — the deck's primary identity signal since FIX-1-T15.
+    It is STUBBED rather than left to the host, because otherwise every one of these tests would
+    depend on whether this machine happens to have a D200 attached and a pyusb to see it. Pass None
+    to model an environment where the USB layer has no verdict (no deck, or no backend).
     """
     bin_dir = tmp_path / "bin"
     home = tmp_path / "home"
@@ -130,12 +141,27 @@ def _cli(
     adb_path = bin_dir / "adb"
     adb_path.write_text(fake_adb, encoding="utf-8")
     adb_path.chmod(0o755)
+    # The USB layer is stubbed in the CHILD, via a sitecustomize on PYTHONPATH, because these tests
+    # assert real exit codes and therefore need a real subprocess.
+    verdict = (
+        {"serial": deck_serial, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"}
+        if deck_serial
+        else {"serial": None, "vid": None, "pid": None, "mode": "none"}
+    )
+    shim = tmp_path / "shim"
+    shim.mkdir(exist_ok=True)
+    (shim / "sitecustomize.py").write_text(
+        "# Test-only stub of the USB layer (FIX-1-T15).\n"
+        "import ghostdeck.usb as _usb\n"
+        f"_usb.detect = lambda: {verdict!r}\n",
+        encoding="utf-8",
+    )
     log = tmp_path / "adb.log"
     env = dict(os.environ)
     env.update(
         PATH=f"{bin_dir}{os.pathsep}{system_path}",
         HOME=str(home),
-        PYTHONPATH=str(SRC),
+        PYTHONPATH=f"{shim}{os.pathsep}{SRC}",
         FAKE_ADB_LOG=str(log),
     )
     if tz is not None:
@@ -185,7 +211,7 @@ def test_stop_reports_failing_adb_and_exits_nonzero(tmp_path):
 
 
 def test_stop_without_device_exits_nonzero(tmp_path):
-    result, calls, _ = _cli(NO_DEVICE_ADB, tmp_path)
+    result, calls, _ = _cli(NO_DEVICE_ADB, tmp_path, deck_serial=None)
     assert result.returncode != 0, result.stdout
     assert "no ADB device" in result.stderr
     # Discovery ran; nothing else may be attempted without a serial.
@@ -194,7 +220,7 @@ def test_stop_without_device_exits_nonzero(tmp_path):
 
 def test_stop_with_silent_fake_adb_exits_nonzero(tmp_path):
     """The master's third acceptance string prints no device line, so it is the no-device path."""
-    result, calls, _ = _cli(SILENT_ADB, tmp_path)
+    result, calls, _ = _cli(SILENT_ADB, tmp_path, deck_serial=None)
     assert result.returncode != 0, result.stdout
     assert "no ADB device" in result.stderr
     assert calls == [DEVICES_ARGV]
@@ -357,13 +383,10 @@ def test_status_reports_playing_no_for_a_recycled_pid(tmp_path):
         # `status` is a read-only command that never touches the device.
         assert "playing=no" in result.stdout, result.stdout
         assert len(calls) == 0, f"status contacted the device through adb: {calls}"
-        # The exit code follows the environment, not the CLI's own text (A-102): 2 when this
-        # interpreter has no usable backend, otherwise 0. Pinning it to 0 would make the suite depend
-        # on the ambient interpreter; deriving it from the CLI's output would be vacuous.
-        from ghostdeck import usb
-
-        expected = 2 if usb.missing_dependency() else 0
-        assert result.returncode == expected, (result.returncode, expected, result.stderr)
+        # The exit code follows the reason (A-102). It is 0 here because `_cli` stubs the USB layer
+        # with a positive deck verdict, so this child is never on the missing-backend path - the
+        # expectation must track the CHILD's environment, not the pytest interpreter's.
+        assert result.returncode == 0, (result.returncode, result.stderr)
     finally:
         victim.kill()
         victim.wait()
@@ -624,7 +647,9 @@ def test_stop_does_not_signal_recycled_pid_even_when_no_device(tmp_path):
     victim = _victim()
     try:
         time.sleep(0.2)
-        result, calls, _ = _cli(NO_DEVICE_ADB, tmp_path, "stop", pre_state={"play_pid": victim.pid})
+        result, calls, _ = _cli(
+            NO_DEVICE_ADB, tmp_path, "stop", pre_state={"play_pid": victim.pid}, deck_serial=None
+        )
         assert result.returncode != 0, result.stdout
         assert "cannot verify" in result.stderr
         assert "no ADB device" in result.stderr, result.stderr
@@ -797,6 +822,11 @@ def test_cleanup_device_times_out_on_a_wedged_adb_server(tmp_path, monkeypatch):
     bin_dir = _wedged_adb(tmp_path)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin:/bin")
     monkeypatch.setattr(play, "_ADB_TIMEOUT", 3.0)
+    # In-process, so the USB layer is patched in place: the deck must be identified before the
+    # wedged `shell` call is reached, or the refusal would pre-empt the timeout under test.
+    monkeypatch.setattr(
+        play.usb, "detect", lambda: {"serial": SERIAL, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"}
+    )
 
     start = time.monotonic()
     with pytest.raises(RuntimeError) as excinfo:
@@ -820,6 +850,9 @@ def test_cleanup_device_tolerates_a_listing_that_times_out(tmp_path, monkeypatch
     bin_dir = _wedged_adb(tmp_path, hang_listing=True)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}/usr/bin:/bin")
     monkeypatch.setattr(play, "_ADB_TIMEOUT", 3.0)
+    monkeypatch.setattr(
+        play.usb, "detect", lambda: {"serial": SERIAL, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"}
+    )
 
     start = time.monotonic()
     play._cleanup_device()  # must not raise
@@ -830,24 +863,144 @@ def test_cleanup_device_tolerates_a_listing_that_times_out(tmp_path, monkeypatch
 # --- A-137: the cleanup must target the deck, not the first device listed ------
 
 
-# A phone listed BEFORE the deck. `serial_from_devices()` returned the first match, which is how
-# every mutating cleanup command went to the phone while `stop` exited 0.
+# A phone listed BEFORE the deck, and both lines field-less (the real shape from T15). Position alone
+# must not decide: the deck is chosen because the USB layer names its serial, not because it is
+# second, and `serial_from_devices()` returning the first match is how every mutating cleanup command
+# went to the phone while `stop` exited 0.
 TWO_DEVICE_ADB = _adb(f"""case "$1" in
-  devices) printf 'List of devices attached\\nPHONE123\\tdevice product:shiba model:Pixel_8 device:shiba transport_id:1\\n{SERIAL}\\tdevice product:d200 model:D200 device:d200 transport_id:2\\n'; exit 0 ;;
+  devices) printf 'List of devices attached\\nPHONE123      device usb:10000001X transport_id:1\\n{SERIAL}      device usb:18092032X transport_id:4\\n'; exit 0 ;;
 esac
 exit 0
 """)
 
-# Only a phone: no attached device identifies as the deck, so the command must refuse.
+# Only a phone, and the USB layer has no verdict either: nothing identifies the deck, so `stop` must
+# refuse rather than grab the one device that happens to be attached. `deck_serial=None` models that
+# environment explicitly (see `_cli`); a deck-verdict-without-a-matching-adb-entry is the separate H3
+# case, pinned by its own test below.
 PHONE_ONLY_ADB = _adb("""case "$1" in
-  devices) printf 'List of devices attached\\nPHONE123\\tdevice product:shiba model:Pixel_8 device:shiba transport_id:1\\n'; exit 0 ;;
+  devices) printf 'List of devices attached\\nPHONE123      device usb:10000001X transport_id:1\\n'; exit 0 ;;
 esac
 exit 0
 """)
+
+
+# --- FIX-1-T15: the real deck line, and what identifies it --------------------
+
+
+def test_deck_line_without_product_fields_still_resolves(tmp_path):
+    """H1/T15 regression pin: the attached deck emits NO product/model fields.
+
+    Its verbatim shape is `<serial>      device usb:18092032X transport_id:4` (serial redacted: this\n    file is in the public tree and must not carry the lab's identity). `stop` refuses
+    when it cannot identify the deck, so a filter that needs those fields broke `stop` on real
+    hardware while the whole suite stayed green on fixtures that invented them. The assertion below
+    is on the fixture itself: if someone reintroduces the fabricated fields, this fails first.
+    """
+    assert "product:" not in DEVICE_LINE and "model:" not in DEVICE_LINE
+    assert "transport_id:4" in DEVICE_LINE  # the real line's only identifying content
+
+    # And the deck is still identified: by the USB layer's verdict, which matched VID/PID.
+    result, calls, _ = _cli(HAPPY_ADB, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert calls == STOP_ARGV, calls
+    assert any(SERIAL in call for call in calls), calls
+
+
+def test_deck_is_identified_by_the_usb_layer_not_by_adb_fields(tmp_path):
+    """Both accepted signals, and the refusal when neither fires.
+
+    With the USB verdict present the field-less line resolves; with the same field-less line but no
+    USB verdict there is nothing to identify the deck, so `stop` must refuse and touch no device.
+    """
+    identified, calls, _ = _cli(HAPPY_ADB, tmp_path / "a", deck_serial=SERIAL)
+    assert identified.returncode == 0, identified.stderr
+    assert calls == STOP_ARGV, calls
+
+    unidentified, calls, _ = _cli(HAPPY_ADB, tmp_path / "b", deck_serial=None)
+    assert unidentified.returncode != 0, unidentified.stdout
+    assert "no ADB device" in unidentified.stderr, unidentified.stderr
+    assert calls == [DEVICES_ARGV], f"nothing may be sent without a positive identification: {calls}"
+
+
+def test_adb_l_identity_fields_are_still_an_accepted_path(tmp_path):
+    """Some builds DO report the fields, so that stays an accepted signal (T15 requirement 2)."""
+    fields_adb = _adb(f"""case "$1" in
+  devices) printf 'List of devices attached\\n{SERIAL}      device product:d200 model:D200 device:d200 transport_id:4\\n'; exit 0 ;;
+esac
+exit 0
+""")
+    result, calls, _ = _cli(fields_adb, tmp_path, deck_serial=None)
+    assert result.returncode == 0, result.stderr
+    assert calls == STOP_ARGV, calls
+
+
+def test_a_stale_adb_server_gets_one_bounded_restart(tmp_path):
+    """H3/T15: USB says ADB while `adb devices` is empty gets ONE server restart, then a refusal.
+
+    The restart is the same recovery `studio._ensure_bridge()` already performs; without it `stop`
+    concluded "no ADB device reachable" the instant the server had not caught up, which the master
+    observed repeatedly on this host. Bounded to one restart: the fake treats every re-list as empty,
+    and only a single kill/start pair may appear.
+    """
+    empty_listing = _adb("""case "$1" in
+  devices) printf 'List of devices attached\\n'; exit 0 ;;
+esac
+exit 0
+""")
+    result, calls, _ = _cli(empty_listing, tmp_path, deck_serial=SERIAL)
+    assert result.returncode != 0, result.stdout
+    assert "no ADB device" in result.stderr, result.stderr
+    assert calls.count("kill-server") == 1, f"exactly one restart, not a loop: {calls}"
+    assert calls.count("start-server") == 1, calls
+    assert calls.count(DEVICES_ARGV) == 2, f"one initial list, one re-check: {calls}"
+    assert not any("shell" in call for call in calls), f"nothing reached a device: {calls}"
+
+
+def test_a_failed_server_restart_does_not_prevent_the_refusal(tmp_path):
+    """A restart that cannot run is no help, not a fatal error (the master's transient 255 note)."""
+    restart_fails = _adb("""case "$1" in
+  devices) printf 'List of devices attached\\n'; exit 0 ;;
+  start-server) echo "error: cannot connect to daemon" >&2; exit 255 ;;
+esac
+exit 0
+""")
+    result, calls, _ = _cli(restart_fails, tmp_path, deck_serial=SERIAL)
+    assert result.returncode != 0, result.stdout
+    assert "no ADB device" in result.stderr, result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
+
+
+def test_the_restart_recovers_a_server_that_then_sees_the_deck(tmp_path):
+    """The point of the H3 recovery: `stop` works even when the server catches up only on retry.
+
+    The fake lists nothing until `start-server` has run, which is the stale-server shape the master
+    observed. Without the bounded restart `stop` refuses and leaves the deck in ADB; with it, the
+    deck is restored and every mutating call reaches it.
+    """
+    state_file = tmp_path / "server-caught-up"
+    flaky_adb = _adb(f"""case "$1" in
+  devices) if [ -f "{state_file}" ]; then printf 'List of devices attached\\n{SERIAL}      device usb:18092032X transport_id:4\\n'; else printf 'List of devices attached\\n'; fi; exit 0 ;;
+  start-server) : > "{state_file}"; exit 0 ;;
+esac
+echo "cleanup ok"
+exit 0
+""")
+    result, calls, _ = _cli(flaky_adb, tmp_path, deck_serial=SERIAL)
+
+    assert result.returncode == 0, result.stderr
+    assert calls.count("kill-server") == 1 and calls.count("start-server") == 1, calls
+    # After the restart the deck is identified, so the whole cleanup runs against it.
+    assert calls[-1] == LISTING_ARGV, calls
+    for argv in (CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV):
+        assert argv in calls, f"{argv} never ran, so the deck was not restored: {calls}"
 
 
 def test_stop_targets_the_deck_when_a_phone_is_listed_first(tmp_path):
-    """A-137: the deck is chosen by its own identity fields, not by its position in `devices -l`."""
+    """A-137: the deck is chosen by identity, never by its position in `devices -l`.
+
+    Here BOTH lines are field-less, so only the USB layer distinguishes them: it names the deck's
+    serial, which is nowhere near the phone's. Every mutating call must go to the deck and none to
+    the phone.
+    """
     result, calls, _ = _cli(TWO_DEVICE_ADB, tmp_path)
     assert result.returncode == 0, result.stderr
     assert calls == STOP_ARGV, calls
@@ -856,7 +1009,7 @@ def test_stop_targets_the_deck_when_a_phone_is_listed_first(tmp_path):
 
 def test_stop_refuses_when_no_attached_device_is_the_deck(tmp_path):
     """With only a phone attached the deck is absent, and the command must say so rather than guess."""
-    result, calls, _ = _cli(PHONE_ONLY_ADB, tmp_path)
+    result, calls, _ = _cli(PHONE_ONLY_ADB, tmp_path, deck_serial=None)
     assert result.returncode != 0, result.stdout
     assert "no ADB device" in result.stderr, result.stderr
     assert "D200" in result.stderr, result.stderr  # names the deck as the missing device
@@ -884,6 +1037,7 @@ def test_stop_keeps_the_player_record_when_the_deck_step_fails(tmp_path):
             "stop",
             pre_state={"play_pid": ours.pid},
             sidecar=recorded,
+            deck_serial=None,
         )
         assert result.returncode != 0, result.stdout
         assert "no ADB device" in result.stderr, result.stderr

@@ -13,10 +13,13 @@ host is never enumerated -- `vhid.status()` reaches it on the `ghostdeck status`
 
 from __future__ import annotations
 
+import fcntl
 import json
+import multiprocessing as mp
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -25,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
+from ghostdeck import HID_PID, HID_VID
 from ghostdeck import state, usb, vhid
 
 
@@ -331,6 +335,130 @@ def test_the_recorded_identity_rejects_a_junk_sidecar(home):
         vhid._identity_path().parent.mkdir(parents=True, exist_ok=True)
         vhid._identity_path().write_text(payload)
         assert vhid._load_identity() is None
+
+
+def _state_lock_is_held() -> bool:
+    """True when this process already holds the state lock.
+
+    `flock` treats two descriptors for the same file as independent, so a second descriptor that is
+    *denied* proves the first is still held. That makes "was the read inside the lock?" a
+    deterministic question instead of a timing one.
+    """
+    state.ensure_dirs()
+    fd = os.open(state.HOME / state.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_write_vhid_reads_and_writes_inside_the_state_lock(home, monkeypatch):
+    """A-104, deterministically: the load must happen under the same lock as the write.
+
+    `save()` takes the lock, but `_write_vhid` used to call `load()` *before* it, so two writers
+    could both read, both mutate, and the later save discard the other's update. Asserting on a
+    concurrent race would be a timing test that passes on both revisions (with a constant victim
+    value, every stale snapshot already contains the committed value), so the invariant is asserted
+    directly instead: at the moment `_write_vhid` reads the document it must already hold the lock.
+    """
+    waits = []
+    real_load = state.load
+
+    def recording_load():
+        waits.append(_state_lock_is_held())
+        return real_load()
+
+    monkeypatch.setattr(state, "load", recording_load)
+    vhid._write_vhid(4242, visible=False, iohid=False, status="up")
+    assert waits, "_write_vhid did not read the state document at all"
+    assert all(waits), f"a state read ran outside the lock: {waits}"
+
+
+def test_write_vhid_does_not_discard_a_concurrent_writers_update(home, monkeypatch):
+    """A-104, on the real failure: another writer's whole update is lost.
+
+    A second writer commits `play_pid` in the window between `_write_vhid`'s read and its write.
+    Under the fix that window cannot exist (the read holds the lock), so both updates survive; with
+    the read outside the lock the stale snapshot clobbers `play_pid` back to None.
+    """
+    real_load = state.load
+    started: list = []
+
+    def load_then_race():
+        snapshot = real_load()
+        if not started:
+            # Marked before the worker starts, so the worker's own `load()` is inert.
+            started.append(True)
+            thread = threading.Thread(target=lambda: state.update(play_pid=9999), daemon=True)
+            started.append(thread)
+            thread.start()
+            # Give the other writer every chance to commit while we are "between" read and write.
+            thread.join(timeout=0.75)
+        return snapshot
+
+    monkeypatch.setattr(state, "load", load_then_race)
+    vhid._write_vhid(4242, visible=False, iohid=False, status="up")
+    worker = started[1]
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "the other writer never completed"
+
+    data = state.load()
+    assert data["play_pid"] == 9999, "a concurrent writer's update was silently discarded"
+    assert data["play"]["pid"] == 9999
+    # ...and the vhid write itself survived the other direction.
+    assert data["vhid"]["pid"] == data["vhid_pid"] == 4242
+
+
+def test_concurrent_vhid_writers_agree_and_never_tear(home):
+    """Two processes writing the record at once: the spellings agree and the JSON is never torn."""
+    from ghostdeck import vhid as vhid_mod
+
+    def writer(pid):
+        for _ in range(30):
+            vhid_mod._write_vhid(pid, visible=False, iohid=False, status="up")
+
+    ctx = mp.get_context("fork")
+    procs = [ctx.Process(target=writer, args=(701,)), ctx.Process(target=writer, args=(702,))]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=60)
+    assert [proc.exitcode for proc in procs] == [0, 0]
+
+    data = state.load()
+    assert data["vhid"]["pid"] in (701, 702)
+    assert data["vhid"]["pid"] == data["vhid_pid"], "the two spellings disagree"
+    assert data["vhid"]["status"] == "up"
+    assert data["vhid"]["iohid"] is False and data["vhid_iohid"] is False
+    assert data["vhid"]["visible"] is False and data["vhid_visible"] is False
+    assert data["vhid_vid"] == HID_VID
+    assert data["vhid_pid_usb"] == HID_PID
+    # Never mid-write: whatever is on disk is a whole document.
+    json.loads(vhid_mod._identity_path().parent.joinpath("state.json").read_text())
+
+
+def test_write_vhid_keeps_the_flat_ids_it_owns(home):
+    """`vhid_vid`/`vhid_pid_usb` have no nested counterpart, so they must still be written (A-104)."""
+    vhid._write_vhid(4242, visible=True, iohid=True, status="up")
+    data = state.load()
+    assert data["vhid_vid"] == HID_VID
+    assert data["vhid_pid_usb"] == HID_PID
+    assert data["vhid"]["visible"] is True and data["vhid_visible"] is True
+    assert data["vhid"]["iohid"] is True and data["vhid_iohid"] is True
+
+
+def test_write_vhid_does_not_disturb_another_section(home):
+    """A merge, not a clobber: the play section is not part of the vhid write."""
+    state.save({"play_pid": 4242, "play": {"pid": 4242}})
+    vhid._write_vhid(5150, visible=False, iohid=False, status="up")
+    data = state.load()
+    assert data["play_pid"] == 4242 and data["play"]["pid"] == 4242
+    assert data["vhid"]["pid"] == 5150
 
 
 def test_is_up_agrees_with_status(home):

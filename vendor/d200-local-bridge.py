@@ -2243,26 +2243,12 @@ def main():
     parser.add_argument('--socket', type=Path, default=DEFAULT_SOCKET)
     parser.add_argument('--serial', default=os.environ.get('D200_ADB_SERIAL', ADB_SERIAL))
     parser.add_argument('--adb', default=os.environ.get('ADB', 'adb'))
-    parser.add_argument('--receipt', type=Path)
     parser.add_argument('--state-file', type=Path)
     arguments = parser.parse_args()
     # Refuse before any device effect: a live bridge keeps its endpoint.
     if socket_listener_live(arguments.socket):
         print(f'bridge_socket_in_use path={arguments.socket}', file=sys.stderr, flush=True)
         raise SystemExit(1)
-    if os.environ.get('D200_BRIDGE_SUPERVISE') == '1':
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-        child_env = dict(os.environ, D200_BRIDGE_SUPERVISE='0')
-        while True:
-            child = subprocess.Popen(
-                [sys.executable, '-B', '-u', str(Path(__file__).resolve()), *sys.argv[1:]],
-                env=child_env, start_new_session=True,
-            )
-            print(f'bridge_supervisor child={child.pid}', file=sys.stderr, flush=True)
-            status = child.wait()
-            print(f'bridge_supervisor child_exit={status}', file=sys.stderr, flush=True)
-            time.sleep(0.5)
     root = Path(__file__).resolve().parent
     transport = DeviceProxy(
         arguments.adb, arguments.serial,

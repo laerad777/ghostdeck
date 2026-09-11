@@ -69,9 +69,19 @@ def test_start_play_raises_when_the_player_dies_on_startup(tmp_path, monkeypatch
 
 
 def test_start_play_records_a_player_that_stays_up(tmp_path, monkeypatch, deck_home):
-    """The other direction: a player that survives the grace window is still recorded as before."""
+    """The other direction: a player that survives the grace window is still recorded as before.
+
+    A-104 canary: `state.save` is poisoned for the whole call, so a revert to the old
+    `load()`-then-`save()` record path fails here immediately rather than only under a race.
+    """
     from ghostdeck import play, state
 
+    def forbidden(data):
+        raise AssertionError(
+            "start_play wrote state with a whole-dict save(); that read is outside the lock (A-104)"
+        )
+
+    monkeypatch.setattr(play.gdstate, "save", forbidden)
     monkeypatch.setattr(
         play, "VENDOR_PLAY", _player(tmp_path, "import time\ntime.sleep(60)\n")
     )
@@ -80,6 +90,8 @@ def test_start_play_records_a_player_that_stays_up(tmp_path, monkeypatch, deck_h
 
     data = state.load()
     assert isinstance(data["play_pid"], int) and data["play_pid"] > 0
+    # Both spellings are written by the one locked update, not by a stale whole-dict write.
+    assert data["play"]["pid"] == data["play_pid"]
     assert (deck_home / ".ghostdeck" / "play.pid").is_file()
     assert play.playing() is True
 
