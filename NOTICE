@@ -35,8 +35,11 @@ Resolved on PATH (`shutil.which`, or a bare-name exec):
   `tools/hardware_verify.py`: pgrep lists processes matching a pattern so the harness can
   find this repository's own local bridge, and kill sends a signal to an exact pid so it
   can stop the bridge process it started itself)
-- ar, file (binutils and the file utility, when present; `device/build-color-agent.sh`
-  inspects the libturbojpeg archive with them)
+- ar, od, tr, mktemp, head, dirname (binutils plus the POSIX text utilities, used by
+  `device/build-color-agent.sh` to inspect the libturbojpeg archive and read the ELF
+  header directly: it parses `e_machine` with od/tr rather than shelling out to `file`,
+  which is not required and is not installed on every host. `ar` and `od` are only used
+  when present, and each is a named requirement in the script's own failure message.)
 
 Invoked by absolute path:
 

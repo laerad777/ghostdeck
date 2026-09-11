@@ -594,8 +594,11 @@ def test_the_agent_is_linked_dynamically_with_a_documented_reason():
 # The member probe is a `mktemp -d "${TMPDIR}/tjprobe.XXXXXX"` removed by a trap. These two
 # tests assert on a *private* TMPDIR rather than on `/tmp/tjprobe*`: every worker runs this same
 # recipe from `pytest tests/ -q` on this one host, so a global count around the subprocess cannot
-# tell a recipe leak from a neighbour's in-flight probe. Holding an empty `/tmp/tjprobe.<random>`
-# for the duration of the test is enough to red the global version.
+# tell a recipe leak from a neighbour's in-flight probe. Precisely: a neighbour's probe directory
+# only reds the global version if it appears *between* the before/after globs - one held for the
+# whole test cancels out in the set difference `after - before`. The race is therefore narrow and
+# load-dependent (measured at 4/25 runs under a concurrent recipe loop), which is exactly why a
+# private TMPDIR is the right assertion surface rather than a flaky global count.
 def test_recipe_leaves_no_temp_files_behind(tmp_path):
     """The probe directory is created before the archiver is consulted, so this die path has to
     clean it up as well."""
