@@ -22,6 +22,20 @@ _OFFLINE_EXIT = 3
 _RECOVERY_HINT = "power-cycle or replug the deck (ghostdeck cannot recover it from the host)"
 
 
+def _describe(error: BaseException) -> str:
+    """A one-line reason for `error` that is never empty.
+
+    `print(error, file=sys.stderr)` renders a message-less exception as a blank line, which is
+    indistinguishable from a process that died between stages. On the real deck a `stop` exited 1
+    with output that stripped to empty, and the failure could not be attributed to anything: a bare
+    `OSError()` or `RuntimeError()` reproduces that signature exactly. The type name is always
+    available, so it is used when the message would otherwise be empty. A message that is already
+    present is passed through untouched, so every existing message is unchanged.
+    """
+    message = str(error).strip()
+    return message or f"{type(error).__name__} (no message)"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ghostdeck", description="D200 JPEG play + hidshim Studio copy")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -60,8 +74,23 @@ def main(argv: list[str] | None = None) -> int:
         # every one of them reports the environment and exits with the environment code.
         print(error, file=sys.stderr)
         return _ENV_EXIT
+    except SystemExit as error:
+        # `except Exception` cannot see this, so a command that exits the process in-process ends the
+        # interpreter with its code and NO output - the same unattributable signature as an
+        # empty-message failure, and it skips whatever the command had left to do (a half-finished
+        # `stop` leaves the deck hijacked with nothing on the terminal to say so). Nothing in the
+        # dispatch path legitimately exits, so name it; the code is preserved. argparse's own
+        # SystemExit is raised above in `parse_args`, so `--help` and usage errors are untouched.
+        raw = error.code
+        code = 0 if raw is None else (raw if isinstance(raw, int) else 1)
+        print(
+            f"a command exited with code {raw!r} instead of returning; this is a ghostdeck bug",
+            file=sys.stderr,
+        )
+        return code
     except Exception as error:
-        print(error, file=sys.stderr)
+        # Never exit non-zero with no explanation (`_describe`).
+        print(_describe(error), file=sys.stderr)
         return 1
     return 2
 

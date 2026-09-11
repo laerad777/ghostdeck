@@ -556,3 +556,50 @@ def test_the_report_descriptor_has_exactly_one_definition():
     assert "0x95, 0x40" not in Path(vhid.__file__).read_text(encoding="utf-8"), (
         "vhid.py carries a second copy of the descriptor again"
     )
+
+
+# --------------------------------------------------------------------------- A-155
+# `iohid` is the no-pyobjc binding, and it is macOS-only. `_cf()`/`_iokit()` used to load the
+# frameworks with nothing catching the failure, so on any host without CoreFoundation/IOKit
+# `iohid.create()` raised `OSError` instead of answering None -- which made the offline suite's own
+# `test_iohid_create_does_not_raise` an ERROR (not a skip) on the `ubuntu-latest` CI job, i.e. that
+# job was red by construction. The platform is a *value* now; these two tests are the two directions.
+
+
+def test_create_answers_none_instead_of_raising_without_corefoundation(monkeypatch):
+    """The non-Apple host, modelled: no `find_library` result and nothing at the framework path.
+
+    Device-free and platform-independent: the two things a Linux runner lacks are replaced here, so
+    the assertion can run on this macOS host -- which is the only platform the defect cannot show on.
+    """
+    from ghostdeck import iohid
+
+    def _missing(_path):
+        raise OSError(
+            "libCoreFoundation.so.0: cannot open shared object file: No such file or directory"
+        )
+
+    monkeypatch.setattr(iohid, "find_library", lambda _name: None)
+    monkeypatch.setattr(iohid.ctypes.cdll, "LoadLibrary", _missing)
+
+    assert iohid._cf() is None
+    assert iohid._iokit() is None
+    assert iohid.create() is None, "create() must answer None, never raise, where there is no IOKit"
+    iohid.pump(0)  # the run-loop helper must be inert too, not an `in_dll` TypeError
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="CoreFoundation is macOS-only")
+def test_a_working_corefoundation_is_still_loaded(monkeypatch):
+    """The other direction: the guard must not turn a working host into None (A-155).
+
+    A `try/except` that swallowed too much would make the real macOS path silently stop working, and
+    every test above would still pass because they all model the failure.
+    """
+    from ghostdeck import iohid
+
+    cf = iohid._cf()
+    assert cf is not None, "the framework loads on this host and must still be returned"
+    assert iohid._iokit() is not None
+    # And `create()` is unchanged on the platform it exists for: a device or the documented None.
+    device = iohid.create()
+    assert device is None or device

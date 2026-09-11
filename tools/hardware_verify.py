@@ -100,9 +100,9 @@ def own_bridges() -> list[int]:
     looked like a duplicate bridge.
     """
     marker = str(ROOT / "vendor" / "d200-local-bridge.py")
-    out = subprocess.run(["pgrep", "-f", "d200-local-bridge.py"], capture_output=True, text=True).stdout
+    listed = subprocess.run(["pgrep", "-f", "d200-local-bridge.py"], capture_output=True, text=True).stdout
     pids = []
-    for pid in out.stdout.split():
+    for pid in listed.split():
         cmd = subprocess.run(["ps", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout
         if marker in cmd:
             pids.append(int(pid))
@@ -111,6 +111,41 @@ def own_bridges() -> list[int]:
 
 def own_bridge_count() -> int:
     return len(own_bridges())
+
+
+def stop_own_bridges(pids: list[int], *, timeout: float = 10.0) -> list[int]:
+    """Stop only the bridge processes this run started, and wait for them to exit.
+
+    No product command stops the bridge: `studio._stop_owned_bridge` only reaps a child
+    that Studio itself spawned, and `ghostdeck stop` deliberately does not touch it. So a
+    verification run that calls `studio._ensure_bridge()` owns the bridge and has to
+    release it, otherwise the deck cannot return to HID and the staged agent survives.
+
+    Only exact pids that appeared during this run are ever signalled - never a pattern
+    match - so a bridge belonging to the operator or another tool is untouched.
+    """
+    for pid in pids:
+        if pid not in own_bridges():
+            continue  # it exited or is not ours; leave it alone
+        subprocess.run(["kill", "-TERM", str(pid)], check=False)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not own_bridges():
+            return []
+        time.sleep(0.3)
+    return own_bridges()
+
+
+def wait_for_mode(wanted: str, *, timeout: float = 25.0) -> str:
+    """Poll until the deck reports `wanted` (or a different mode settles)."""
+    deadline = time.monotonic() + timeout
+    current = device_mode()
+    while time.monotonic() < deadline:
+        current = device_mode()
+        if current == wanted:
+            return current
+        time.sleep(0.5)
+    return current
 
 
 def cli(*args: str) -> subprocess.CompletedProcess:
@@ -223,6 +258,9 @@ def main() -> int:
         print("\nRESULT: cannot continue without a bridge")
         return 1
     setup_seconds = time.monotonic() - began
+    # Record exactly which bridge processes this run created, so teardown can release
+    # only those. See stop_own_bridges for why the harness must do this itself.
+    our_bridges = own_bridges()
     observe("after bring-up")
     check("bridge socket live", studio._socket_state()[0] == "live", str(studio._socket_state()))
     check("exactly one bridge", own_bridge_count() == 1, f"count={own_bridge_count()}")
@@ -276,10 +314,10 @@ def main() -> int:
         if device_mode() == "none":
             notes.append("the deck left the USB bus during stop; it needs a physical replug. "
                          "Investigate whether the stock-UI restart can drop the link.")
-        if serial and device_mode() == "adb":
-            check("no staged agent left on the deck",
-                  deck_paths(serial, "/tmp/d200-color-agent")["/tmp/d200-color-agent"] == "ABSENT",
-                  deck_paths(serial, "/tmp/d200-color-agent")["/tmp/d200-color-agent"])
+        # The staged agent belongs to the BRIDGE's session, not to `stop`: the bridge removes
+        # it in its own teardown (`_remove_staged_agent`). So while the bridge runs the agent
+        # is legitimately present, and asserting ABSENT here would be asserting the wrong
+        # contract. It is checked in the teardown section instead, after the bridge is gone.
 
     print("\n== teardown ==")
     if args.no_clean:
@@ -287,14 +325,18 @@ def main() -> int:
     else:
         observe("before teardown")
         print(f"  teardown: {stop_playing()}")
-        for _ in range(10):
-            time.sleep(2)
-            if device_mode() == "hid" and own_bridge_count() == 0:
-                break
+        remaining = stop_own_bridges(our_bridges)
+        check("the bridge this run started is stopped", not remaining, f"remaining={remaining}")
+        # Only once the bridge is gone can the deck return to HID: the restarted stock UI
+        # performs the HID re-enumeration, and the bridge holds the ADB session until then.
+        final_mode = wait_for_mode("hid")
         observe("after teardown")
-        check("bridge stopped", own_bridge_count() == 0, f"count={own_bridge_count()}")
-        check("deck back on HID", device_mode() == "hid", device_mode())
+        check("deck back on HID", final_mode == "hid", final_mode)
         check("not playing", not play.playing(), f"playing={play.playing()}")
+        if serial and final_mode == "hid":
+            # Re-check the staged agent now, the point at which the bridge has removed it.
+            staged = deck_paths(serial, "/tmp/d200-color-agent")["/tmp/d200-color-agent"]
+            check("no staged agent left after the bridge stopped", staged == "ABSENT", staged)
 
     print()
     for note in notes:

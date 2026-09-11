@@ -21,7 +21,13 @@ Nothing here is hand-copied from the header that can be derived from it:
 * the state values are parsed from the header's `enum d200_decode_state` and cross-checked against
   what the running driver reports, so a renumbered state cannot pass silently;
 * the driver's own `check("...")` call sites are parsed, so a *deleted* contract case fails instead
-  of quietly shrinking coverage.
+  of quietly shrinking coverage;
+* `d200_decode_init`'s rollback is exercised at every call that can fail. The header promises that
+  "a failed init rolls back acquired resources; call destroy to check cleanup", but a real
+  `pipe()` failure cannot be forced without an rlimit trick that would test the rlimit instead of
+  the rollback, so the driver interposes on `pthread_mutex_init`, `pthread_cond_init`, `pipe`,
+  `fcntl` and `pthread_create` and confirms the promise, including that descriptors a successful
+  `pipe()` handed out are closed again by the rollback itself.
 
 ThreadSanitizer is the interesting sanitizer for this header, and it is only trusted after a
 deliberately racy control program has been shown to be *detected* on this host.
@@ -131,6 +137,24 @@ CONTRACT_CASES = frozenset(
         "worker_is_inside_the_callback_before_destroy",
         "destroy_joins_a_worker_blocked_in_the_callback",
         "worker_thread_actually_exited",
+        # init rollback with each acquiring call injected to fail
+        "init_after_a_mutex_failure_reports_the_errno",
+        "destroy_after_a_mutex_failure_is_clean",
+        "queue_is_reusable_after_a_mutex_failure",
+        "init_after_a_cond_failure_reports_the_errno",
+        "destroy_after_a_cond_failure_is_clean",
+        "queue_is_reusable_after_a_cond_failure",
+        "init_after_a_pipe_failure_reports_the_errno",
+        "destroy_after_a_pipe_failure_is_clean",
+        "queue_is_reusable_after_a_pipe_failure",
+        "init_after_an_fcntl_failure_reports_the_errno",
+        "destroy_after_an_fcntl_failure_is_clean",
+        "pipe_descriptors_are_closed_after_an_fcntl_failure",
+        "queue_is_reusable_after_an_fcntl_failure",
+        "init_after_a_pthread_create_failure_reports_the_errno",
+        "destroy_after_a_pthread_create_failure_is_clean",
+        "pipe_descriptors_are_closed_after_a_pthread_create_failure",
+        "queue_is_reusable_after_a_pthread_create_failure",
     }
 )
 
@@ -203,6 +227,84 @@ DRIVER = r"""
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* ------------------------------------------------------------------ fault injection
+ *
+ * `d200_decode_init` reaches its `failed:` label from five calls that can fail, and the header
+ * promises that "a failed init rolls back acquired resources; call destroy to check cleanup". A
+ * real `pipe()` failure cannot be forced without an rlimit trick that would test the rlimit rather
+ * than the rollback, so the driver interposes on those calls at the source level instead. Each
+ * wrapper passes straight through unless `fault_site` names it, and that window is exactly one
+ * `d200_decode_init` call. `(pipe)(...)` and `(fcntl)(...)` are deliberately not macro-expanded: a
+ * function-like macro only fires on an identifier immediately followed by `(`.
+ */
+#include <stdarg.h>
+
+enum { FAULT_NONE = 0, FAULT_MUTEX, FAULT_COND, FAULT_PIPE, FAULT_FCNTL, FAULT_CREATE };
+
+static int fault_site;
+static int fault_errno;
+static int injected_pipe_fds[2] = {-1, -1};
+
+static void injected_pipe_reset(void) {
+    injected_pipe_fds[0] = injected_pipe_fds[1] = -1;
+}
+
+static int d200_fault_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attributes) {
+    if (fault_site == FAULT_MUTEX) return fault_errno;
+    return (pthread_mutex_init)(mutex, attributes);
+}
+
+static int d200_fault_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attributes) {
+    if (fault_site == FAULT_COND) return fault_errno;
+    return (pthread_cond_init)(cond, attributes);
+}
+
+static int d200_fault_pipe(int descriptors[2]) {
+    int result;
+    if (fault_site == FAULT_PIPE) {
+        errno = fault_errno;
+        return -1;
+    }
+    result = (pipe)(descriptors);
+    if (result == 0) {
+        injected_pipe_fds[0] = descriptors[0];
+        injected_pipe_fds[1] = descriptors[1];
+    }
+    return result;
+}
+
+static int d200_fault_fcntl(int descriptor, int command, ...) {
+    va_list arguments;
+    int argument, result;
+    if (fault_site == FAULT_FCNTL) {
+        errno = fault_errno;
+        return -1;
+    }
+    va_start(arguments, command);
+    if (command == F_GETFD || command == F_GETFL) {
+        va_end(arguments);
+        return (fcntl)(descriptor, command);
+    }
+    argument = va_arg(arguments, int);
+    va_end(arguments);
+    result = (fcntl)(descriptor, command, argument);
+    return result;
+}
+
+static int d200_fault_pthread_create(pthread_t *thread, const pthread_attr_t *attributes,
+                                     void *(*start)(void *), void *context) {
+    if (fault_site == FAULT_CREATE) return fault_errno;
+    return (pthread_create)(thread, attributes, start, context);
+}
+
+#define pthread_mutex_init(mutex, attributes) d200_fault_mutex_init((mutex), (attributes))
+#define pthread_cond_init(cond, attributes) d200_fault_cond_init((cond), (attributes))
+#define pipe(descriptors) d200_fault_pipe(descriptors)
+#define fcntl(...) d200_fault_fcntl(__VA_ARGS__)
+#define pthread_create(thread, attributes, start, context) \
+    d200_fault_pthread_create((thread), (attributes), (start), (context))
+
 #include "d200_color_decode.h"
 
 #define JOBS 200
@@ -609,6 +711,108 @@ static void test_destroy_joins_busy_worker(void) {
     check("worker_thread_actually_exited", ctx_calls(&c) == 1);
 }
 
+/* ------------------------------------------------------------------ init rollback */
+
+static int fd_is_closed(int descriptor) {
+    errno = 0;
+    return fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+}
+
+/* Probed *before* the explicit destroy below: the descriptors must be closed by init's own rollback,
+ * or the check would only re-prove what destroy already does for every failed init. */
+static int injected_fds_are_closed(void) {
+    return injected_pipe_fds[0] >= 0 && injected_pipe_fds[1] >= 0 &&
+           fd_is_closed(injected_pipe_fds[0]) && fd_is_closed(injected_pipe_fds[1]);
+}
+
+static void test_init_rollback(void) {
+    struct d200_decode_queue q;
+    struct ctx c;
+    int rc, closed, init_errno;
+
+    ctx_init(&c, -1, 1);
+
+    /* The mutex cannot be created: nothing was acquired, and the queue stays usable. */
+    memset(&q, 0, sizeof(q));
+    injected_pipe_reset();
+    fault_errno = ENOMEM;
+    fault_site = FAULT_MUTEX;
+    errno = 0;
+    rc = d200_decode_init(&q, ctx_decode, &c);
+    fault_site = FAULT_NONE;
+    /* Captured here: probing the descriptors below leaves EBADF in errno. */
+    init_errno = errno;
+    check("init_after_a_mutex_failure_reports_the_errno", rc == -1 && init_errno == ENOMEM);
+    check("destroy_after_a_mutex_failure_is_clean", d200_decode_destroy(&q) == 0);
+    check("queue_is_reusable_after_a_mutex_failure",
+          d200_decode_init(&q, ctx_decode, &c) == 0 && d200_decode_destroy(&q) == 0);
+
+    /* The condvar fails after the mutex: destroy must release the mutex it did acquire. */
+    memset(&q, 0, sizeof(q));
+    injected_pipe_reset();
+    fault_errno = EINVAL;
+    fault_site = FAULT_COND;
+    errno = 0;
+    rc = d200_decode_init(&q, ctx_decode, &c);
+    fault_site = FAULT_NONE;
+    /* Captured here: probing the descriptors below leaves EBADF in errno. */
+    init_errno = errno;
+    check("init_after_a_cond_failure_reports_the_errno", rc == -1 && init_errno == EINVAL);
+    check("destroy_after_a_cond_failure_is_clean", d200_decode_destroy(&q) == 0);
+    check("queue_is_reusable_after_a_cond_failure",
+          d200_decode_init(&q, ctx_decode, &c) == 0 && d200_decode_destroy(&q) == 0);
+
+    /* pipe() itself fails once the mutex and condvar exist. */
+    memset(&q, 0, sizeof(q));
+    injected_pipe_reset();
+    fault_errno = ENFILE;
+    fault_site = FAULT_PIPE;
+    errno = 0;
+    rc = d200_decode_init(&q, ctx_decode, &c);
+    fault_site = FAULT_NONE;
+    /* Captured here: probing the descriptors below leaves EBADF in errno. */
+    init_errno = errno;
+    check("init_after_a_pipe_failure_reports_the_errno", rc == -1 && init_errno == ENFILE);
+    check("destroy_after_a_pipe_failure_is_clean", d200_decode_destroy(&q) == 0);
+    check("queue_is_reusable_after_a_pipe_failure",
+          d200_decode_init(&q, ctx_decode, &c) == 0 && d200_decode_destroy(&q) == 0);
+
+    /* fcntl fails *after* pipe() handed out two descriptors, so the rollback owes a close. */
+    memset(&q, 0, sizeof(q));
+    injected_pipe_reset();
+    fault_errno = EMFILE;
+    fault_site = FAULT_FCNTL;
+    errno = 0;
+    rc = d200_decode_init(&q, ctx_decode, &c);
+    fault_site = FAULT_NONE;
+    /* Captured here: probing the descriptors below leaves EBADF in errno. */
+    init_errno = errno;
+    closed = injected_fds_are_closed();
+    check("init_after_an_fcntl_failure_reports_the_errno", rc == -1 && init_errno == EMFILE);
+    check("destroy_after_an_fcntl_failure_is_clean", d200_decode_destroy(&q) == 0);
+    check("pipe_descriptors_are_closed_after_an_fcntl_failure", closed);
+    check("queue_is_reusable_after_an_fcntl_failure",
+          d200_decode_init(&q, ctx_decode, &c) == 0 && d200_decode_destroy(&q) == 0);
+
+    /* pthread_create fails last: every other resource was acquired and no thread exists to join. */
+    memset(&q, 0, sizeof(q));
+    injected_pipe_reset();
+    fault_errno = EAGAIN;
+    fault_site = FAULT_CREATE;
+    errno = 0;
+    rc = d200_decode_init(&q, ctx_decode, &c);
+    fault_site = FAULT_NONE;
+    /* Captured here: probing the descriptors below leaves EBADF in errno. */
+    init_errno = errno;
+    closed = injected_fds_are_closed();
+    check("init_after_a_pthread_create_failure_reports_the_errno",
+          rc == -1 && init_errno == EAGAIN);
+    check("destroy_after_a_pthread_create_failure_is_clean", d200_decode_destroy(&q) == 0);
+    check("pipe_descriptors_are_closed_after_a_pthread_create_failure", closed);
+    check("queue_is_reusable_after_a_pthread_create_failure",
+          d200_decode_init(&q, ctx_decode, &c) == 0 && d200_decode_destroy(&q) == 0);
+}
+
 int main(void) {
     /* The header's own constants, echoed so the test can compare them with the parsed enum. */
     printf("ENUM D200_DECODE_EMPTY %d\n", (int)D200_DECODE_EMPTY);
@@ -622,6 +826,7 @@ int main(void) {
     test_stream_and_failure();
     test_full_pipe();
     test_destroy_joins_busy_worker();
+    test_init_rollback();
 
     printf("TOTAL %u\n", cases);
     printf("FAILED %u\n", failures);

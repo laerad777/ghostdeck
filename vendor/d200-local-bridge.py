@@ -49,6 +49,16 @@ SESSION_DIR_PRELOAD = 'preload.so'
 # which the shim's parser accepts. It also keeps this handler from outliving a
 # closing handle by more than one window.
 INPUT_IDLE_TICK_SECONDS = 0.5
+# How long one start waits for the device-side proxy's forwarded port to answer
+# with a BOOTSTRAP frame. Named, because it is only half of a bring-up budget:
+# the host's own wait for this bridge's unix socket (src/ghostdeck/studio.py,
+# BRIDGE_WAIT) starts BEFORE `_stage()` and this one starts after it, so the host
+# can expire first on a deck whose device commands are slow -- and it then kills a
+# bridge that is still inside its own budget. `bridgeStartupAttempt` (below)
+# reports both halves of every attempt so the next hardware run attributes a slow
+# bring-up instead of guessing at it. The value is unchanged from the revision
+# that was measured; only the name is new.
+PROXY_READINESS_SECONDS = 15.0
 # One line per staged entry: '<directory>|<name>|<bytes>'. `ls -A` so a hidden
 # extra entry cannot pass for a clean session directory, and `wc -c` so no
 # stat(1) is required on the deck. Unparseable output is never treated as proof
@@ -117,6 +127,22 @@ class StateFileError(RuntimeError):
     happens before any device effect and its message is shown to the user verbatim
     at the top level, next to ``bridge_socket_in_use`` / ``bridge_stage_failed``.
     Callers catching ``RuntimeError`` keep working.
+    """
+
+
+class StartupError(RuntimeError):
+    """The device proxy did not come up, reported as one line instead of a traceback.
+
+    A `TimeoutError` from the forwarded-port wait used to escape `main()` as an
+    unhandled exception whose last frame named `_start` and nothing about why: the
+    real-deck log recorded nine of those with no way to tell a slow proxy from one
+    being killed underneath it. The message is built from fixed vocabulary only --
+    never device-supplied text, never the session directory -- and the `attempt`
+    counters and timings travel in the `bridgeStartupAttempt` diagnostic.
+
+    `RuntimeError` rather than `TimeoutError` on purpose: `TimeoutError` is an
+    `OSError` subclass, and every caller in this module catches `OSError` for
+    "the device went away". This failure is not that.
     """
 
 
@@ -321,11 +347,41 @@ class DeviceProxy:
         self.error = None
         self.reader = None
         self.heartbeat = None
+        # Startup instrumentation: the 1-based ordinal of the `_start` this process
+        # is running, and the last device command this bridge issued. Both are
+        # diagnostics only -- nothing reads them to make a decision.
+        self.startup_attempt = 0
+        self.last_device_command = None
 
     def _run(self, *arguments, timeout=15):
-        result = subprocess.run(
-            [self.adb, '-s', self.serial, *arguments],
-            capture_output=True, check=False, timeout=timeout,
+        """Run one device command, recording it for the attribution diagnostics.
+
+        `arguments[0]` is the verb (`shell`, `push`, `forward`); the rest of the
+        argument list can name the session directory, so only the verb is kept. The
+        record is what makes a USB disappearance attributable from this side: it is
+        the last thing the bridge asked the deck to do before the transport went
+        away. Read-only and lock-free (one assignment of a fresh dict, so an
+        interrupted `_run` cannot see a half-written record), and it never raises.
+        """
+        verb = arguments[0] if arguments and type(arguments[0]) is str else 'unknown'
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                [self.adb, '-s', self.serial, *arguments],
+                capture_output=True, check=False, timeout=timeout,
+            )
+        except BaseException as error:
+            self.last_device_command = dict(
+                verb=verb, outcome='error', category=type(error).__name__,
+                errno=diagnostic_errno(error), returnCode=None,
+                seconds=round(time.monotonic() - started, 3),
+            )
+            raise
+        self.last_device_command = dict(
+            verb=verb, outcome='nonzero' if result.returncode else 'ok',
+            category=None, errno=None,
+            returnCode=result.returncode if result.returncode else None,
+            seconds=round(time.monotonic() - started, 3),
         )
         if result.returncode:
             raise DeviceCommandError(result.returncode)
@@ -473,6 +529,94 @@ class DeviceProxy:
             except DeviceCommandError as error:
                 status = '' if error.returncode is None else f' (exit {error.returncode})'
                 raise StagingError(f'could not {step} on the device: {error}{status}') from error
+
+    def _local_artifact_sizes(self):
+        """The sizes of the two artifacts this build stages, or None if unmeasurable.
+
+        Deliberately local-only: the T13 reap fix removed the sampling of these
+        numbers against the deck, because a leftover is by definition from an
+        earlier build. Here they are the expectation the deck's own report is
+        checked against, which is a different question.
+        """
+        try:
+            return {
+                SESSION_DIR_PROXY: self.proxy_binary.stat().st_size,
+                SESSION_DIR_PRELOAD: self.preload_library.stat().st_size,
+            }
+        except OSError:
+            return None
+
+    def _staged_entries_query(self):
+        """One shell round trip reporting the deck's sizes for the two staged files."""
+        return (
+            f'for n in {SESSION_DIR_PROXY} {SESSION_DIR_PRELOAD}; do '
+            f'echo "$n|$(wc -c < "{self.remote_dir}/$n" 2>/dev/null)"; done'
+        )
+
+    def _staged_entries_present(self):
+        """True only when the deck provably still holds what this build stages.
+
+        A transport revive happens while the USB link is being reconfigured, and
+        the deck-side files usually survive it -- so re-pushing ~77 KB on every
+        revive is traffic during exactly the moment the link is least able to carry
+        it. The real-deck log this answers showed 56 revives against 60 dropped
+        streams, i.e. dozens of avoidable push round trips per session.
+
+        Anything this check cannot prove answers False, which means "stage again":
+        a failed command, unparseable output, a missing entry, a size that differs
+        from the local artifact. Fail-closed, so the only thing the skip can do is
+        save commands; it can never conclude that files are present when they are
+        not. The vocabulary is the same `echo` / `wc -c` the sibling listing already
+        relies on, because the deck's shell is toybox and `stat(1)` is not assured.
+        """
+        expected = self._local_artifact_sizes()
+        if expected is None:
+            return False
+        try:
+            result = self._run('shell', self._staged_entries_query(), timeout=5)
+        except (DeviceCommandError, OSError, subprocess.SubprocessError):
+            return False
+        stdout = getattr(result, 'stdout', None) or b''
+        seen = {}
+        for line in stdout.decode('utf-8', 'replace').splitlines():
+            fields = line.strip().split('|')
+            if len(fields) != 2:
+                return False
+            try:
+                seen[fields[0]] = int(fields[1])
+            except ValueError:
+                return False
+        return seen == expected
+
+    def _restore_staged_modes(self):
+        """Re-apply the staged modes after a reuse; False when the deck refused."""
+        try:
+            self._run(
+                'shell',
+                f'chmod 700 {self.remote_dir}; '
+                f'chmod 700 {self.remote_dir}/{SESSION_DIR_PROXY}; '
+                f'chmod 600 {self.remote_dir}/{SESSION_DIR_PRELOAD}',
+                timeout=5,
+            )
+        except (DeviceCommandError, OSError, subprocess.SubprocessError):
+            return False
+        return True
+
+    def _ensure_staged_for_revive(self):
+        """Reuse the deck-side staging when it is provably intact, else re-stage.
+
+        Returns True when it re-staged. The reuse branch restores the directory and
+        file modes (`chmod`) because those are the part the check does not prove,
+        and keeps the full `_stage()` as the answer to every uncertainty.
+        """
+        if self._staged_entries_present() and self._restore_staged_modes():
+            emit_diagnostic(sys.stderr, dict(
+                event='transportReviveReusedStage', pid=os.getpid(),
+                clock='host-monotonic',
+            ))
+            return False
+        self._stage()
+        return True
 
     def _stage_video_agent(self, deadline):
         """Push the native agent to its fixed path; record that this instance owns it."""
@@ -649,8 +793,73 @@ class DeviceProxy:
                 error.add_note(f'startup cleanup failed: {cleanup_error}')
             raise
 
+    def _begin_startup_attempt(self):
+        self.startup_attempt += 1
+        return self.startup_attempt
+
+    def _report_startup(self, attempt, stage_started, readiness_started, error):
+        """One greppable record per start attempt: what it cost and how it ended.
+
+        Fixed keys and bounded values, written through the module's existing
+        `emit_diagnostic`, so the next real-deck log can be counted (`grep -c
+        bridgeStartupAttempt`) and the slow phase identified without a deck in
+        hand. `stageSeconds` covers `_stage()`; `readinessSeconds` covers the
+        forwarded-port wait, and is null when the failure happened before that wait
+        began. `lastDeviceCommand` is the last command this bridge issued, which is
+        what makes a device that vanished mid-attempt attributable.
+        """
+        try:
+            now = time.monotonic()
+            record = dict(
+                event='bridgeStartupAttempt', pid=os.getpid(), attempt=attempt,
+                clock='host-monotonic',
+                stageSeconds=(round((readiness_started if readiness_started is not None
+                                     else now) - stage_started, 3)),
+                readinessSeconds=(None if readiness_started is None
+                                  else round(now - readiness_started, 3)),
+                outcome='ready' if error is None else 'failed',
+                failure=None if error is None else type(error).__name__,
+                lastDeviceCommand=(dict(self.last_device_command)
+                                   if self.last_device_command else None),
+            )
+            emit_diagnostic(sys.stderr, record)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _startup_failure_reason(error):
+        """Fixed vocabulary only: never device-supplied text, never the session dir."""
+        if type(error) is TimeoutError:
+            return (f'the device proxy did not become ready within '
+                    f'{PROXY_READINESS_SECONDS:g}s on its forwarded port')
+        if type(error) is ProtocolError:
+            return 'the device proxy did not enter raw transport mode'
+        return f'the device proxy failed to start ({type(error).__name__})'
+
     def _start(self):
-        self._stage()
+        """Start the device proxy, reporting each attempt and failing in one line.
+
+        `_stage()` keeps raising its own types unchanged, so the H4
+        `bridge_stage_failed` path is untouched. Everything after staging is a
+        startup failure that used to escape as a traceback: it is reported through
+        `bridgeStartupAttempt` and raised as `StartupError`, which `main()` turns
+        into one line and a non-zero exit.
+        """
+        attempt = self._begin_startup_attempt()
+        stage_started = time.monotonic()
+        readiness_started = None
+        try:
+            self._stage()
+            readiness_started = time.monotonic()
+            self._start_proxy_transport()
+        except BaseException as error:
+            self._report_startup(attempt, stage_started, readiness_started, error)
+            if readiness_started is None:
+                raise
+            raise StartupError(self._startup_failure_reason(error)) from error
+        self._report_startup(attempt, stage_started, readiness_started, None)
+
+    def _start_proxy_transport(self):
         device_port = 30000 + int(self.session_token[:4], 16) % 20000
         self.device_port = device_port
         self.current_device_port = device_port
@@ -667,7 +876,7 @@ class DeviceProxy:
             start_new_session=True,
         )
         self.forward_port = self._create_forward(device_port)
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + PROXY_READINESS_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -808,7 +1017,10 @@ class DeviceProxy:
                         pass
             self.reader_stream = self.transport_socket = None
             self._reap_proxy_process()
-            self._stage()
+            # Skip the two pushes when the deck provably still holds them: a revive
+            # is already the moment the link is least reliable, and re-staging on
+            # every dropped stream was the bulk of the observed churn.
+            self._ensure_staged_for_revive()
             device_port = 30000 + int(self.session_token[:4], 16) % 20000
             self.device_port = device_port
             self.current_device_port = device_port
@@ -825,7 +1037,7 @@ class DeviceProxy:
                 start_new_session=True,
             )
             self.forward_port = self._create_forward(device_port)
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + PROXY_READINESS_SECONDS
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -2313,6 +2525,12 @@ def main():
             transport.start()
         except DeviceAdmissionError as error:
             print(f'bridge_device_in_use error={error}', file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        except StartupError as error:
+            # One line, non-zero exit. The per-attempt numbers (staging seconds,
+            # readiness seconds, the last command issued) are already on stderr as
+            # a `bridgeStartupAttempt` diagnostic; this is the human-readable half.
+            print(f'bridge_startup_failed error={error}', file=sys.stderr, flush=True)
             raise SystemExit(1)
         except StagingError as error:
             # The session is already unwound by the time this is raised (the

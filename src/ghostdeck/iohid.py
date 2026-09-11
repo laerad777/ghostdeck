@@ -41,10 +41,21 @@ REPORT_DESCRIPTOR = bytes(
 
 
 def _cf():
+    """CoreFoundation, or None when this host does not provide it.
+
+    macOS-only. Returning None rather than raising is what keeps the platform a *value*: `create()`
+    is already documented to answer None when it cannot make a device, so a caller on a non-Apple
+    host -- `vhid.serve()`'s binding probe, a user running `ghostdeck status` on Linux, the offline
+    suite on a CI runner -- gets that documented answer instead of an `OSError` traceback from a
+    macOS framework path (A-155, which made the `ubuntu-latest` job red by construction).
+    """
     path = find_library("CoreFoundation")
     if not path:
         path = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-    lib = ctypes.cdll.LoadLibrary(path)
+    try:
+        lib = ctypes.cdll.LoadLibrary(path)
+    except OSError:
+        return None
     lib.CFStringCreateWithCString.restype = c_void_p
     lib.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
     lib.CFNumberCreate.restype = c_void_p
@@ -69,7 +80,11 @@ def _cf():
 
 
 def _iokit():
-    lib = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/IOKit.framework/IOKit")
+    """IOKit, or None when this host does not provide it. See `_cf()` for why this is a value."""
+    try:
+        lib = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/IOKit.framework/IOKit")
+    except OSError:
+        return None
     lib.IOHIDUserDeviceCreate.restype = c_void_p
     lib.IOHIDUserDeviceCreate.argtypes = [c_void_p, c_void_p]
     lib.IOHIDUserDeviceScheduleWithRunLoop.argtypes = [c_void_p, c_void_p, c_void_p]
@@ -79,6 +94,8 @@ def _iokit():
 def create(vid: int = HID_VID, pid: int = HID_PID, product: str = "ulanzi") -> c_void_p | None:
     cf = _cf()
     iokit = _iokit()
+    if cf is None or iokit is None:
+        return None
     key_cb = ctypes.addressof(ctypes.c_char.in_dll(cf, "kCFTypeDictionaryKeyCallBacks"))
     val_cb = ctypes.addressof(ctypes.c_char.in_dll(cf, "kCFTypeDictionaryValueCallBacks"))
     default_mode = c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
@@ -125,6 +142,9 @@ def create(vid: int = HID_VID, pid: int = HID_PID, product: str = "ulanzi") -> c
 
 
 def pump(seconds: float = 0.25) -> None:
+    """Run the current thread's run loop briefly, or do nothing where there is no CoreFoundation."""
     cf = _cf()
+    if cf is None:
+        return
     default_mode = c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
     cf.CFRunLoopRunInMode(default_mode, ctypes.c_double(seconds), 0)

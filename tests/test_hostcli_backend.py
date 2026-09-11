@@ -226,3 +226,79 @@ def test_status_still_exits_zero_for_a_usable_deck(monkeypatch, capsys, home):
     assert "usb=adb" in captured.out, captured
     assert "offline" not in captured.out + captured.err, captured
     assert captured.err == "", captured
+
+
+# --- in-lane hardening: a non-zero exit must never be silent ------------------------------
+#
+# From a real-deck observation that could not be attributed: cycle 2 of the master's hardware pass
+# reported `stop` exiting 1 with EMPTY output. Two mechanisms produce exactly that signature, and
+# both are closed here. Neither had a proven reachable instance - every `raise` in the stop path
+# carries a message, and nothing in the dispatch path exits the process - so these are
+# diagnosability fixes: they make an unattributable failure name itself instead of being a blank.
+
+
+def test_a_message_less_failure_still_names_its_type(monkeypatch, capsys, home):
+    """`print(error)` renders an empty message as a blank line: rc=1, output strips to ""."""
+    from ghostdeck import cli, play
+
+    for error in (OSError(), RuntimeError(), ValueError()):
+        monkeypatch.setattr(play, "stop", lambda e=error: (_ for _ in ()).throw(e))
+        code = cli.main(["stop"])
+        captured = capsys.readouterr()
+        assert code == 1, (code, captured)
+        assert captured.err.strip(), f"{type(error).__name__} exited 1 with no output at all"
+        assert type(error).__name__ in captured.err, captured
+
+
+def test_a_messageful_failure_is_printed_unchanged(monkeypatch, capsys, home):
+    """The fallback must not decorate a real message: existing output stays byte-identical."""
+    from ghostdeck import cli, play
+
+    monkeypatch.setattr(
+        play, "stop", lambda: (_ for _ in ()).throw(RuntimeError("deck is on fire"))
+    )
+    code = cli.main(["stop"])
+    captured = capsys.readouterr()
+    assert code == 1, (code, captured)
+    assert captured.err == "deck is on fire\n", captured
+
+
+def test_a_command_that_exits_the_process_is_reported_not_silent(monkeypatch, capsys, home):
+    """`except Exception` cannot see `SystemExit`, so it ended the interpreter with no output."""
+    from ghostdeck import cli, play
+
+    monkeypatch.setattr(play, "stop", lambda: sys.exit(1))
+    code = cli.main(["stop"])
+    captured = capsys.readouterr()
+    assert code == 1, (code, captured)  # the code is preserved, not swallowed
+    assert captured.err.strip(), "a command exited the process and said nothing"
+    assert "ghostdeck bug" in captured.err, captured
+
+
+def test_an_exit_with_no_code_still_returns_zero(monkeypatch, capsys, home):
+    """`sys.exit()` (code None) means 0, and the guard must not turn it into a failure."""
+    from ghostdeck import cli, play
+
+    monkeypatch.setattr(play, "stop", lambda: sys.exit())
+    code = cli.main(["stop"])
+    assert code == 0, (code, capsys.readouterr())
+
+
+def test_argparse_usage_errors_are_not_swallowed_by_the_exit_guard(capsys):
+    """The guard sits INSIDE the dispatch try, so argparse's own exits are untouched.
+
+    `parse_args` runs above the try on purpose: `--help` and a usage error must still exit 0 and 2
+    with argparse's own output, not be reported as a ghostdeck bug.
+    """
+    import pytest as _pytest
+
+    from ghostdeck import cli
+
+    with _pytest.raises(SystemExit) as help_exit:
+        cli.main(["--help"])
+    assert help_exit.value.code == 0
+
+    with _pytest.raises(SystemExit) as usage_exit:
+        cli.main(["definitely-not-a-command"])
+    assert usage_exit.value.code == 2
+    assert "ghostdeck bug" not in capsys.readouterr().err

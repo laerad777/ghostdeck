@@ -26,6 +26,25 @@ def gcc() -> str:
     return path
 
 
+def _stale(source: Path, output: Path) -> bool:
+    """True when `output` must be (re)built from `source`: absent, unreadable, or older than it.
+
+    The caches under `~/.ghostdeck/bin` used to be trusted on `is_file()` alone, so once an output
+    existed an edit to `device/*.c` was never compiled again -- and `ensure()` then re-copied that
+    stale cache into `vendor/`, so the staged files looked freshly built (A-166). A user who had ever
+    run `build`/`play` kept the binaries of that moment with no signal and no `--force`.
+
+    A source that cannot be stat()ed counts as stale: producing the artifact is the safe answer, and
+    it keeps the failure at the compiler (which can explain itself) rather than here.
+    """
+    if not output.is_file():
+        return True
+    try:
+        return source.stat().st_mtime > output.stat().st_mtime
+    except OSError:
+        return True
+
+
 def ensure() -> None:
     gdstate.BIN_DIR.mkdir(parents=True, exist_ok=True)
     _compile_proxy_preload()
@@ -46,13 +65,13 @@ def _compile_proxy_preload() -> None:
         raise RuntimeError(f"device sources missing under {DEVICE}")
     out_proxy = gdstate.BIN_DIR / "d200-zkgui-proxy"
     out_preload = gdstate.BIN_DIR / "libd200-zkgui-preload.so"
-    if not out_proxy.is_file():
+    if _stale(proxy, out_proxy):
         subprocess.run(
             [compiler, "-O2", "-Wall", "-Wextra", str(proxy), "-o", str(out_proxy), "-pthread"],
             check=True,
             timeout=120,
         )
-    if not out_preload.is_file():
+    if _stale(preload, out_preload):
         subprocess.run(
             [
                 compiler,
@@ -74,11 +93,13 @@ def _compile_proxy_preload() -> None:
 
 def _ensure_agent() -> None:
     dest = gdstate.BIN_DIR / "d200-color-agent"
-    if dest.is_file():
-        return
     sibling = ROOT.parent / "d200-color-agent"
-    if sibling.is_file():
+    # A rebuilt sibling wins over an older cached copy (A-166). The agent itself is compiled by the
+    # recipe, not here, so this is the one place a fresh build can reach the cache.
+    if sibling.is_file() and _stale(sibling, dest):
         shutil.copy2(sibling, dest)
+        return
+    if dest.is_file():
         return
     gcc_hint = (
         "Install an ARMv7 Linux hard-float toolchain"

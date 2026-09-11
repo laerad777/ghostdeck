@@ -8,11 +8,13 @@ against a real backend, and no test writes to a device.
 from __future__ import annotations
 
 
+import os
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -268,6 +270,104 @@ def test_proxy_preload_behaviour_is_not_weakened():
     assert "-shared" in source and "-fPIC" in source
     assert "device sources missing under" in source
     assert "device binary missing after build" in source
+
+
+# --------------------------------------------------------------------------- A-166
+# The ARM caches under `~/.ghostdeck/bin` were trusted on `is_file()` alone, so once an output
+# existed an edit to `device/*.c` was never compiled again -- and `ensure()` then re-copied that
+# stale cache into `vendor/`, which made the staged files look freshly built. Everything below runs
+# against a recording stub in place of the cross compiler and against temp directories: no real
+# toolchain run, and nothing written inside the repo.
+
+
+def _stub_devicebuild(monkeypatch, tmp_path):
+    """`devicebuild` redirected to temp dirs, with the compiler replaced by a recorder.
+
+    Returns `(device, bindir, vendor, runs)`. The stub writes a distinguishable body per invocation,
+    so a test can tell a freshly compiled artifact from a re-stamped cache by its bytes.
+    """
+    device = tmp_path / "device"
+    device.mkdir()
+    for name in ("d200-zkgui-proxy.c", "d200-zkgui-preload.c"):
+        (device / name).write_text("int v1;\n", encoding="utf-8")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # `_ensure_agent` looks for the prebuilt agent beside the repo root.
+    (tmp_path / "d200-color-agent").write_bytes(b"agent")
+    runs = []
+
+    def _run(argv, **_kwargs):
+        runs.append([str(part) for part in argv])
+        Path(argv[argv.index("-o") + 1]).write_bytes(b"built-run-%d" % len(runs))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(devicebuild, "DEVICE", device)
+    monkeypatch.setattr(devicebuild, "VENDOR", vendor)
+    monkeypatch.setattr(devicebuild, "ROOT", repo)
+    monkeypatch.setattr(devicebuild.gdstate, "BIN_DIR", bindir)
+    monkeypatch.setattr(devicebuild, "gcc", lambda: "stub-armv7-gcc")
+    monkeypatch.setattr(devicebuild.subprocess, "run", _run)
+    return device, bindir, vendor, runs
+
+
+def test_a_cached_object_is_rebuilt_when_its_source_changes(tmp_path, monkeypatch):
+    """A-166: `if not out.is_file()` meant the compiler ran once, ever, for a given output."""
+    device, _, _, runs = _stub_devicebuild(monkeypatch, tmp_path)
+
+    devicebuild._compile_proxy_preload()
+    assert len(runs) == 2, "a cold cache must compile both objects"
+
+    devicebuild._compile_proxy_preload()
+    assert len(runs) == 2, "an unchanged source must not recompile: the cache still has to work"
+
+    newer = time.time() + 5
+    for name in ("d200-zkgui-proxy.c", "d200-zkgui-preload.c"):
+        os.utime(device / name, (newer, newer))
+    devicebuild._compile_proxy_preload()
+    assert len(runs) == 4, (
+        f"an edited source was not recompiled: {len(runs) - 2} ran, the other 2 were stale"
+    )
+
+
+def test_ensure_republishes_rebuilt_binaries_into_vendor(tmp_path, monkeypatch):
+    """The other half of A-166: `vendor/` was re-stamped from the cache, so staleness was invisible."""
+    device, _, vendor, runs = _stub_devicebuild(monkeypatch, tmp_path)
+
+    devicebuild.ensure()
+    assert len(runs) == 2
+    assert (vendor / "d200-zkgui-proxy").read_bytes() == b"built-run-1"
+    assert (vendor / "libd200-zkgui-preload.so").read_bytes() == b"built-run-2"
+
+    newer = time.time() + 5
+    os.utime(device / "d200-zkgui-proxy.c", (newer, newer))
+    devicebuild.ensure()
+    assert (vendor / "d200-zkgui-proxy").read_bytes() == b"built-run-3", (
+        "vendor/ was re-stamped from the stale cache instead of the rebuilt object"
+    )
+    assert (vendor / "libd200-zkgui-preload.so").read_bytes() == b"built-run-2", (
+        "the untouched preload was recompiled anyway"
+    )
+
+
+def test_a_rebuilt_agent_sibling_replaces_the_cached_copy(tmp_path, monkeypatch):
+    """The agent is compiled by the recipe; a fresh sibling must still reach the cache (A-166)."""
+    _, bindir, _, _ = _stub_devicebuild(monkeypatch, tmp_path)
+    sibling = tmp_path / "d200-color-agent"
+
+    devicebuild._ensure_agent()
+    assert (bindir / "d200-color-agent").read_bytes() == b"agent"
+
+    sibling.write_bytes(b"agent-v2")
+    newer = time.time() + 5
+    os.utime(sibling, (newer, newer))
+    devicebuild._ensure_agent()
+    assert (bindir / "d200-color-agent").read_bytes() == b"agent-v2", (
+        "a rebuilt agent was never published to the cache"
+    )
 
 
 # --------------------------------------------------------------------------- B-107
