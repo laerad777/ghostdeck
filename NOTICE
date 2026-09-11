@@ -1,0 +1,26 @@
+ghostdeck
+Copyright (c) 2026 ghostdeck contributors
+
+This project is licensed under the MIT License. See LICENSE.
+
+Third-party property (not this project)
+---------------------------------------
+Ulanzi, Ulanzi Studio, Ulanzi Studio.app, and related trademarks remain
+the property of their owners. This project does not modify, bundle, or
+redistribute official Studio or any Studio.app.
+
+Device firmware, SigmaStar / Ulanzi kernel modules, stock UI binaries,
+and other vendor firmware remain the property of their owners. This
+project does not flash firmware, ship vendor kernel modules, or claim
+ownership of on-device stock software.
+
+External programs this project only executes
+--------------------------------------------
+ghostdeck invokes the following programs from PATH when present. It does
+not vendor, relicense, or redistribute them:
+
+- adb (Android SDK platform-tools)
+- ffmpeg
+- yt-dlp (optional; used only for URL sources)
+
+Those programs keep their own licenses. Install them separately.

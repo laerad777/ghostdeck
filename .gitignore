@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.DS_Store
+vendor/d200-zkgui-proxy
+vendor/d200-color-agent
+vendor/libd200-zkgui-preload.so
