@@ -654,7 +654,11 @@ static int worker(const uint8_t session[16], uint32_t fps_n, uint32_t fps_d, int
         };
         if (poll(pollfds, 2, color_poll_timeout(s)) < 0 && errno != EINTR) { reason = D200_VS_DISCONNECTED; break; }
     }
-    if (!running) reason = (uint32_t)signal_reason;
+    /* The loop's own cause wins. An out-of-band signal addresses the process, not
+     * its diagnosis: replacing an observed failure with the signal's reason would
+     * report a transport disconnect as a clean cancel and skip the owned ERROR
+     * record below. The signal supplies a reason only while none was reached. */
+    if (!running && !reason) reason = (uint32_t)signal_reason;
 done:
     (void)color_startup_failure(&s->startup, session, STDERR_FILENO, reason);
     /* An owned failure record lets the proxy start its absolute cleanup/reap
