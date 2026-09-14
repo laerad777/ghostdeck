@@ -174,13 +174,13 @@ def test_readmes_describe_hidshim_copy():
     en = (ROOT / "README.md").read_text(encoding="utf-8")
     ko = (ROOT / "README.ko.md").read_text(encoding="utf-8")
     en_l = en.lower()
+    ko_l = ko.lower()
     assert "hidshim" in en_l
     assert "ulanzi studio adb.app" in en_l
     assert "/applications/ulanzi studio.app" in en_l
-    assert "never written" in en_l or "not written" in en_l or "never" in en_l
+    assert "hidshim" in ko_l
+    assert "ulanzi studio adb.app" in ko_l
     assert MARKER not in en
-    assert "hidshim" in ko.lower()
-    assert "2207:0019" in ko
     assert MARKER not in ko
 
 

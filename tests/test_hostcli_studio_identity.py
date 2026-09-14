@@ -97,15 +97,22 @@ def test_stranger_mentioning_the_executable_is_not_our_copy(tmp_path, monkeypatc
 def test_the_real_copy_is_still_recognised_by_argv0(tmp_path, monkeypatch):
     """The fix must not become under-matching: the copy itself is still found and stopped."""
     studio, marker = _install(monkeypatch, tmp_path)
-    # argv[0] IS the resolved executable and the rest of the argv is the copy's own arguments, which
-    # is exactly what the real Studio looks like in ps. `executable=` is what sets argv[0] here.
-    mine = subprocess.Popen(
-        [marker, "-c", "import time; time.sleep(60)"], executable=sys.executable
-    )
+    # `Popen(..., executable=sys.executable)` does not make ps report argv[0] as
+    # the marker on every CPython (GHA Python.framework shows Python.app). A
+    # clang-built sleeper at the marker path is argv[0] exactly, which is what
+    # the real Studio looks like. An unsigned copy of /bin/sleep is SIGKILL'd.
+    cc = shutil.which("clang") or shutil.which("cc")
+    if cc is None:
+        pytest.skip("no C compiler to build an argv[0] sleeper")
+    src = Path(marker).parent / "sleeper.c"
+    src.write_text("#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n", encoding="utf-8")
+    built = subprocess.run([cc, "-o", marker, str(src)], capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    mine = subprocess.Popen([marker])
     try:
         time.sleep(0.5)
-        assert marker in _ps_line(mine.pid)
-        assert studio._copy_pids() == [mine.pid], (studio._copy_pids(), mine.pid)
+        assert marker in _ps_line(mine.pid), _ps_line(mine.pid)
+        assert studio._copy_pids() == [mine.pid], (studio._copy_pids(), mine.pid, _ps_line(mine.pid))
         assert studio.running() is True
         studio._quit_copy()
         assert not _alive(mine), "the copy itself was not stopped"

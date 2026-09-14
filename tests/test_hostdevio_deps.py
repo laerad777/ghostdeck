@@ -211,18 +211,17 @@ def test_recipe_fails_clearly_without_the_cross_compiler(tmp_path):
     reason="no Homebrew libturbojpeg on this host to reject",
 )
 def test_recipe_rejects_a_host_static_library(tmp_path):
-    """The Homebrew .a is Mach-O arm64; it must be rejected, not silently linked."""
-    env = {
-        "PATH": "/opt/homebrew/bin:/usr/bin:/bin",
-        "HOME": str(tmp_path),
-        "TURBOJPEG_LIB": "/opt/homebrew/lib",
-        "TURBOJPEG_INC": "/opt/homebrew/include",
-    }
+    """The Homebrew .a is Mach-O arm64; it must be rejected, not silently linked.
+
+    `--check-abi` is the ABI guard and does not need the cross compiler. The
+    full recipe dies at 'not on PATH' on a GHA image that has jpeg-turbo but
+    no armv7-linux-gnueabihf-gcc, which never reached this assertion.
+    """
     result = subprocess.run(
-        ["/bin/sh", str(RECIPE)],
+        ["/bin/sh", str(RECIPE), "--check-abi", "/opt/homebrew/lib/libturbojpeg.a"],
         capture_output=True,
         text=True,
-        env=env,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
         cwd=str(ROOT),
     )
     assert result.returncode != 0
