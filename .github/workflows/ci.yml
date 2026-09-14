@@ -11,22 +11,19 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: pytest (macos, py${{ matrix.python-version }})
+    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Host compiler and ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc ffmpeg
       - name: Device-free suite
         env:
-          # Never opt into the hardware harness. Tests that need a deck skip themselves.
           GHOSTDECK_HW_TEST: ""
         run: |
           python -m pip install pytest

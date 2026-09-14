@@ -2,7 +2,7 @@
 
 Contributions are welcome as GitHub Issues and pull requests.
 
-PRs run the device-free pytest suite on Ubuntu (Python 3.11–3.13) and
+PRs run the device-free pytest suite on macOS (the 0.1.0 host) and
 must include `Signed-off-by` on every commit.
 
 ## License of contributions
