@@ -426,7 +426,7 @@ def _vendor_player_pids() -> list[int]:
     env = dict(os.environ, LC_ALL="C")
     try:
         result = subprocess.run(
-            ["ps", "-ax", "-o", "pid=,command="],
+            ["ps", "-axww", "-o", "pid=,command="],
             capture_output=True,
             text=True,
             env=env,
