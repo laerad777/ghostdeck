@@ -105,6 +105,13 @@ def youtube_watch_url(href: str) -> str:
         return f"https://www.youtube.com/watch?v={parts[1]}"
     return ""
 
+def is_google_login_host(host: str) -> bool:
+    """accounts.google.* is a desktop WebAuthn page; mobile YouTube asks for Bluetooth instead."""
+    host = (host or "").lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host == "accounts.youtube.com" or host == "accounts.google.com" or host.startswith("accounts.google.")
+
 def page_follow_action(seen_watch: str, href: str) -> tuple[str, str]:
     """When the YouTube page changes: (new_seen, play_url | 'stop' | '')."""
     watch = youtube_watch_url(href)
@@ -298,6 +305,35 @@ def main() -> int:
         else:
             _gui_kick(ctrl, "play", action)
 
+    def _open_google_login(ctrl, request) -> None:
+        config = WKWebViewConfiguration.alloc().init()
+        config.setWebsiteDataStore_(ctrl.web.configuration().websiteDataStore())
+        config.preferences().setJavaScriptCanOpenWindowsAutomatically_(True)
+        page = config.defaultWebpagePreferences()
+        if page is not None:
+            page.setPreferredContentMode_(0)
+        popup = WKWebView.alloc().initWithFrame_configuration_(
+            NSMakeRect(0, 0, 560, 720),
+            config,
+        )
+        popup.setUIDelegate_(ctrl)
+        popup.setNavigationDelegate_(ctrl)
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, 560, 720),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        win.setTitle_("Google 로그인")
+        win.contentView().addSubview_(popup)
+        popup.setFrame_(win.contentView().bounds())
+        popup.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        win.center()
+        win.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+        popup.loadRequest_(request)
+        ctrl.popups.append((win, popup))
+
     class Controller(NSObject):
         def init(self):
             self = objc.super(Controller, self).init()
@@ -353,6 +389,7 @@ def main() -> int:
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
             )
             self.web.setUIDelegate_(self)
+            self.web.setNavigationDelegate_(self)
             view.addSubview_(self.web)
             self.web.loadRequest_(
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://m.youtube.com"))
@@ -456,28 +493,45 @@ def main() -> int:
                 return
             _gui_follow(self, href or _gui_href(self))
 
+        def webView_decidePolicyForNavigationAction_decisionHandler_(self, webView, action, handler):
+            request = action.request() if action is not None else None
+            url = request.URL() if request is not None else None
+            host = str(url.host()) if url is not None and url.host() is not None else ""
+            if is_google_login_host(host) and webView is self.web:
+                _open_google_login(self, request)
+                handler(0)
+                return
+            handler(1)
+
         def webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures_(
-            self, webView, configuration, _navigationAction, _features
+            self, _webView, configuration, navigationAction, _features
         ):
+            page = configuration.defaultWebpagePreferences()
+            if page is not None:
+                page.setPreferredContentMode_(0)
             popup = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(0, 0, 390, 640),
+                NSMakeRect(0, 0, 560, 720),
                 configuration,
             )
-            popup.setCustomUserAgent_(webView.customUserAgent())
             popup.setUIDelegate_(self)
+            popup.setNavigationDelegate_(self)
             win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 390, 640),
+                NSMakeRect(0, 0, 560, 720),
                 NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
                 NSBackingStoreBuffered,
                 False,
             )
-            win.setTitle_("로그인")
+            win.setTitle_("Google 로그인")
             win.contentView().addSubview_(popup)
             popup.setFrame_(win.contentView().bounds())
             popup.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             win.center()
             win.makeKeyAndOrderFront_(None)
+            NSApp.activateIgnoringOtherApps_(True)
             self.popups.append((win, popup))
+            request = navigationAction.request() if navigationAction is not None else None
+            if request is not None:
+                popup.loadRequest_(request)
             return popup
 
         def webViewDidClose_(self, webView):

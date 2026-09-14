@@ -12,6 +12,7 @@ from ghostdeck.app import (
     CommandResult,
     DeckRemote,
     ensure_store_id,
+    is_google_login_host,
     read_pasteboard,
     resolve_source,
     shim_is_up,
@@ -53,6 +54,14 @@ def test_youtube_watch_url_keeps_only_the_video_id():
     assert youtube_watch_url("https://www.youtube.com/embed/dQw4w9WgXcQ") == watch
     assert youtube_watch_url("https://www.youtube.com/results?search_query=x") == ""
     assert youtube_watch_url("https://www.youtube.com/") == ""
+
+
+def test_google_login_host_is_desktop_accounts_not_youtube():
+    assert is_google_login_host("accounts.google.com")
+    assert is_google_login_host("accounts.google.co.kr")
+    assert is_google_login_host("accounts.youtube.com")
+    assert not is_google_login_host("m.youtube.com")
+    assert not is_google_login_host("www.youtube.com")
 
 
 def test_ensure_store_id_reuses_the_same_uuid(tmp_path):
