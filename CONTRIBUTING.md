@@ -1,6 +1,7 @@
 # Contributing to ghostdeck
 
 Contributions are welcome as GitHub Issues and pull requests.
+
 PRs run the device-free pytest suite on Ubuntu (Python 3.11–3.13) and
 must include `Signed-off-by` on every commit.
 
