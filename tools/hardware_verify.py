@@ -182,18 +182,28 @@ def wait_for_mode(wanted: str, *, timeout: float = 25.0) -> str:
     return current
 
 
-def cli(*args: str) -> subprocess.CompletedProcess:
+def cli(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
     """Run the product CLI, capturing output through a FILE.
 
-    A pipe would be held open by the detached player that `play` leaves running, so
-    `communicate()` would block until its timeout and the harness would look like it
-    hung. That was a real false alarm during development.
+    Two traps this helper exists to avoid, both hit for real:
+
+    1. A pipe would be held open by the detached player that `play` leaves running, so
+       `communicate()` would block until its timeout and the harness would look like it hung.
+       Hence a file, not a pipe.
+    2. **`play` never returns on its own.** `play.start_play` always passes `--loop`, so the
+       command runs until the player is stopped. A synchronous `play` call therefore always
+       ends in a timeout, no matter how short the clip - which read as "play hung" twice while
+       the deck had in fact consumed 12461 frames. `play` must be treated as a fire-and-hold
+       command: the caller starts it, watches the published diagnostics, and stops it.
+
+    Pass an explicit `timeout` when the command is expected to be long-lived; see
+    `start_play_async` for the pattern the harness uses.
     """
     handle = tempfile.NamedTemporaryFile(prefix="ghostdeck-cli-", suffix=".log", delete=False)
     try:
         result = subprocess.run(
             [sys.executable, "-m", "ghostdeck.cli", *args],
-            stdout=handle, stderr=subprocess.STDOUT, timeout=120,
+            stdout=handle, stderr=subprocess.STDOUT, timeout=timeout,
             cwd=str(ROOT), env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
         )
         result.stdout = Path(handle.name).read_text(errors="replace")
@@ -201,6 +211,23 @@ def cli(*args: str) -> subprocess.CompletedProcess:
         return result
     finally:
         handle.close()
+
+
+def start_play_async(media: str) -> subprocess.Popen:
+    """Start `play` without waiting for it.
+
+    `play` loops until stopped, so it is a fire-and-hold command. The caller watches
+    `HOST_STATE`'s diagnostics for consumption and then calls `cli("stop")`. Output goes to a
+    file for the same reason as `cli()`.
+    """
+    handle = tempfile.NamedTemporaryFile(prefix="ghostdeck-play-", suffix=".log", delete=False)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ghostdeck.cli", "play", media],
+        stdout=handle, stderr=subprocess.STDOUT,
+        cwd=str(ROOT), env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+    )
+    process._ghostdeck_log = handle  # keep the file object alive for the duration
+    return process
 
 
 def host_diagnostics() -> dict:
@@ -334,18 +361,26 @@ def main() -> int:
         print(f"\n== play {media} ==")
         if HOST_STATE.exists():
             HOST_STATE.unlink()
-        result = cli("play", media)
-        check("play exit 0", result.returncode == 0,
-              f"rc={result.returncode} {(result.stdout or '').strip()[:80]}")
-
+        # `play` loops until stopped, so it is started, watched, and then stopped - never
+        # awaited. Awaiting it always times out regardless of clip length (see cli()).
+        player = start_play_async(media)
         peak = {}
-        for _ in range(20):
+        for _ in range(24):
             time.sleep(1.0)
             current = host_diagnostics()
             if (current.get("framesConsumed") or 0) >= (peak.get("framesConsumed") or 0):
                 peak = current
             if (peak.get("framesConsumed") or 0) > 5 and peak.get("firstConsumedReceipt"):
                 break
+            # Do NOT stop waiting when the launcher exits. `ghostdeck play` is a fire-and-hold
+            # launcher: it starts the player, waits out its own A-103 grace window and returns,
+            # and the player only begins publishing consumed frames a second or two AFTER that.
+            # Treating the launcher's exit as failure made a healthy session read as 0 frames.
+            # Only a launcher that exited NON-ZERO is a failure.
+            if player.poll() not in (None, 0) and (peak.get("framesConsumed") or 0) == 0:
+                break
+        check("play started", (peak.get("framesConsumed") or 0) > 0 or player.poll() in (None, 0),
+              f"launcher rc={player.poll()}")
         consumed = peak.get("framesConsumed") or 0
         check("frames consumed by the deck", consumed > 5,
               f"sent={peak.get('framesSent')} consumed={consumed} bytes={peak.get('streamBytesSent')}")
