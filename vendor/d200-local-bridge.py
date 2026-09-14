@@ -1754,9 +1754,16 @@ class DeviceProxy:
                         pass
             if self.transport_socket is not None:
                 try:
+                    self.transport_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
                     self.transport_socket.close()
                 except OSError:
                     pass
+            reader = self.reader
+            if reader is not None and reader is not threading.current_thread():
+                reader.join(timeout=5)
             owned_ports = {self.forward_port, self.replacement_forward_port} - {None}
             self.forward_port = self.replacement_forward_port = None
             forwards_removed = 0

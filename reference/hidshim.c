@@ -642,7 +642,13 @@ static int rpc(const char *operation, uint64_t handle, const char *capability,
         return -1;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    snprintf(address.sun_path, sizeof(address.sun_path), "%s", SOCKET_PATH);
+    {
+        size_t cap = sizeof(address.sun_path);
+        size_t n = strlen(SOCKET_PATH);
+        if (n >= cap) n = cap - 1;
+        memcpy(address.sun_path, SOCKET_PATH, n);
+        address.sun_path[n] = '\0';
+    }
     /* Non-blocking transport: the connect, the request write and the reply read
      * are each bounded by this one absolute deadline, so a peer that accepted
      * the connection and stopped answering cannot block the caller. */

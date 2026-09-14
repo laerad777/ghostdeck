@@ -28,6 +28,7 @@ without the real Studio copy and the deck, and neither is claimed here.
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 import shutil
@@ -222,7 +223,7 @@ def test_each_distinct_reason_is_recorded_once_and_repeats_are_dropped(model, tm
 
     assert result.returncode == 0, result.stderr
     entries = records(destination)
-    assert [entry["errno"] for entry in entries] == [2, 61], (
+    assert [entry["errno"] for entry in entries] == [errno.ENOENT, errno.ECONNREFUSED], (
         "one line per distinct errno, in first-seen order"
     )
     assert [entry["reason"] for entry in entries] == ["absent", "refused"]
@@ -261,7 +262,7 @@ def test_the_log_is_append_only_and_never_truncates_what_is_already_there(model,
     assert result.returncode == 0, result.stderr
     lines = destination.read_text(encoding="utf-8").splitlines()
     assert lines[0] == '{"event":"pre-existing"}'
-    assert [json.loads(line)["errno"] for line in lines[1:]] == [2, 61]
+    assert [json.loads(line)["errno"] for line in lines[1:]] == [errno.ENOENT, errno.ECONNREFUSED]
 
 
 def test_a_symlink_planted_at_the_log_path_is_not_written_through(model, tmp_path):

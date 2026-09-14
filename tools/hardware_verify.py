@@ -109,6 +109,23 @@ def adb_available() -> bool:
     return True
 
 
+def _process_command_line(pid) -> str:
+    """Full argv of pid. Linux `ps -o command=` is the 15-char comm name."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+    except (OSError, TypeError, ValueError):
+        raw = b""
+    if raw:
+        return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+    try:
+        return subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return ""
+
+
 def own_bridges() -> list[int]:
     """Only this repository's bridge.
 
@@ -134,12 +151,7 @@ def is_bridge_pid(pid) -> bool:
     re-read immediately before signalling for exactly that reason.
     """
     marker = str(ROOT / "vendor" / "d200-local-bridge.py")
-    try:
-        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return marker in cmd
+    return marker in _process_command_line(pid)
 
 
 def own_bridge_count() -> int:

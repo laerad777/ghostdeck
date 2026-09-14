@@ -305,6 +305,11 @@ def _socket_state() -> tuple[str, str]:
     """
     if not SOCKET.exists():
         return _ENDPOINT_DEAD, "endpoint is absent"
+    try:
+        if not SOCKET.is_socket():
+            return _ENDPOINT_UNDETERMINABLE, "path exists and is not a socket"
+    except OSError as error:
+        return _ENDPOINT_UNDETERMINABLE, f"{type(error).__name__}: {error}"
     probe = None
     try:
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

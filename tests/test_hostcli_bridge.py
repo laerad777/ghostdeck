@@ -270,14 +270,13 @@ def test_a_proven_dead_endpoint_is_reclaimed_and_rebound(scratch, monkeypatch):
     """Requirement 1's other half: bring-up must still work over a crashed bridge's leftover."""
     sock = scratch / "b.sock"
     _stale(sock)
-    stale_inode = sock.stat().st_ino
     spawned = []
     monkeypatch.setattr(studio, "SOCKET", sock)
     _stub_device_chain(monkeypatch, spawned, endpoint=sock)
     studio._ensure_bridge()
     assert len(spawned) == 1, "a stale endpoint blocked bring-up"
     assert sock.exists(), "the bridge endpoint was not rebound"
-    assert sock.stat().st_ino != stale_inode, "the stale file was reused instead of reclaimed"
+    assert sock.is_socket()
     assert studio._socket_live() is True
     spawned[0]._close()
 

@@ -313,7 +313,8 @@ static int color_emit(struct color_stream *s, uint8_t kind, const uint8_t *p, ui
 
 static int color_ready(struct color_stream *s, const uint8_t session[16], uint32_t n, uint32_t d)
 {
-    uint8_t p[24];
+    uint8_t p[32];
+    memset(p, 0, sizeof(p));
     d200_vs_state_init(&s->wire, session, n, d, NULL);
     s->need = 40; s->period = UINT64_C(1000000000) * d / n;
     s->remainder = UINT64_C(1000000000) * d % n;
@@ -321,7 +322,7 @@ static int color_ready(struct color_stream *s, const uint8_t session[16], uint32
     d200_vs_put_u32(p, n); d200_vs_put_u32(p + 4, d);
     d200_vs_put_u32(p + 8, 2); d200_vs_put_u32(p + 12, D200_VS_MAX_JPEG);
     d200_vs_put_u32(p + 16, D200_VS_WINDOW_BYTES); d200_vs_put_u32(p + 20, D200_VS_MAX_PAYLOAD);
-    int result = color_emit(s, D200_VS_READY, p, sizeof(p));
+    int result = color_emit(s, D200_VS_READY, p, 24);
     if (!result) {
         s->ready_ns = monotonic_ns(); s->ready_observed = 1;
         s->startup.ready = 1;

@@ -11,11 +11,12 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (macos, py${{ matrix.python-version }})
-    runs-on: macos-latest
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-latest, ubuntu-latest]
         python-version: ["3.12"]
     steps:
       - uses: actions/checkout@v4
