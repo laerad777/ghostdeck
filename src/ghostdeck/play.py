@@ -455,6 +455,16 @@ def _signal_vendor_players() -> None:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if not _vendor_player_pids():
+            return
+        time.sleep(0.1)
+    for pid in _vendor_player_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 def _signal_host_stated_player() -> None:
     """SIGTERM the pid published in host json if it is the vendor player.
