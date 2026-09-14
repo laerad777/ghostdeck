@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ghostdeck import cli
@@ -103,6 +104,17 @@ def youtube_watch_url(href: str) -> str:
     if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live", "v"):
         return f"https://www.youtube.com/watch?v={parts[1]}"
     return ""
+
+def ensure_store_id(path: Path, mint) -> str:
+    """One UUID for WKWebsiteDataStore so YouTube login and cache survive relaunch."""
+    if path.is_file():
+        text = path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    value = str(mint()).strip()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value + "\n", encoding="utf-8")
+    return value
 
 
 class DeckRemote:
@@ -239,7 +251,7 @@ def main() -> int:
             self = objc.super(Controller, self).init()
             self.busy = False
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 1020, 740),
+                NSMakeRect(0, 0, 390, 844),
                 NSWindowStyleMaskTitled
                 | NSWindowStyleMaskClosable
                 | NSWindowStyleMaskMiniaturizable
@@ -249,31 +261,49 @@ def main() -> int:
             )
             self.window.setTitle_("ghostdeck")
             self.window.setReleasedWhenClosed_(False)
-            self.window.setMinSize_((640, 480))
+            self.window.setMinSize_((320, 560))
             self.window.center()
             view = self.window.contentView()
 
             config = WKWebViewConfiguration.alloc().init()
+            from Foundation import NSUUID
+            from WebKit import WKWebsiteDataStore
+
+            uid = NSUUID.alloc().initWithUUIDString_(
+                ensure_store_id(
+                    Path.home() / ".ghostdeck" / "webkit-store-id",
+                    lambda: str(NSUUID.UUID().UUIDString()),
+                )
+            )
+            config.setWebsiteDataStore_(WKWebsiteDataStore.dataStoreForIdentifier_(uid))
+            prefs = config.defaultWebpagePreferences()
+            if prefs is not None:
+                prefs.setPreferredContentMode_(1)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(0, 56, 1020, 684),
+                NSMakeRect(0, 72, 390, 772),
                 config,
             )
             self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            self.web.setCustomUserAgent_(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
+                "Mobile/15E148 Safari/604.1"
+            )
             view.addSubview_(self.web)
             self.web.loadRequest_(
-                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
+                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://m.youtube.com"))
             )
 
-            self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(12, 32, 520, 18))
+            self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 48, 374, 18))
             self.status.setEditable_(False)
             self.status.setBezeled_(False)
             self.status.setDrawsBackground_(False)
-            self.status.setFont_(NSFont.userFixedPitchFontOfSize_(11))
+            self.status.setFont_(NSFont.userFixedPitchFontOfSize_(10))
             self.status.setStringValue_("usb=? shim=? copy=? playing=?")
             self.status.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.status)
 
-            play_btn = NSButton.alloc().initWithFrame_(NSMakeRect(540, 24, 110, 28))
+            play_btn = NSButton.alloc().initWithFrame_(NSMakeRect(8, 18, 118, 28))
             play_btn.setTitle_("이 영상 재생")
             play_btn.setBezelStyle_(NSBezelStyleRounded)
             play_btn.setTarget_(self)
@@ -282,7 +312,7 @@ def main() -> int:
             view.addSubview_(play_btn)
             self.play_btn = play_btn
 
-            stop_btn = NSButton.alloc().initWithFrame_(NSMakeRect(656, 24, 72, 28))
+            stop_btn = NSButton.alloc().initWithFrame_(NSMakeRect(130, 18, 60, 28))
             stop_btn.setTitle_("정지")
             stop_btn.setBezelStyle_(NSBezelStyleRounded)
             stop_btn.setTarget_(self)
@@ -291,7 +321,7 @@ def main() -> int:
             view.addSubview_(stop_btn)
             self.stop_btn = stop_btn
 
-            open_btn = NSButton.alloc().initWithFrame_(NSMakeRect(734, 24, 72, 28))
+            open_btn = NSButton.alloc().initWithFrame_(NSMakeRect(194, 18, 56, 28))
             open_btn.setTitle_("파일")
             open_btn.setBezelStyle_(NSBezelStyleRounded)
             open_btn.setTarget_(self)
@@ -299,13 +329,13 @@ def main() -> int:
             open_btn.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(open_btn)
 
-            self.note = NSTextField.alloc().initWithFrame_(NSMakeRect(12, 8, 996, 16))
+            self.note = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 2, 374, 14))
             self.note.setEditable_(False)
             self.note.setBezeled_(False)
             self.note.setDrawsBackground_(False)
-            self.note.setFont_(NSFont.labelFontOfSize_(11))
+            self.note.setFont_(NSFont.labelFontOfSize_(10))
             self.note.setTextColor_(NSColor.secondaryLabelColor())
-            self.note.setStringValue_("영상을 열고 이 영상 재생. 정지 후 Studio가 켜져 있으면 덱은 ADB입니다.")
+            self.note.setStringValue_("영상을 열고 재생. Studio가 켜져 있으면 덱은 ADB입니다.")
             self.note.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.note)
 

@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from ghostdeck.app import (
     CommandResult,
     DeckRemote,
+    ensure_store_id,
     read_pasteboard,
     resolve_source,
     shim_is_up,
@@ -47,10 +48,19 @@ def test_youtube_watch_url_keeps_only_the_video_id():
     watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert youtube_watch_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=12s") == watch
     assert youtube_watch_url("https://youtu.be/dQw4w9WgXcQ") == watch
+    assert youtube_watch_url("https://m.youtube.com/watch?v=dQw4w9WgXcQ") == watch
     assert youtube_watch_url("https://www.youtube.com/shorts/dQw4w9WgXcQ") == watch
     assert youtube_watch_url("https://www.youtube.com/embed/dQw4w9WgXcQ") == watch
     assert youtube_watch_url("https://www.youtube.com/results?search_query=x") == ""
     assert youtube_watch_url("https://www.youtube.com/") == ""
+
+
+def test_ensure_store_id_reuses_the_same_uuid(tmp_path):
+    path = tmp_path / "webkit-store-id"
+    first = ensure_store_id(path, lambda: "11111111-1111-1111-1111-111111111111")
+    second = ensure_store_id(path, lambda: "22222222-2222-2222-2222-222222222222")
+    assert first == "11111111-1111-1111-1111-111111111111"
+    assert second == first
 
 
 def test_empty_field_plays_a_copied_url():
