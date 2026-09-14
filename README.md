@@ -1,239 +1,122 @@
 # ghostdeck
 
-Play JPEG video on a Ulanzi D200-class deck from macOS. Keys during ADB
-play go through a local hidshim copy of Studio (`ghostdeck studio`), not
-through a userspace virtual HID.
+[![ci](https://github.com/laerad777/ghostdeck/actions/workflows/ci.yml/badge.svg)](https://github.com/laerad777/ghostdeck/actions/workflows/ci.yml)
 
-Version **0.1.0**. License: MIT (see `LICENSE` and `NOTICE`).
-Korean: [README.ko.md](README.ko.md).
+Play JPEG video on a Ulanzi D200 from macOS. While the deck is in ADB, Studio
+keys go through a **local hidshim copy** started by `ghostdeck studio`.
 
-ghostdeck does **not** redistribute Studio.app, vendor firmware, or
-kernel modules. It never sets gadget `functions=hid,adb`.
+Version **0.1.0**. MIT (`LICENSE`, `NOTICE`). Korean: [README.ko.md](README.ko.md).
+
+This is a **checkout**, not a PyPI package. A wheel of `ghostdeck` cannot see
+`vendor/`, `device/`, or `reference/`. Clone the repo and install editable.
+
+Official Studio.app, vendor firmware, and kernel modules are not shipped.
+The gadget is never set to `functions=hid,adb`. Device serials are discovered
+at runtime, never committed.
 
 ## Requirements
 
-- macOS (0.1.0 target; Linux is documentation only)
+- macOS (0.1.0)
 - Python 3.11+
-- git
+- `adb`, `ffmpeg`, `ffprobe` on `PATH` (`yt-dlp` only for URLs)
+- `hidapi` and `pyusb` (the `device` extra)
+- Official `/Applications/Ulanzi Studio.app` if you want Studio keys
+- `~/.ghostdeck/bin/d200-color-agent` (ARM Linux binary; see below)
 
-`ghostdeck play`, `stop`, `detect`, and `status` run these from `PATH`:
-
-- `adb` (Android SDK [platform-tools](https://developer.android.com/tools/releases/platform-tools))
-- `ffmpeg`
-- `ffprobe` (ships with ffmpeg; `play` probes the source with it first)
-- `yt-dlp` only if you play URLs
-
-`ghostdeck` also needs two Python backends, installed as the `device`
-extra (see Install):
-
-- `hidapi` — the HID backend: `detect` and `status` read the deck's serial
-  and presence through it, and `play` writes the `0x00ff` report through it
-  to move the deck to ADB.
-- `pyusb` — the USB backend: ADB-mode presence is observed by enumerating
-  the bus with it, which is also how `play` waits for the switch to land.
-
-Neither is optional in 0.1.0: `detect`, `status` and `play` cannot report
-or act without them. Each prints a single install hint and exits `2` before
-it reaches hardware. Commands that never talk to the deck, such as `build`
-and `quit`, still run.
-
-`ghostdeck build` compiles the device helpers and the hidshim Studio copy, so it needs:
-
-- `armv7-linux-gnueabihf-gcc`, an ARM Linux cross toolchain (also needed the first time `play` builds the device binaries)
-- Xcode command line tools: `clang`, `xcrun`, `install_name_tool`, `codesign`, `ditto`
-- the official `/Applications/Ulanzi Studio.app` installed
-
-ARM device binaries (`d200-zkgui-proxy`, `libd200-zkgui-preload.so`,
-`d200-color-agent`) are not git files; there is no download step.
-`ghostdeck build` compiles the proxy and preload from `device/*.c` with
-`armv7-linux-gnueabihf-gcc` into `~/.ghostdeck/bin/`. `d200-color-agent`
-is not compiled for you.
-
-To build it, run `device/build-color-agent.sh`. That script enforces two
-prerequisites, and a stock macOS machine does not meet the second:
-
-1. an ARMv7 Linux cross toolchain providing `armv7-linux-gnueabihf-gcc`
-   (Homebrew: `brew install armv7-unknown-linux-gnueabihf` — the formula
-   name differs from the binary name);
-2. an **ARM Linux** static `libturbojpeg.a` and its `turbojpeg.h`.
-
-Homebrew's `jpeg-turbo` does **not** satisfy the second one: it installs a
-Mach-O arm64 archive, which cannot be linked into an ARM Linux binary. The
-script detects this and exits 1, printing:
-
-> build-color-agent.sh: .../libturbojpeg.a contains no ELF object members
-> (first inspected member: Mach-O object (magic cffaedfe)). A macOS/Homebrew
-> or Windows libturbojpeg cannot be linked into an ARM Linux binary. ...
-
-The only path 0.1.0 offers is a real ARM Linux libturbojpeg, such as
-Debian/Ubuntu's `libturbojpeg0-dev`, pointed at explicitly:
-
-```bash
-TURBOJPEG_INC=/usr/arm-linux-gnueabihf/include \
-TURBOJPEG_LIB=/usr/arm-linux-gnueabihf/lib \
-  device/build-color-agent.sh
-```
-
-0.1.0 has **no turnkey way to produce the agent on macOS**, and no download:
-provision a prebuilt `d200-color-agent` at `~/.ghostdeck/bin/d200-color-agent`,
-or point `GHOSTDECK_AGENT_SOURCE` at one. Until one of those is present,
-`ghostdeck build` fails at the agent step: it never adopts a binary from
-outside the tree unless that variable names it, and it says so on stderr
-when it does.
+`detect`, `status`, and `play` exit `2` with an install hint if `hidapi` or
+`pyusb` is missing. `build` and `quit` do not need them.
 
 ## Install
 
-This directory is the public repository root. Do not publish the parent lab tree.
-
 ```bash
-git init
+git clone https://github.com/laerad777/ghostdeck.git
+cd ghostdeck
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[device]"
-ghostdeck build
 ```
 
-The `device` extra is what installs `hidapi` and `pyusb`; it is the
-documented install. A plain `python -m pip install -e .` installs neither,
-and then `detect`, `status` and `play` exit `2` with
-`hidapi is not installed (pip install hidapi)` (or the `pyusb` equivalent)
-before they reach the deck.
-
-`ghostdeck build` compiles hidshim into a local Studio copy (from
-`/Applications/Ulanzi Studio.app`) and ARM device helpers into
-`~/.ghostdeck/bin`. It needs the ARM cross toolchain and the Xcode
-command line tools, not `adb` or `ffmpeg`. It also needs
-`~/.ghostdeck/bin/d200-color-agent` to exist already; see above.
-
-Put `adb` and `ffmpeg` on `PATH` before `play`. Example (Homebrew ffmpeg
-plus Google platform-tools):
+Put `adb` and `ffmpeg` on `PATH`. Homebrew ffmpeg plus Android
+platform-tools is enough:
 
 ```bash
 export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 ```
 
-`play` needs one more thing that is not on `PATH`: the **hidshim bridge**
-must already be running. The player reaches the deck through
-`/tmp/d200-adb-bridge.sock` before it opens a stream, so the order is
-**`ghostdeck studio` first, then `ghostdeck play`**. `ghostdeck studio`
-starts both the bridge and the local Studio copy; opening
-`~/Applications/Ulanzi Studio ADB.app` by hand is not enough, because
-without the bridge that copy's shim enumerates no device at all.
+### Device agent
 
-With no bridge running, `play` refuses before it spawns the player and
-names `ghostdeck studio` in one line. `stop`, `detect`, and `status` never
-use the bridge and keep working while it is down.
+`d200-color-agent` is not in git and is not a one-command macOS build. Put a
+prebuilt ARM Linux binary at `~/.ghostdeck/bin/d200-color-agent`, or point
+`GHOSTDECK_AGENT_SOURCE` at one. `device/build-color-agent.sh` needs an ARMv7
+Linux cross gcc **and** an ARM Linux `libturbojpeg.a` (Homebrew jpeg-turbo is
+Mach-O and will be refused).
 
-Simultaneous Studio keys need a **local** copy of official Studio with
-hidshim (`~/Applications/Ulanzi Studio ADB.app`); that copy is built
-locally. The official `/Applications/Ulanzi Studio.app` is never
-written or shipped.
+`ghostdeck build` compiles the zkgui proxy/preload and the hidshim Studio
+copy. It needs Xcode CLT (`clang`, `codesign`, `ditto`, …) and the official
+Studio app. It still fails at the agent step until that binary exists.
+
+## Use
+
+```bash
+ghostdeck studio          # hidshim copy + bridge; run this first
+ghostdeck play video.mp4  # JPEG play over ADB
+ghostdeck stop            # stop the player; Studio stays if it is up
+```
+
+Do not open `~/Applications/Ulanzi Studio ADB.app` by hand. Without the
+bridge that copy's shim sees no device.
 
 ## Commands
 
-| Command | Purpose |
+| Command | What it does |
 | --- | --- |
-| `ghostdeck detect` | Print serial, VID/PID, and USB mode (HID `2207:0019` or ADB `18d1:d002`). Fails if no deck is found. Serial is discovered at runtime; it is not baked into the source. |
-| `ghostdeck play FILE\|URL` | ADB JPEG play through the running hidshim bridge. **Start the bridge with `ghostdeck studio` first**; with none running, `play` refuses and spawns nothing. |
-| `ghostdeck studio` | **Run this before `play`.** Launch the **local** hidshim copy (`~/Applications/Ulanzi Studio ADB.app`) and start the hidshim bridge that `play` connects to. Official `/Applications/Ulanzi Studio.app` is not written. |
-| `ghostdeck stop` | Stop the player. If the hidshim bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is live, leave the gadget in ADB (Studio keeps the keys). |
-| `ghostdeck quit` | Tear down the IOHID keeper if any. It is not the key path. |
-| `ghostdeck status` | USB mode, shim copy, IOHID, playing. |
+| `ghostdeck studio` | Start the local hidshim copy and the bridge `play` talks to. Does not write official Studio. |
+| `ghostdeck play FILE\|URL` | Play through the running bridge. Refuses if the bridge is down. |
+| `ghostdeck stop` | Stop the player. If the bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is up, leave the deck in ADB so Studio keys keep working. |
+| `ghostdeck detect` | Serial, VID/PID, USB mode. Fails if no deck. |
+| `ghostdeck status` | USB mode, shim copy, playing. |
+| `ghostdeck quit` | Stop the unused IOHID keeper, if any. |
 
-`ffmpeg`, `ffprobe`, and `adb` missing: `play` fails. `yt-dlp` missing:
-URL sources fail; local files still play. No bridge running: `play` fails
-before it spawns the player; `stop`, `detect`, and `status` are unaffected.
+`play` is a launcher: it returns after the player has survived a short grace
+window. The player keeps looping until `stop`.
 
-Host state lives in `~/.ghostdeck/state.json`. `ghostdeck studio` appends
-the hidshim bridge's stdout and stderr to `/tmp/d200-local-bridge.log`;
-other logs go to the terminal.
+## Stop vs Studio
 
-### Who cleans up what
-
-Three different things own three different pieces of state, and only one of
-them is a `ghostdeck` command:
+Three owners, one of them a `ghostdeck` command:
 
 | Owner | Owns | Released by |
 | --- | --- | --- |
-| `ghostdeck stop` | the player; stock UI and `/tmp/ghostdeck-*` **only when the bridge is down** | running `ghostdeck stop` |
-| the **bridge** (`ghostdeck studio`) | the staged agent `/tmp/d200-color-agent`, the `/dev/fb0` black-out, and the ADB-mode hold on the deck | the bridge process exiting |
+| `ghostdeck stop` | the player; stock UI and `/tmp/ghostdeck-*` only when the bridge is **down** | `ghostdeck stop` |
+| the bridge (`ghostdeck studio`) | staged `/tmp/d200-color-agent`, framebuffer black-out, ADB hold | quitting the bridge / hidshim copy |
 
-Two consequences worth knowing before you go looking for the wrong command:
+There is no `ghostdeck` command that stops the bridge. If `stop` exits `0`
+and the deck is still ADB with Studio open, that is expected. To return to
+HID: quit the hidshim copy, then `ghostdeck stop`.
 
-- **`ghostdeck stop` does not stop the bridge and does not remove
-  `/tmp/d200-color-agent`.** No `ghostdeck` command stops the bridge: it is a
-  separate long-lived process. While it is running, `stop` kills the player
-  and does **not** bounce `zkswe`; the deck stays ADB so Studio keys keep
-  working. The staged agent is cleaned up by the bridge's own teardown.
-- **The deck returns to HID only once the bridge is gone, then `stop` (or
-  a replug).** If `stop` exited `0` and the deck still enumerates as ADB
-  with Studio open, that is expected. Quit the hidshim copy / bridge first
-  if you want HID back, then `ghostdeck stop`.
+## Exit codes
 
-The bridge is not stopped on your behalf because a bridge it did not start may
-be someone else's — including one a test or another tool is using. Any tool
-that starts a bridge owns exactly the process it created, and releases only
-that one. That is also why `play` refuses when no bridge is running instead of
-starting one: it would then own a long-lived process it does not wait for and
-never cleans up. `ghostdeck studio` is the command that owns a bridge.
+| Code | Meaning |
+| --- | --- |
+| `0` | success (`status` also uses `0` when no deck is attached) |
+| `1` | no deck, or another failure |
+| `2` | missing `hidapi` / `pyusb` |
+| `3` | deck is attached as ADB but the transport will not run a command (`offline`) |
 
-## If the deck is attached but stops answering
+`detect` and `status` only read `adb devices`. They never restart the adb
+server. Nothing is sent to a device that is not identified as the D200.
 
-A deck can end up enumerated on USB as ADB while its `adbd` does not
-answer. `adb devices -l` then lists it in a state that is not `device`,
-usually `offline`:
+An `offline` deck is not a missing cable. Host-side reconnects do not recover
+it; power-cycle or replug, then retry.
 
-```
-<serial>      offline usb:18092032X transport_id:1
-```
+## Out of scope
 
-Nothing on the host recovers this. On the deck this project was developed
-against, a 160-second wait, three `adb kill-server`/`start-server` cycles,
-`adb reconnect`, and a USB reset were all tried, and none of them worked.
-**Power-cycle the deck, or replug its USB cable, and then re-run the
-command.** An attached deck that is merely `offline` is not the same thing
-as a deck that is absent, and it is not a cabling problem.
+- PyPI / a self-contained wheel
+- Linux as a supported host in 0.1.0
+- `functions=hid,adb`, firmware, kernel modules
+- Redistributing Studio.app
+- ARM binaries in git
+- Hard-coded serials
 
-`ghostdeck` distinguishes the three states instead of reporting `no device`:
+## License
 
-| State | `detect` | `status` | `stop` |
-| --- | --- | --- | --- |
-| usable | exit `0`, `mode=adb` | exit `0`, `usb=adb` | restores the deck |
-| attached, adb transport not answering | exit `3`, `mode=adb (offline)` | exit `3`, `usb=adb (offline)` | refuses, names the serial and the state, sends nothing to the deck |
-| absent | exit `1`, `no device` | exit `0`, `usb=none` | exit `1`, names the deck as absent |
-
-Exit codes: `0` success, `1` no deck or another failure, `2` the Python
-environment is unusable (a missing `hidapi` or `pyusb`), `3` the deck is
-attached but its adb transport cannot run a command.
-
-`detect` and `status` are reporting commands and only read `adb devices`:
-they never restart the adb server, and no command is ever sent to a device
-that could not be identified as the deck.
-
-## Plugins
-
-Drop scripts in `~/.ghostdeck/plugins`. The 0.1.0 folder is documented
-and created as needed; the call protocol is **not** frozen. These are
-not Ulanzi Studio store plugins.
-
-## Simultaneous (hidshim)
-
-Physical USB cannot enumerate HID and ADB at once. `play` puts the real
-deck on ADB. Official Studio does not see a fake USB device.
-
-Simultaneous keys use **hidshim** in a **local copy**:
-`~/Applications/Ulanzi Studio ADB.app`. That copy's `libhidapi.0.dylib`
-is our shim (`2207:0019` / `ulanzi` inside the process, unix socket
-`/tmp/d200-adb-bridge.sock`). `ghostdeck studio` opens that copy and starts
-the bridge the shim talks to, so it must be running before `play`.
-
-Official `/Applications/Ulanzi Studio.app` is never written or shipped.
-IOHIDUserDevice is a failed Apple-entitlement spike, not the product path.
-Hardware deck buttons during ADB play are best-effort.
-
-## What this project will not do
-
-- Set `functions=hid,adb` or flash firmware
-- Redistribute Studio.app
-- Commit ARM binaries to git
-- Hard-code a device serial
+MIT. PRs need `Signed-off-by` (DCO). See [CONTRIBUTING.md](CONTRIBUTING.md).
