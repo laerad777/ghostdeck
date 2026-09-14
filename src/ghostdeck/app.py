@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import json
+import math
 import re
 import subprocess
 import sys
@@ -133,6 +135,30 @@ def should_start_play(seen: str, href: str, media_src: str = "") -> str:
         return ""
     return source
 
+def play_offset(seconds) -> float:
+    """A --start value. Junk becomes 0."""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value < 0:
+        return 0.0
+    return value
+
+def parse_watch_payload(raw) -> tuple[str, float]:
+    """url and currentTime from the page, or (raw, 0) if it is just a URL."""
+    if isinstance(raw, dict):
+        return str(raw.get("url") or ""), play_offset(raw.get("t"))
+    text = str(raw or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return text, 0.0
+        if isinstance(data, dict):
+            return str(data.get("url") or ""), play_offset(data.get("t"))
+    return text, 0.0
+
 def is_google_login_host(host: str) -> bool:
     """accounts.google.* is a desktop WebAuthn page; mobile YouTube asks for Bluetooth instead."""
     host = (host or "").lower().split(":")[0]
@@ -175,7 +201,7 @@ class DeckRemote:
     def stop(self) -> CommandResult:
         return self._run(["stop"])
 
-    def play(self, source: str, pasteboard: str = "") -> list[CommandResult]:
+    def play(self, source: str, pasteboard: str = "", start: float = 0.0, loop: bool = True) -> list[CommandResult]:
         source = resolve_source(source, pasteboard)
         if not source:
             return [CommandResult(["play"], 2, "", "유튜브에서 영상을 연 다음 재생을 누르십시오")]
@@ -186,18 +212,24 @@ class DeckRemote:
             results.append(self._run(["studio"]))
             if results[-1].code != 0:
                 return results
-        results.append(self._run(["play", source]))
+        argv = ["play", source]
+        start = play_offset(start)
+        if start > 0:
+            argv.extend(["--start", f"{start:.3f}"])
+        if not loop:
+            argv.append("--no-loop")
+        results.append(self._run(argv))
         return results
 
 
-def _busy_call(remote: DeckRemote, op: str, source: str, pasteboard: str, done) -> None:
+def _busy_call(remote: DeckRemote, op: str, source: str, pasteboard: str, done, start=0.0, loop=True) -> None:
     try:
         if op == "status":
             results = [remote.status()]
         elif op == "stop":
             results = [remote.stop()]
         else:
-            results = remote.play(source, pasteboard)
+            results = remote.play(source, pasteboard, start=start, loop=loop)
         done(results, None)
     except Exception as error:
         done([], error)
@@ -270,13 +302,21 @@ def main() -> int:
     return id ? ('https://www.youtube.com/watch?v=' + id) : String(location.href);
   }
   window.__ghostdeckWatch = watchUrl;
+  window.__ghostdeckNow = function(){
+    var v = document.querySelector('video');
+    return JSON.stringify({
+      url: watchUrl(),
+      t: (v && isFinite(v.currentTime)) ? v.currentTime : 0
+    });
+  };
   function post(type){
     try {
       var v = document.querySelector('video');
       window.webkit.messageHandlers.ghostdeck.postMessage({
         type: type,
         url: watchUrl(),
-        src: (v && v.currentSrc) ? String(v.currentSrc) : ''
+        src: (v && v.currentSrc) ? String(v.currentSrc) : '',
+        t: (v && isFinite(v.currentTime)) ? v.currentTime : 0
       });
     } catch (e) {}
   }
@@ -309,12 +349,14 @@ def main() -> int:
     def _gui_apply(ctrl, results, error) -> None:
         _gui_set_busy(ctrl, False)
         pending = getattr(ctrl, "pending_source", "")
+        pending_start = getattr(ctrl, "pending_start", 0.0)
         ctrl.pending_source = ""
+        ctrl.pending_start = 0.0
         if error is not None:
             ctrl.seen_watch = ""
             ctrl.note.setStringValue_(f"{type(error).__name__}: {error}")
             if pending:
-                _gui_kick(ctrl, "play", pending)
+                _gui_kick(ctrl, "play", pending, start=pending_start)
             return
         for item in results:
             if item.argv[:1] == ["status"] and item.stdout.strip():
@@ -322,7 +364,7 @@ def main() -> int:
         last = results[-1] if results else None
         if last is None:
             if pending:
-                _gui_kick(ctrl, "play", pending)
+                _gui_kick(ctrl, "play", pending, start=pending_start)
             return
         if last.code != 0:
             ctrl.seen_watch = ""
@@ -333,15 +375,16 @@ def main() -> int:
         elif last.argv[:1] == ["play"]:
             if len(last.argv) > 1:
                 ctrl.seen_watch = last.argv[1]
-            ctrl.note.setStringValue_("덱에서 재생. 루프는 정지까지 계속됩니다.")
+            ctrl.note.setStringValue_("덱에서 재생. 창과 완전 싱크는 안 됩니다.")
         elif last.argv[:1] == ["studio"]:
             ctrl.note.setStringValue_("Studio 브리지를 시작했습니다.")
         if pending:
-            _gui_kick(ctrl, "play", pending)
+            _gui_kick(ctrl, "play", pending, start=pending_start)
 
-    def _gui_kick(ctrl, op: str, source: str) -> None:
+    def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False) -> None:
         if ctrl.busy and op == "play":
             ctrl.pending_source = source
+            ctrl.pending_start = play_offset(start)
             return
         if ctrl.busy and op != "status":
             return
@@ -357,25 +400,28 @@ def main() -> int:
                 source,
                 pasteboard,
                 lambda r, e: AppHelper.callAfter(lambda: _gui_apply(ctrl, r, e)),
+                play_offset(start),
+                False if op == "play" else loop,
             ),
             daemon=True,
         )
         thread.start()
 
-    def _gui_follow(ctrl, href: str) -> None:
+    def _gui_follow(ctrl, href: str, start: float = 0.0) -> None:
         _seen, action = page_follow_action(getattr(ctrl, "seen_watch", ""), href)
         if not action:
             return
         if action == "stop":
             _gui_kick(ctrl, "stop", "")
             return
-        _gui_kick(ctrl, "play", action)
+        _gui_kick(ctrl, "play", action, start=start)
 
     class Controller(NSObject):
         def init(self):
             self = objc.super(Controller, self).init()
             self.busy = False
             self.pending_source = ""
+            self.pending_start = 0.0
             self.seen_watch = ""
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, 420, 844),
@@ -506,20 +552,17 @@ def main() -> int:
         def play_(self, _sender):
             ctrl = self
 
-            def after(href, _err):
-                page = href if isinstance(href, str) else _gui_href(ctrl)
-                source = should_start_play(getattr(ctrl, "seen_watch", ""), page)
-                if source:
-                    _gui_kick(ctrl, "play", source)
-                    return
+            def after(raw, _err):
+                page, start = parse_watch_payload(raw)
+                page = page or _gui_href(ctrl)
                 watch = youtube_watch_url(page) or playable_source(page)
                 if watch:
-                    _gui_kick(ctrl, "play", watch)
+                    _gui_kick(ctrl, "play", watch, start=start)
                     return
                 ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
 
             self.web.evaluateJavaScript_completionHandler_(
-                "window.__ghostdeckWatch ? window.__ghostdeckWatch() : window.location.href",
+                "window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href",
                 after,
             )
 
@@ -528,12 +571,13 @@ def main() -> int:
                 _gui_kick(self, "status", "")
             ctrl = self
 
-            def after(href, _err):
-                page = href if isinstance(href, str) else _gui_href(ctrl)
-                _gui_follow(ctrl, page)
+            def after(raw, _err):
+                page, start = parse_watch_payload(raw)
+                page = page or _gui_href(ctrl)
+                _gui_follow(ctrl, page, start=start)
 
             self.web.evaluateJavaScript_completionHandler_(
-                "window.__ghostdeckWatch ? window.__ghostdeckWatch() : window.location.href",
+                "window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href",
                 after,
             )
 
@@ -542,23 +586,25 @@ def main() -> int:
             kind = ""
             href = ""
             src = ""
+            start = 0.0
             try:
                 kind = str(body.objectForKey_("type") or "")
                 href = str(body.objectForKey_("url") or "")
                 src = str(body.objectForKey_("src") or "")
+                start = play_offset(body.objectForKey_("t"))
             except Exception:
                 if isinstance(body, dict):
                     kind = str(body.get("type") or "")
                     href = str(body.get("url") or "")
                     src = str(body.get("src") or "")
+                    start = play_offset(body.get("t"))
             href = href or _gui_href(self)
             if kind == "play":
                 source = should_start_play(getattr(self, "seen_watch", ""), href, src)
-                if source and not self.busy:
-                    self.seen_watch = source
-                    _gui_kick(self, "play", source)
+                if source:
+                    _gui_kick(self, "play", source, start=start)
                 return
-            _gui_follow(self, href)
+            _gui_follow(self, href, start=start)
 
         def webView_didCommitNavigation_(self, webView, _nav):
             if webView is not self.web:

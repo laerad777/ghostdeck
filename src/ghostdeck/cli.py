@@ -58,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("gui")
     p_play = sub.add_parser("play")
     p_play.add_argument("source")
+    p_play.add_argument("--fit", choices=("auto", "pad", "cover"), default="auto")
+    p_play.add_argument("--start", type=float, default=0)
+    p_play.add_argument("--no-loop", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.cmd in _NEEDS_TREE:
@@ -69,7 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "status":
             return _status()
         if args.cmd == "play":
-            playmod.start_play(args.source)
+            playmod.start_play(
+                args.source,
+                fit=args.fit,
+                start=args.start,
+                loop=not args.no_loop,
+            )
             return 0
         if args.cmd == "stop":
             playmod.stop()

@@ -488,7 +488,7 @@ def _kill_play(*, keep_record: bool = False) -> None:
         _clear_play_records()
 
 
-def start_play(source: str, fit: str = "auto") -> None:
+def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = True) -> None:
     _require_tools(source)
     adb.require_adb()
     # Before any device work: an unusable SOURCE must fail cheaply and name the user's own input,
@@ -527,21 +527,27 @@ def start_play(source: str, fit: str = "auto") -> None:
     env = dict(os.environ)
     env["GHOSTDECK_SERIAL"] = found.get("serial") or _deck_serial() or ""
     env["PYTHONPATH"] = str(VENDOR_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+    argv = [
+        sys.executable,
+        "-B",
+        "-u",
+        str(VENDOR_PLAY),
+        source,
+        "--fps",
+        "source",
+        "--quality",
+        "12",
+        "--crop",
+        "auto",
+        "--fit",
+        fit,
+    ]
+    if loop:
+        argv.append("--loop")
+    if start > 0:
+        argv.extend(["--start", f"{start:.3f}"])
     proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-B",
-            "-u",
-            str(VENDOR_PLAY),
-            source,
-            "--fps",
-            "source",
-            "--quality",
-            "12",
-            "--crop",
-            "auto",
-            "--loop",
-        ],
+        argv,
         start_new_session=True,
         env=env,
     )

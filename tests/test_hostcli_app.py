@@ -19,6 +19,8 @@ from ghostdeck.app import (
     youtube_watch_url,
     playable_source,
     should_start_play,
+    play_offset,
+    parse_watch_payload,
 )
 
 
@@ -92,6 +94,34 @@ def test_should_start_play_ignores_the_same_youtube_video():
     watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert should_start_play(watch, watch, "https://rr.googlevideo.com/videoplayback") == ""
     assert should_start_play("", watch) == watch
+
+
+def test_play_offset_and_watch_payload():
+    assert play_offset(-3) == 0.0
+    assert play_offset("12.5") == 12.5
+    assert parse_watch_payload('{"url":"https://www.youtube.com/watch?v=x","t":9.25}') == (
+        "https://www.youtube.com/watch?v=x",
+        9.25,
+    )
+
+
+def test_gui_play_passes_start_and_does_not_loop():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv[:1] == ["status"]:
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        return CommandResult(argv, 0, "", "")
+
+    DeckRemote(run).play("https://www.youtube.com/watch?v=dQw4w9WgXcQ", start=15.2, loop=False)
+    assert calls[-1] == [
+        "play",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "--start",
+        "15.200",
+        "--no-loop",
+    ]
 
 
 def test_empty_field_plays_a_copied_url():
