@@ -156,7 +156,9 @@ def detect_crop(source):
         sample = min(8.0, max(2.0, duration - start))
         result = run("ffmpeg", "-hide_banner", "-ss", f"{start:.3f}", "-i", source,
                      "-t", f"{sample:.3f}",
-                     "-vf", "fps=2,cropdetect=8:2:0", "-f", "null", "-",
+                     # 8 misses compressed letterbox (iris 1080p: 8→1920x1080,
+                     # 24→1920:804:0:138). Round 2, reset 0 stay.
+                     "-vf", "fps=2,cropdetect=24:2:0", "-f", "null", "-",
                      check=False, capture=True)
         candidates = re.findall(r"crop=(\d+:\d+:\d+:\d+)", result.stderr or "")
         if not candidates:
