@@ -2042,3 +2042,19 @@ def test_stop_does_not_relaunch_a_running_hidshim_copy(monkeypatch):
     monkeypatch.setattr(studio, "launch", lambda: launched.append("launch"))
     play.stop()
     assert launched == []
+
+def test_stop_does_not_bounce_zkswe_while_the_bridge_is_live(monkeypatch):
+    """Parent `--play` only kills the player. Bouncing zkswe is what ghostdeck got wrong."""
+    from ghostdeck import play, studio
+
+    bounced = []
+    monkeypatch.setattr(play, "_kill_play", lambda **k: None)
+    monkeypatch.setattr(play, "_session_released", lambda *a, **k: True)
+    monkeypatch.setattr(play, "_cleanup_device", lambda: bounced.append("bounce"))
+    monkeypatch.setattr(play, "_clear_play_records", lambda: None)
+    monkeypatch.setattr(play.gdstate, "load", lambda: {"play_pid": 1})
+    monkeypatch.setattr(studio, "_socket_live", lambda: True)
+    monkeypatch.setattr(studio, "running", lambda: True)
+    monkeypatch.setattr(studio, "launch", lambda: bounced.append("launch"))
+    play.stop()
+    assert bounced == []

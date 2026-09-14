@@ -767,16 +767,18 @@ def stop() -> None:
 
     The player's identity decides the exit code only, never whether the deck is restored: an
     unverifiable pid is left exactly as it is (nothing signalled, nothing erased) and the cleanup
-    still runs, because skipping it would leave the stock UI stopped and the staged files on the
-    device with no other command able to restore them.
+    still runs *when Studio is not holding the gadget*, because skipping it would leave the stock
+    UI stopped with no other command able to restore them.
 
-    A-126: the player's record is erased only after the device steps have succeeded. When the deck
-    call fails, the state still describing the session that was just stopped is the only evidence a
-    user or a later run has of what happened, and `stop` is the documented recovery command.
+    The parent `launch-studio-adb.py --play` path only stops the loop player. It never restarts
+    `zkswe` while the copied Studio and the local bridge are up. Ghostdeck `stop` used to bounce
+    anyway, which is what made a working parent-style session look broken: the bounce drops HID,
+    transportRevive yanks ADB back, and the keys go with the gadget.
     """
     identity_error = None
     record_is_disposable = True
     session_was_playing = gdstate.load().get("play_pid") is not None
+    keep_gadget = studio._socket_live()
     try:
         _kill_play(keep_record=True)
     except RuntimeError as error:
@@ -796,28 +798,20 @@ def stop() -> None:
             f"the media session did not release within {_SESSION_RELEASE_TIMEOUT:.0f}s, so the stock "
             f"UI was left alone rather than cut the transport mid-stream; re-run `ghostdeck stop`"
         )
-    try:
-        _cleanup_device()
-    except RuntimeError as cleanup_error:
-        if identity_error is None:
-            raise
-        raise RuntimeError(f"{cleanup_error} (as well as: {identity_error})") from cleanup_error
-    # H1: with no bridge, the bounce re-enumerates HID and it sticks (measured 4.2s).
-    # With the ghostdeck bridge still live, HID appears for ~0.5s then ADB returns —
-    # transportRevive writes the HID-to-ADB switch the moment the gadget leaves.
-    # That is why bounce-only "used to work" and `ghostdeck studio`+play does not.
-    # Do not demand HID while the bridge is up. Keys come from the hidshim Studio
-    # copy (IOHIDUserDevice from a CLI vhid process returns NULL on this host).
-    # Re-open the copy if it is down; `launch()` will not quit it while the
-    # bridge is live. Next play already calls enable_adb.
-    if session_was_playing:
-        if studio._socket_live():
-            try:
-                if not studio.running():
-                    studio.launch()
-            except Exception as error:
-                print(f"hidshim Studio copy skipped: {error}", file=sys.stderr)
-        elif not _await_hid_return(require_hid=True):
+    if keep_gadget:
+        try:
+            if not studio.running():
+                studio.launch()
+        except Exception as error:
+            print(f"hidshim Studio copy skipped: {error}", file=sys.stderr)
+    else:
+        try:
+            _cleanup_device()
+        except RuntimeError as cleanup_error:
+            if identity_error is None:
+                raise
+            raise RuntimeError(f"{cleanup_error} (as well as: {identity_error})") from cleanup_error
+        if session_was_playing and not _await_hid_return(require_hid=True):
             hid_error = RuntimeError(_hid_stuck_message())
             if identity_error is not None:
                 raise RuntimeError(
