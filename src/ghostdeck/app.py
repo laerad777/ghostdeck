@@ -63,7 +63,7 @@ class DeckRemote:
     def play(self, source: str) -> list[CommandResult]:
         source = source.strip()
         if not source:
-            return [CommandResult(["play"], 2, "", "파일을 고르십시오")]
+            return [CommandResult(["play"], 2, "", "파일 경로나 https:// 링크를 넣으십시오")]
         results: list[CommandResult] = []
         st = self._run(["status"])
         results.append(st)
@@ -171,8 +171,9 @@ def main() -> int:
     frame = tk.Frame(root, padx=10, pady=8)
     frame.pack(fill="both", expand=True)
     tk.Label(frame, textvariable=status_var, anchor="w", font=("Menlo", 11)).pack(fill="x")
+    tk.Label(frame, text="파일 경로 또는 https:// 링크", anchor="w").pack(fill="x", pady=(8, 0))
     row = tk.Frame(frame)
-    row.pack(fill="x", pady=(8, 4))
+    row.pack(fill="x", pady=(2, 4))
     tk.Entry(row, textvariable=file_var).pack(side="left", fill="x", expand=True)
     tk.Button(row, text="열기", command=choose).pack(side="left", padx=(6, 0))
     buttons = tk.Frame(frame)

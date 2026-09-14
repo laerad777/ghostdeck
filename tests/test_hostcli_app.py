@@ -72,6 +72,18 @@ def test_play_refuses_an_empty_path_without_touching_the_cli():
     assert results[0].code == 2
     assert "파일" in results[0].stderr
 
+def test_play_passes_a_url_through_to_the_cli():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv == ["status"]:
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        return CommandResult(argv, 0, "", "")
+
+    DeckRemote(run).play("https://youtu.be/dQw4w9WgXcQ")
+    assert calls == [["status"], ["play", "https://youtu.be/dQw4w9WgXcQ"]]
+
 
 def test_stop_is_only_stop():
     calls: list[list[str]] = []
