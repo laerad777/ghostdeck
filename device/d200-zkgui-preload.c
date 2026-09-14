@@ -152,7 +152,9 @@ static int framebuffer_handle_valid(int fd)
  * released: the application may hold that number now, so it is never probed,
  * written through or closed again. The fresh handle is ours by construction
  * and is closed here. Caller holds framebuffer_lock and has already latched
- * the teardown latch; the black-out obligation never survives the call. */
+ * the teardown latch. A successful SET clears the black-out obligation and a
+ * failed reopen or probe leaves it pending, so the teardown retry can still
+ * discharge it. */
 static void restore_color_key_through_fresh_handle(void)
 {
     int control_fd;
@@ -172,8 +174,10 @@ static void restore_color_key_through_fresh_handle(void)
  * own. The saved key is only valid while the original black-out is live, so
  * the obligation is discharged here, through a fresh handle, before teardown
  * latches: re-acquiring later would probe a screen that is still forced black
- * and overwrite the true original, while dropping it here would strand the
- * black-out on the panel for the rest of the process. */
+ * and overwrite the true original. A discharge that fails leaves the
+ * obligation pending rather than dropping it here, so restore_framebuffer()
+ * can retry through another fresh handle instead of stranding the black-out on
+ * the panel for the rest of the process. */
 static void release_framebuffer_fd(int fd)
 {
     int cancel_state;
@@ -185,7 +189,6 @@ static void release_framebuffer_fd(int fd)
         framebuffer_teardown = 1;
         if (framebuffer_configured)
             restore_color_key_through_fresh_handle();
-        framebuffer_configured = 0;
     }
     pthread_mutex_unlock(&framebuffer_lock);
     (void)pthread_setcancelstate(cancel_state, NULL);

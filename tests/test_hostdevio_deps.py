@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import time
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -233,6 +234,7 @@ def test_recipe_rejects_a_host_static_library(tmp_path):
 def test_ensure_agent_error_names_the_recipe_and_the_prerequisite(monkeypatch, tmp_path):
     monkeypatch.setattr(devicebuild.gdstate, "BIN_DIR", tmp_path / "bin")
     monkeypatch.setattr(devicebuild, "ROOT", tmp_path / "repo")
+    monkeypatch.delenv(devicebuild.AGENT_SOURCE_ENV, raising=False)
     with pytest.raises(RuntimeError) as excinfo:
         devicebuild._ensure_agent()
     message = str(excinfo.value)
@@ -240,6 +242,11 @@ def test_ensure_agent_error_names_the_recipe_and_the_prerequisite(monkeypatch, t
     assert "build-color-agent.sh" in message
     assert "libturbojpeg" in message
     assert str(devicebuild.AGENT_RECIPE) == str(ROOT / "device" / "build-color-agent.sh")
+    # T12: the message must name the documented location and the opt-in, and must not advertise
+    # the implicit `ROOT.parent` adoption that no longer exists.
+    assert str(tmp_path / "bin" / "d200-color-agent") in message
+    assert devicebuild.AGENT_SOURCE_ENV in message
+    assert "sibling" not in message
 
 
 def test_ensure_agent_prefers_an_existing_binary(monkeypatch, tmp_path):
@@ -247,10 +254,18 @@ def test_ensure_agent_prefers_an_existing_binary(monkeypatch, tmp_path):
     bindir.mkdir()
     (bindir / "d200-color-agent").write_text("#!/bin/sh\n")
     monkeypatch.setattr(devicebuild.gdstate, "BIN_DIR", bindir)
+    monkeypatch.delenv(devicebuild.AGENT_SOURCE_ENV, raising=False)
     assert devicebuild._ensure_agent() is None
 
 
-def test_ensure_agent_copies_a_sibling_build(monkeypatch, tmp_path):
+def test_ensure_agent_ignores_a_file_beside_the_repository(monkeypatch, tmp_path):
+    """T12 (a): a prebuilt agent in `ROOT.parent` must NOT be adopted implicitly.
+
+    That file is copied into `~/.ghostdeck/bin`, re-copied into `vendor/`, and executed on the deck
+    by the bridge, and `ROOT.parent` is wherever the user happened to clone the tree. The old
+    revision adopted it with no flag, prompt or doc line, which also made the README wrong on a host
+    that had one. This test fails on that revision.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir()
     repo = tmp_path / "repo"
@@ -259,8 +274,54 @@ def test_ensure_agent_copies_a_sibling_build(monkeypatch, tmp_path):
     sibling.write_bytes(b"\x7fELF")
     monkeypatch.setattr(devicebuild.gdstate, "BIN_DIR", bindir)
     monkeypatch.setattr(devicebuild, "ROOT", repo)
+    monkeypatch.delenv(devicebuild.AGENT_SOURCE_ENV, raising=False)
+    with pytest.raises(RuntimeError) as excinfo:
+        devicebuild._ensure_agent()
+    assert "d200-color-agent is not built" in str(excinfo.value)
+    assert not (bindir / "d200-color-agent").exists(), "the sibling was adopted implicitly"
+
+
+def test_ensure_agent_adopts_the_opted_in_source_and_says_so(monkeypatch, tmp_path, capsys):
+    """T12 (b): the capability survives, gated on `GHOSTDECK_AGENT_SOURCE`, with provenance."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    source = tmp_path / "prebuilt" / "d200-color-agent"
+    source.parent.mkdir()
+    source.write_bytes(b"\x7fELF-prebuild")
+    monkeypatch.setattr(devicebuild.gdstate, "BIN_DIR", bindir)
+    monkeypatch.setenv(devicebuild.AGENT_SOURCE_ENV, str(source))
     devicebuild._ensure_agent()
-    assert (bindir / "d200-color-agent").read_bytes() == b"\x7fELF"
+    assert (bindir / "d200-color-agent").read_bytes() == b"\x7fELF-prebuild"
+    err = capsys.readouterr().err
+    assert str(source) in err, "the adoption was silent"
+    assert str(bindir / "d200-color-agent") in err
+    assert devicebuild.AGENT_SOURCE_ENV in err
+
+
+def test_ensure_agent_rejects_an_opt_in_that_names_no_file(monkeypatch, tmp_path):
+    """An opt-in typo has to fail loudly: falling back to "not built" would hide it."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    missing = tmp_path / "nope" / "d200-color-agent"
+    monkeypatch.setattr(devicebuild.gdstate, "BIN_DIR", bindir)
+    monkeypatch.setenv(devicebuild.AGENT_SOURCE_ENV, str(missing))
+    with pytest.raises(RuntimeError) as excinfo:
+        devicebuild._ensure_agent()
+    message = str(excinfo.value)
+    assert devicebuild.AGENT_SOURCE_ENV in message
+    assert str(missing) in message
+    assert not (bindir / "d200-color-agent").exists()
+
+
+def test_agent_source_is_unset_by_default_and_expands_a_home(monkeypatch, tmp_path):
+    monkeypatch.delenv(devicebuild.AGENT_SOURCE_ENV, raising=False)
+    assert devicebuild.agent_source() is None
+    monkeypatch.setenv(devicebuild.AGENT_SOURCE_ENV, "   ")
+    assert devicebuild.agent_source() is None
+    monkeypatch.setenv(devicebuild.AGENT_SOURCE_ENV, str(tmp_path / "a"))
+    assert devicebuild.agent_source() == tmp_path / "a"
+    monkeypatch.setenv(devicebuild.AGENT_SOURCE_ENV, "~/agent")
+    assert devicebuild.agent_source() == Path.home() / "agent"
 
 
 def test_proxy_preload_behaviour_is_not_weakened():
@@ -296,8 +357,9 @@ def _stub_devicebuild(monkeypatch, tmp_path):
     vendor.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
-    # `_ensure_agent` looks for the prebuilt agent beside the repo root.
+    # A prebuilt agent is adopted only through the opt-in (T12).
     (tmp_path / "d200-color-agent").write_bytes(b"agent")
+    monkeypatch.setenv(devicebuild.AGENT_SOURCE_ENV, str(tmp_path / "d200-color-agent"))
     runs = []
 
     def _run(argv, **_kwargs):
@@ -353,17 +415,17 @@ def test_ensure_republishes_rebuilt_binaries_into_vendor(tmp_path, monkeypatch):
     )
 
 
-def test_a_rebuilt_agent_sibling_replaces_the_cached_copy(tmp_path, monkeypatch):
-    """The agent is compiled by the recipe; a fresh sibling must still reach the cache (A-166)."""
+def test_a_rebuilt_agent_source_replaces_the_cached_copy(tmp_path, monkeypatch):
+    """The agent is compiled by the recipe; a fresher opt-in source must reach the cache (A-166)."""
     _, bindir, _, _ = _stub_devicebuild(monkeypatch, tmp_path)
-    sibling = tmp_path / "d200-color-agent"
+    source = tmp_path / "d200-color-agent"
 
     devicebuild._ensure_agent()
     assert (bindir / "d200-color-agent").read_bytes() == b"agent"
 
-    sibling.write_bytes(b"agent-v2")
+    source.write_bytes(b"agent-v2")
     newer = time.time() + 5
-    os.utime(sibling, (newer, newer))
+    os.utime(source, (newer, newer))
     devicebuild._ensure_agent()
     assert (bindir / "d200-color-agent").read_bytes() == b"agent-v2", (
         "a rebuilt agent was never published to the cache"
@@ -596,9 +658,10 @@ def test_the_agent_is_linked_dynamically_with_a_documented_reason():
 # recipe from `pytest tests/ -q` on this one host, so a global count around the subprocess cannot
 # tell a recipe leak from a neighbour's in-flight probe. Precisely: a neighbour's probe directory
 # only reds the global version if it appears *between* the before/after globs - one held for the
-# whole test cancels out in the set difference `after - before`. The race is therefore narrow and
-# load-dependent (measured at 4/25 runs under a concurrent recipe loop), which is exactly why a
-# private TMPDIR is the right assertion surface rather than a flaky global count.
+# whole test cancels out in the set difference `after - before`. The race is load-dependent, not
+# narrow (4/25 under one concurrent recipe loop, 13/25 re-measured in the T6 verification pane with
+# a tighter loop), so a private TMPDIR - 0/25 reds in that same harness - is the assertion surface
+# that tests the recipe instead of the neighbours' load.
 def test_recipe_leaves_no_temp_files_behind(tmp_path):
     """The probe directory is created before the archiver is consulted, so this die path has to
     clean it up as well."""
@@ -699,3 +762,176 @@ def test_the_missing_backend_is_reported_before_the_switch_poll_is_spent(monkeyp
     # Exactly one call: `enable_adb`'s own pre-switch detection. Zero poll iterations, so the
     # 5s readiness timeout was not spent proving something that could never succeed.
     assert polls == [1], f"the post-switch poll ran {len(polls) - 1} time(s) anyway"
+
+
+# --------------------------------------------------------------------------- T13
+# `missing_dependency()` asked whether the `usb` *package* imports, while the code that needs it
+# imports the `usb.core` *submodule*. An importable-but-incomplete pyusb therefore passed the check
+# and `_usb_find()` swallowed the ImportError, so `ghostdeck detect` said "no device" with exit 1
+# instead of the documented exit 2 -- the A-004/A-108 class on the pyusb path. The stubs below are
+# real packages on a real PYTHONPATH, not patched internals, so the predicate under test is the
+# product's own.
+
+HID_STUB_SOURCE = """\
+\"\"\"A hidapi stand-in that enumerates nothing: the empty bus must not hide the verdict.\"\"\"
+
+
+def enumerate(vid, pid):
+    return []
+
+
+class device:
+    def open_path(self, path):
+        return None
+
+    def write(self, payload):
+        return len(payload)
+
+    def close(self):
+        return None
+"""
+
+# A pyusb that imports but has no `usb.core` at all (partial, interrupted or shadowed install).
+USB_STUB_WITHOUT_CORE = None
+
+USB_STUB_WORKING = """\
+\"\"\"A smallest-thing-that-works `usb.core`.\"\"\"
+
+
+class _Device:
+    serial_number = "STUB-SERIAL"
+
+
+def find(idVendor=None, idProduct=None):
+    return _Device()
+"""
+
+# The boundary case: the submodule imports, but talking to the bus fails at runtime.
+USB_STUB_UNUSABLE_AT_RUNTIME = """\"\"\"A pyusb whose transfers fail: a runtime error, not a missing module.\"\"\"
+
+
+def find(idVendor=None, idProduct=None):
+    raise IOError("libusb reported no usable backend")
+"""
+
+_BACKEND_MODULES = ("usb", "usb.core", "hid")
+
+
+def _write_backend_stub(root: Path, usb_core: str | None) -> Path:
+    """A directory holding an importable `usb` (with `usb/core.py` only when given) and a `hid`."""
+    stub = root / "stub"
+    package = stub / "usb"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text('__version__ = "stub"\n', encoding="utf-8")
+    if usb_core is not None:
+        (package / "core.py").write_text(usb_core, encoding="utf-8")
+    (stub / "hid.py").write_text(HID_STUB_SOURCE, encoding="utf-8")
+    return stub
+
+
+@pytest.fixture
+def stub_backends(tmp_path):
+    """Resolve `usb`/`hid` to temp stubs and restore `sys.modules` exactly afterwards."""
+    saved = {name: sys.modules.get(name) for name in _BACKEND_MODULES}
+
+    def _install(usb_core: str | None) -> Path:
+        stub = _write_backend_stub(tmp_path, usb_core)
+        for name in _BACKEND_MODULES:
+            sys.modules.pop(name, None)
+        sys.path.insert(0, str(stub))
+        spec = importlib.util.find_spec("usb")
+        assert spec is not None and str(spec.origin).startswith(str(stub)), (
+            f"the stub is not what `usb` resolves to ({spec and spec.origin}); a real pyusb on this "
+            "host would make this test prove nothing"
+        )
+        return stub
+
+    yield _install
+
+    while sys.path and sys.path[0].startswith(str(tmp_path)):
+        sys.path.pop(0)
+    for name, module in saved.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
+def test_an_importable_usb_without_usb_core_is_a_broken_install(stub_backends):
+    """The predicate must answer the question the code asks: `usb.core`, not `usb`."""
+    stub_backends(USB_STUB_WITHOUT_CORE)
+    assert usb._importable("usb") is True, "precondition: the stub package imports"
+    assert usb._importable("usb.core") is False, "precondition: it has no `usb.core`"
+    # This is the whole defect: `hid` imports, so the old check returned None here.
+    assert usb.missing_dependency() == usb.USB_BROKEN_HINT
+    assert "pyusb" in usb.USB_BROKEN_HINT
+
+
+def test_a_broken_pyusb_cannot_become_a_missing_deck_verdict(stub_backends):
+    stub_backends(USB_STUB_WITHOUT_CORE)
+    found = usb.detect()
+    assert found["mode"] == "none"
+    assert found["dependency"] == usb.USB_BROKEN_HINT, (
+        "a broken backend reached the caller as a hardware verdict"
+    )
+    with pytest.raises(usb.MissingDependency) as excinfo:
+        usb._usb_find(0x2207, 0x0019)
+    assert usb.USB_BROKEN_HINT in str(excinfo.value)
+    # `vhid.status()` reports host-side fields and keeps its bool contract. The environment verdict
+    # is what goes to the user, and `detect()` above is where it is made.
+    assert usb.virtual_hid_enumerated() is False
+
+
+def test_a_healthy_pyusb_still_reaches_the_hardware_verdict(stub_backends):
+    """The other half: a working `usb.core` must be used, not reported as an environment problem."""
+    stub_backends(USB_STUB_WORKING)
+    assert usb.missing_dependency() is None
+    assert usb.detect() == {
+        "serial": "STUB-SERIAL",
+        "vid": usb.ADB_VID,
+        "pid": usb.ADB_PID,
+        "mode": "adb",
+    }
+
+
+def test_a_pyusb_that_fails_at_runtime_is_still_only_no_device(stub_backends):
+    """T13 boundary: the import of the submodule is the verdict. A transfer that fails while a
+    device is present keeps its current behaviour -- None, not MissingDependency."""
+    stub_backends(USB_STUB_UNUSABLE_AT_RUNTIME)
+    assert usb.missing_dependency() is None
+    assert usb._usb_find(0x2207, 0x0019) is None
+    assert usb.detect()["mode"] == "none"
+
+
+def test_detect_exits_2_for_a_broken_pyusb_instead_of_blaming_the_deck(tmp_path):
+    """End to end, in a subprocess, exactly as the user runs it."""
+    stub = _write_backend_stub(tmp_path, USB_STUB_WITHOUT_CORE)
+    env = {
+        "PYTHONPATH": f"{stub}{os.pathsep}{SRC}",
+        "HOME": str(tmp_path / "home"),
+        "PATH": os.environ.get("PATH", ""),
+    }
+    Path(env["HOME"]).mkdir()
+    result = subprocess.run(
+        [sys.executable, "-m", "ghostdeck.cli", "detect"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+        timeout=60,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "pyusb" in combined
+    assert "no device" not in combined, "the broken install was reported as a missing deck"
+
+
+def test_the_hid_backend_has_no_submodule_for_the_same_hole():
+    """T13 item 4: the same reasoning applied to `hid`. It is imported as a top-level module only
+    (`import hid`; hidapi ships as a single extension module with no submodules), so there is no
+    `hid.<x>` import that a partial install could silently break. `_hid_present()`/`_hid_serial()`
+    already return None -- not a hardware verdict -- when `_hid_module()` raises, and
+    `missing_dependency()` covers the package itself."""
+    text = (SRC / "ghostdeck" / "usb.py").read_text(encoding="utf-8")
+    assert re.search(r"^\s*(import|from)\s+hid\.[A-Za-z_]", text, re.MULTILINE) is None
+    assert "import hid\n" in text

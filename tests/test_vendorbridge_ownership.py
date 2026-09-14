@@ -67,6 +67,33 @@ def test_the_identity_oracle_agrees_with_play_py(tmp_path):
     assert _process_start_time(True) == (None, None)
 
 
+def test_a_claim_still_raises_for_the_shapes_the_advisory_path_skips(state_path):
+    """Total-ness belongs to the advisory call only; startup must stay visible.
+
+    The non-claim tests above skip these same destinations. `claim=True` is the
+    deliberate startup takeover, so it must still report a root it cannot publish
+    into rather than starting a session with no record.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    blocker = state_path.parent / "not-a-directory"
+    blocker.write_text("not a directory")
+    # The state root cannot even be created here. The claim keeps the underlying
+    # `OSError`, exactly as it does when the write itself fails (`if claim: raise`);
+    # the advisory path above skips this same shape.
+    with pytest.raises(OSError):
+        publish_video_state({"phase": "active", "pid": os.getpid()}, claim=True,
+                            state_path=blocker / "host.json")
+    read_only = state_path.parent / "ro"
+    read_only.mkdir()
+    os.chmod(read_only, 0o500)
+    try:
+        with pytest.raises(PermissionError):
+            publish_video_state({"phase": "active", "pid": os.getpid()}, claim=True,
+                                state_path=read_only / "nested" / "host.json")
+    finally:
+        os.chmod(read_only, 0o700)
+
+
 def test_publishing_binds_the_record_owner_to_pid_and_start_time(state_path):
     publish_video_state({"phase": "active", "pid": os.getpid(), "source": "x"}, claim=True,
                         state_path=state_path)
@@ -202,6 +229,71 @@ def test_no_hostile_destination_can_raise_from_a_non_claim_publication(state_pat
     finally:
         os.chmod(state_path.parent, 0o700)
     assert json.loads(state_path.read_text())["pid"] != os.getpid(), "an unwritable root must not be a lie"
+
+
+def test_a_destination_that_cannot_be_looked_at_is_skipped_not_raised(state_path):
+    """`_state_kind` caught only `FileNotFoundError`, so ENOTDIR and EACCES escaped.
+
+    A parent entry that is not a directory (`ENOTDIR`) and a parent without search
+    permission (`EACCES`) both made `path.lstat()` raise out of the *advisory*
+    publication, which `VideoStream.send` calls on every FRAME batch. `_state_kind`
+    is documented as classifying without following a planted symlink; a path that
+    cannot be looked at is not our regular file either, so it is `foreign`.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # (i) ENOTDIR: a regular file where a directory component is expected.
+    blocker = state_path.parent / "not-a-directory"
+    blocker.write_text("not a directory")
+    assert control._state_kind(blocker / "host.json") == "foreign"
+    returned = publish_video_state({"phase": "active", "pid": os.getpid()},
+                                   state_path=blocker / "host.json")
+    assert returned["phase"] == "active"
+    assert blocker.read_text() == "not a directory", "the blocker must be left alone"
+
+    # (ii) EACCES: the parent exists but cannot be searched.
+    locked = state_path.parent / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0o000)
+    try:
+        assert control._state_kind(locked / "host.json") == "foreign"
+        returned = publish_video_state({"phase": "active", "pid": os.getpid()},
+                                       state_path=locked / "host.json")
+        assert returned["phase"] == "active"
+    finally:
+        os.chmod(locked, 0o700)
+
+
+def test_an_uncreatable_state_root_is_skipped_not_raised(state_path):
+    """The advisory path created the state root outside its own failure handling.
+
+    `path.parent.mkdir(...)` ran before any `try`, so a state root that does not
+    exist and cannot be created raised `PermissionError`/`FileExistsError` into the
+    send loop -- the one caller the function's docstring promises never to raise at.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    read_only = state_path.parent / "ro"
+    read_only.mkdir()
+    os.chmod(read_only, 0o500)
+    try:
+        returned = publish_video_state({"phase": "active", "pid": os.getpid()},
+                                       state_path=read_only / "nested" / "host.json")
+        assert returned["phase"] == "active"
+        assert not (read_only / "nested").exists(), "the refused root must not half-exist"
+    finally:
+        os.chmod(read_only, 0o700)
+
+
+def test_a_record_that_cannot_be_copied_is_skipped_not_raised(state_path):
+    """The state copy is the function's first statement, and it escaped unguarded.
+
+    A payload `json` cannot round-trip raised `TypeError` straight out of the
+    advisory publication. Nothing is published in that case, so the caller keeps
+    its own state object and the record on disk is left as it was.
+    """
+    state = {"phase": "active", "pid": os.getpid(), "diagnostics": {1, 2}}
+    assert publish_video_state(state, state_path=state_path) is state
+    assert not state_path.exists()
 
 
 def test_a_claim_still_reports_an_unpublishable_destination(state_path):

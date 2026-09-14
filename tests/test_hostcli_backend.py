@@ -98,13 +98,18 @@ def test_status_still_exits_zero_with_a_working_environment(monkeypatch, capsys,
 
 def _stub_play_until_detect(monkeypatch):
     """Let `start_play` reach the `usb.detect()` verdict without touching a device or a file."""
-    from ghostdeck import devicebuild, play
+    from ghostdeck import devicebuild, play, studio
 
     monkeypatch.setattr(play, "_require_tools", lambda source: None)
     monkeypatch.setattr(play.adb, "require_adb", lambda: None)
     monkeypatch.setattr(play, "_validate_source", lambda source: None)
     monkeypatch.setattr(play.gdstate, "ensure_dirs", lambda: None)
     monkeypatch.setattr(devicebuild, "ensure", lambda: None)
+    # T19: `start_play` also refuses while the hidshim bridge is down, and the contract here is to
+    # reach the `usb.detect()` verdict, so the bridge is presented as live. Two lambdas, not a
+    # socket: liveness and ownership are stubbed, so no test can see or bind a real bridge.
+    monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
 
 
 def test_start_play_blames_the_backend_not_the_device(monkeypatch):

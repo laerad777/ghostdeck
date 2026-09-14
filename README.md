@@ -23,6 +23,20 @@ kernel modules. It never sets gadget `functions=hid,adb`.
 - `ffprobe` (ships with ffmpeg; `play` probes the source with it first)
 - `yt-dlp` only if you play URLs
 
+`ghostdeck` also needs two Python backends, installed as the `device`
+extra (see Install):
+
+- `hidapi` — the HID backend: `detect` and `status` read the deck's serial
+  and presence through it, and `play` writes the `0x00ff` report through it
+  to move the deck to ADB.
+- `pyusb` — the USB backend: ADB-mode presence is observed by enumerating
+  the bus with it, which is also how `play` waits for the switch to land.
+
+Neither is optional in 0.1.0: `detect`, `status` and `play` cannot report
+or act without them. Each prints a single install hint and exits `2` before
+it reaches hardware. Commands that never talk to the deck, such as `build`
+and `quit`, still run.
+
 `ghostdeck build` compiles the device helpers and the hidshim Studio copy, so it needs:
 
 - `armv7-linux-gnueabihf-gcc`, an ARM Linux cross toolchain (also needed the first time `play` builds the device binaries)
@@ -61,8 +75,11 @@ TURBOJPEG_LIB=/usr/arm-linux-gnueabihf/lib \
 ```
 
 0.1.0 has **no turnkey way to produce the agent on macOS**, and no download:
-provision a prebuilt `d200-color-agent` in `~/.ghostdeck/bin/` out of band.
-Until that file exists, `ghostdeck build` fails at the agent step.
+provision a prebuilt `d200-color-agent` at `~/.ghostdeck/bin/d200-color-agent`,
+or point `GHOSTDECK_AGENT_SOURCE` at one. Until one of those is present,
+`ghostdeck build` fails at the agent step: it never adopts a binary from
+outside the tree unless that variable names it, and it says so on stderr
+when it does.
 
 ## Install
 
@@ -72,9 +89,15 @@ This directory is the public repository root. Do not publish the parent lab tree
 git init
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e ".[device]"
 ghostdeck build
 ```
+
+The `device` extra is what installs `hidapi` and `pyusb`; it is the
+documented install. A plain `python -m pip install -e .` installs neither,
+and then `detect`, `status` and `play` exit `2` with
+`hidapi is not installed (pip install hidapi)` (or the `pyusb` equivalent)
+before they reach the deck.
 
 `ghostdeck build` compiles hidshim into a local Studio copy (from
 `/Applications/Ulanzi Studio.app`) and ARM device helpers into
@@ -89,6 +112,18 @@ plus Google platform-tools):
 export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 ```
 
+`play` needs one more thing that is not on `PATH`: the **hidshim bridge**
+must already be running. The player reaches the deck through
+`/tmp/d200-adb-bridge.sock` before it opens a stream, so the order is
+**`ghostdeck studio` first, then `ghostdeck play`**. `ghostdeck studio`
+starts both the bridge and the local Studio copy; opening
+`~/Applications/Ulanzi Studio ADB.app` by hand is not enough, because
+without the bridge that copy's shim enumerates no device at all.
+
+With no bridge running, `play` refuses before it spawns the player and
+names `ghostdeck studio` in one line. `stop`, `detect`, and `status` never
+use the bridge and keep working while it is down.
+
 Simultaneous Studio keys need a **local** copy of official Studio with
 hidshim (`~/Applications/Ulanzi Studio ADB.app`); that copy is built
 locally. The official `/Applications/Ulanzi Studio.app` is never
@@ -99,14 +134,15 @@ written or shipped.
 | Command | Purpose |
 | --- | --- |
 | `ghostdeck detect` | Print serial, VID/PID, and USB mode (HID `2207:0019` or ADB `18d1:d002`). Fails if no deck is found. Serial is discovered at runtime; it is not baked into the source. |
-| `ghostdeck play FILE\|URL` | ADB JPEG play. Optional IOHID attempt does not block play. |
-| `ghostdeck studio` | Launch the **local** hidshim copy (`~/Applications/Ulanzi Studio ADB.app`). Official `/Applications/Ulanzi Studio.app` is not written. |
+| `ghostdeck play FILE\|URL` | ADB JPEG play through the running hidshim bridge. **Start the bridge with `ghostdeck studio` first**; with none running, `play` refuses and spawns nothing. Optional IOHID attempt does not block play. |
+| `ghostdeck studio` | **Run this before `play`.** Launch the **local** hidshim copy (`~/Applications/Ulanzi Studio ADB.app`) and start the hidshim bridge that `play` connects to. Official `/Applications/Ulanzi Studio.app` is not written. |
 | `ghostdeck stop` | Stop playback, restore stock UI, clear `/tmp/ghostdeck-*` on the deck. |
 | `ghostdeck quit` | Tear down the IOHID keeper if any. |
 | `ghostdeck status` | USB mode, shim copy, IOHID, playing. |
 
 `ffmpeg`, `ffprobe`, and `adb` missing: `play` fails. `yt-dlp` missing:
-URL sources fail; local files still play.
+URL sources fail; local files still play. No bridge running: `play` fails
+before it spawns the player; `stop`, `detect`, and `status` are unaffected.
 
 Host state lives in `~/.ghostdeck/state.json`. `ghostdeck studio` appends
 the hidshim bridge's stdout and stderr to `/tmp/d200-local-bridge.log`;
@@ -136,7 +172,9 @@ Two consequences worth knowing before you go looking for the wrong command:
 The bridge is not stopped on your behalf because a bridge it did not start may
 be someone else's — including one a test or another tool is using. Any tool
 that starts a bridge owns exactly the process it created, and releases only
-that one.
+that one. That is also why `play` refuses when no bridge is running instead of
+starting one: it would then own a long-lived process it does not wait for and
+never cleans up. `ghostdeck studio` is the command that owns a bridge.
 
 ## If the deck is attached but stops answering
 
@@ -185,7 +223,8 @@ deck on ADB. Official Studio does not see a fake USB device.
 Simultaneous keys use **hidshim** in a **local copy**:
 `~/Applications/Ulanzi Studio ADB.app`. That copy's `libhidapi.0.dylib`
 is our shim (`2207:0019` / `ulanzi` inside the process, unix socket
-`/tmp/d200-adb-bridge.sock`). `ghostdeck studio` opens that copy.
+`/tmp/d200-adb-bridge.sock`). `ghostdeck studio` opens that copy and starts
+the bridge the shim talks to, so it must be running before `play`.
 
 Official `/Applications/Ulanzi Studio.app` is never written or shipped.
 IOHIDUserDevice is a failed Apple-entitlement spike, not the product path.

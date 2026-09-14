@@ -268,20 +268,36 @@ def test_a_directory_at_the_destination_is_reported_not_followed(tmp_path):
     assert temp_siblings(parent) == []
 
 
-@pytest.mark.parametrize("shape", ["directory", "missing-parent", "unwritable-parent"])
+@pytest.mark.parametrize("shape", ["directory", "missing-parent", "unwritable-parent",
+                                  "parent-is-a-file", "unsearchable-parent"])
 def test_the_cli_reports_an_unusable_state_path_in_one_line(deckless_bridge, scratch,
                                                            isolated_home, shape):
     """The state file is written before `transport.start()`, outside any handler.
 
     A raw traceback here also meant the bridge went on to stage to the deck even
-    though it could not publish the record it was asked for.
+    though it could not publish the record it was asked for. The last two shapes
+    are the ones `_state_kind` could not classify: its `lstat` failure check named
+    only `FileNotFoundError`, so a non-directory parent entry (`ENOTDIR`) and an
+    unsearchable one (`EACCES`) escaped as tracebacks -- from this writer and from
+    the teardown read in `own_state_record`.
     """
     state_file = scratch / "state.pid"
     restore = None
+    blocker = None
     if shape == "directory":
         state_file.mkdir()
     elif shape == "missing-parent":
         state_file = scratch / "nope" / "state.pid"
+    elif shape == "parent-is-a-file":
+        blocker = scratch / "not-a-directory"
+        blocker.write_text("not a directory")
+        state_file = blocker / "state.pid"
+    elif shape == "unsearchable-parent":
+        parent = scratch / "locked"
+        parent.mkdir()
+        parent.chmod(0o000)
+        restore = parent
+        state_file = parent / "state.pid"
     else:
         parent = scratch / "ro"
         parent.mkdir()
@@ -303,3 +319,5 @@ def test_the_cli_reports_an_unusable_state_path_in_one_line(deckless_bridge, scr
     )
     if shape == "directory":
         assert state_file.is_dir()
+    if blocker is not None:
+        assert blocker.read_text() == "not a directory", "the blocker must be left alone"

@@ -442,6 +442,46 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
         child.wait(timeout=timeout)
 
 
+def require_bridge() -> None:
+    """One-line refusal when the bridge this project spawns is not serving `SOCKET`, else return.
+
+    `play` needs a bridge and must not start one. The player's first device-side act is
+    `connect_bridge(BRIDGE_SOCKET)` before `videoOpen` (vendor/d200-color-play.py), so with nothing
+    listening the child dies with a raw `ConnectionRefusedError` and the user is told neither what
+    was missing nor what to run. `_ensure_bridge()` is the thing that *starts* a bridge, and it does
+    real device work (it moves the deck off HID and waits for it to answer device commands), so it
+    stays where it is: `studio`, the command that owns the copied app the bridge exists to serve.
+    The documented rule is that a tool which starts a bridge owns exactly the process it created and
+    releases only that one; `play` has no lifecycle for a long-lived process it outlives (it returns
+    as soon as the player survives the grace window, while the bridge must serve the whole session).
+    The user needs `ghostdeck studio` anyway: simultaneous operation *is* the shim, so there is no
+    path where `play` works without the copy running.
+
+    Only `play` and `studio` depend on the bridge. `stop` - the recovery command - and the read-only
+    `detect`/`status`/`quit` never touch it, and that must stay true: they are exactly what a user
+    needs while the bridge is down. Do not move this call into `stop`.
+
+    Liveness is not ownership (A-133): a live listener that no live bridge of ours owns would leave
+    the player talking to a stranger, so it is refused with the same reasoning `launch()` uses.
+    """
+    endpoint, probe_reason = _socket_state()
+    if endpoint == _ENDPOINT_LIVE:
+        if _bridge_owner_live():
+            return
+        raise RuntimeError(
+            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to start "
+            f"the player against an unidentified bridge. Stop that process, or remove {SOCKET} if it "
+            f"is a leftover, and retry"
+        )
+    if endpoint == _ENDPOINT_UNDETERMINABLE:
+        raise _undeterminable_endpoint(probe_reason)
+    raise RuntimeError(
+        f"the hidshim bridge is not running ({probe_reason}), and the player reaches the deck "
+        f"through it: run `ghostdeck studio` first (it starts the bridge and the Studio copy), then "
+        f"re-run `ghostdeck play`"
+    )
+
+
 def _ensure_bridge() -> None:
     endpoint, probe_reason = _socket_state()
     if endpoint == _ENDPOINT_LIVE:

@@ -110,12 +110,77 @@ def test_stale_endpoint_is_reclaimed_and_bound(scratch):
 
 
 def test_non_socket_path_is_refused_not_deleted(scratch):
-    """ENOTSOCK is not proof of death, so the path is left untouched."""
+    """A path that is not a socket is not proof of death, so it is left untouched."""
     path = scratch / "plain.sock"
     path.write_text("not a socket")
     with pytest.raises(bridge.BridgeSocketInUse):
         bridge.BridgeServer(path, state=None)
     assert path.read_text() == "not a socket"
+
+
+def test_a_non_socket_is_not_proven_dead_even_when_connect_refuses(scratch, monkeypatch):
+    """A-193/A-200: the verdict must not depend on the platform's errno.
+
+    Connecting to a regular file raises ENOTSOCK on macOS but ECONNREFUSED on
+    Linux, and ECONNREFUSED is how a genuinely dead listener answers -- so the
+    old errno-only predicate reported a planted file as dead on Linux and
+    unlinked it. The refusal is forced here on macOS, which is the Linux shape.
+    """
+    def refuse(self, address):
+        raise ConnectionRefusedError(61, "Connection refused")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    path = scratch / "plain.sock"
+    path.write_text("not a socket")
+
+    assert bridge.socket_listener_live(path) is True, "a refused plain file is not a dead endpoint"
+    with pytest.raises(bridge.BridgeSocketInUse):
+        bridge.BridgeServer(path, state=None)
+    assert path.read_text() == "not a socket"
+
+
+def test_a_non_socket_is_classified_without_connecting(scratch, monkeypatch):
+    """The path's shape decides first; the probe is only for an actual socket."""
+    def forbidden(self, address):
+        raise AssertionError("a path that is not a socket must not be probed")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    path = scratch / "plain.sock"
+    path.write_text("not a socket")
+    assert bridge.socket_listener_live(path) is True
+    assert bridge.socket_listener_live(scratch / "absent.sock") is False
+
+
+def test_a_symlink_at_the_endpoint_is_refused_not_followed(scratch):
+    """`lstat`, like `endpoint_identity`: the endpoint is the path, not its target.
+
+    Following the link would bind our socket at a location the caller never chose,
+    and `endpoint_identity` would then report no endpoint of ours to clean up.
+    """
+    path = scratch / "bridge.sock"
+    target = scratch / "gone.sock"
+    path.symlink_to(target)
+    assert bridge.socket_listener_live(path) is True
+
+    with pytest.raises(bridge.BridgeSocketInUse):
+        bridge.BridgeServer(path, state=None)
+    assert path.is_symlink(), "the planted link must survive"
+    assert not target.exists(), "nothing may be bound through the link"
+
+
+def test_a_dead_socket_is_still_reclaimed(scratch):
+    """Control: the shape check must not disable the intended reclamation."""
+    path = scratch / "stale.sock"
+    plant_live_listener(path).close()
+    assert path.exists() and path.is_socket()
+    assert bridge.socket_listener_live(path) is False
+
+    server = bridge.BridgeServer(path, state=None)
+    try:
+        assert probe(path) is True
+    finally:
+        server.server_close()
+    assert not path.exists()
 
 
 def test_server_close_removes_its_own_endpoint(scratch):
@@ -166,6 +231,30 @@ def test_cli_refuses_a_live_endpoint_before_any_device_work(scratch):
         assert probe(path) is True
     finally:
         listener.close()
+
+
+def test_cli_refuses_a_planted_file_at_the_endpoint(scratch):
+    """End to end: the operator's file must survive a refused bridge start."""
+    path = scratch / "plain.sock"
+    path.write_text("operator data")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BRIDGE_PATH),
+            "--socket",
+            str(path),
+            "--serial",
+            "unused",
+            "--adb",
+            str(scratch / "no-such-adb"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "bridge_socket_in_use" in result.stderr
+    assert path.read_text() == "operator data"
 
 
 class RecordingProxy(bridge.DeviceProxy):

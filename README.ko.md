@@ -23,6 +23,20 @@ ghostdeck는 Studio.app, 벤더 펌웨어, 커널 모듈을 **배포하지 않�
 - `ffprobe` (ffmpeg에 포함; `play`가 원본 fps를 먼저 측정)
 - URL 재생 시에만 `yt-dlp`
 
+`ghostdeck`에는 파이썬 백엔드 두 개도 필요합니다. `device` extra로
+설치합니다(설치 절 참조):
+
+- `hidapi` — HID 백엔드. `detect`와 `status`가 이걸로 덱의 시리얼과
+  존재를 읽고, `play`가 이걸로 `0x00ff` 리포트를 써서 덱을 ADB로
+  전환합니다.
+- `pyusb` — USB 백엔드. ADB 모드 존재는 이걸로 버스를 직접 열거해서
+  확인하며, `play`가 전환이 끝나기를 기다릴 때도 같은 경로를 씁니다.
+
+0.1.0에서 둘 다 선택 사항이 아닙니다. `detect`, `status`, `play`는
+둘 없이는 보고도 동작도 못 합니다. 각각 설치 안내 한 줄을 출력한 뒤
+하드웨어에 도달하기 전에 `2`로 종료합니다. `build`, `quit`처럼 덱과
+통신하지 않는 명령은 그대로 실행됩니다.
+
 `ghostdeck build`는 기기 바이너리와 hidshim Studio 복사본을 컴파일하므로 다음이 필요합니다:
 
 - `armv7-linux-gnueabihf-gcc` (ARM Linux 크로스 툴체인; `play`가 기기 바이너리를 처음 빌드할 때도 필요)
@@ -62,8 +76,11 @@ TURBOJPEG_LIB=/usr/arm-linux-gnueabihf/lib \
 
 0.1.0에는 **macOS에서 에이전트를 만드는 간편한(turnkey) 방법이 없고**
 내려받는 방법도 없습니다. 미리 빌드한 `d200-color-agent`를
-`~/.ghostdeck/bin/`에 별도로 준비해야 합니다. 그 파일이 없으면
-`ghostdeck build`는 에이전트 단계에서 실패합니다.
+`~/.ghostdeck/bin/d200-color-agent`에 준비하거나,
+`GHOSTDECK_AGENT_SOURCE`가 그 파일을 가리키게 하십시오. 둘 중 하나가
+없으면 `ghostdeck build`는 에이전트 단계에서 실패합니다. 이 변수가
+가리키지 않는 바이너리를 트리 밖에서 가져오는 일은 없으며, 가져올
+때는 stderr로 알립니다.
 
 ## 설치
 
@@ -73,9 +90,15 @@ TURBOJPEG_LIB=/usr/arm-linux-gnueabihf/lib \
 git init
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e ".[device]"
 ghostdeck build
 ```
+
+`device` extra가 `hidapi`와 `pyusb`를 설치합니다. 이것이 문서화된
+설치입니다. `python -m pip install -e .`만 실행하면 둘 다 설치되지
+않고, 그 상태에서는 `detect`, `status`, `play`가
+`hidapi is not installed (pip install hidapi)`(또는 `pyusb`에 해당하는
+메시지)를 출력하고 덱에 도달하기 전에 `2`로 종료합니다.
 
 `ghostdeck build`가 공식 Studio를 로컬 복사하고 hidshim을 넣으며,
 ARM 기기 바이너리를 `~/.ghostdeck/bin`에 컴파일한다. ARM 크로스
@@ -89,6 +112,18 @@ Google platform-tools):
 export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 ```
 
+`play`에는 `PATH`에 없는 것이 하나 더 필요합니다. **hidshim 브리지**가
+이미 실행 중이어야 합니다. 플레이어는 스트림을 열기 전에
+`/tmp/d200-adb-bridge.sock`을 통해 덱에 도달합니다. 순서는
+**`ghostdeck studio` 먼저, 그다음 `ghostdeck play`**입니다. `ghostdeck
+studio`가 브리지와 로컬 Studio 복사본을 모두 시작합니다.
+`~/Applications/Ulanzi Studio ADB.app`을 직접 열어도 충분하지 않습니다.
+브리지가 없으면 그 복사본의 심은 기기를 아예 열거하지 않습니다.
+
+브리지가 없으면 `play`는 플레이어를 띄우기 **전에** 거부하고 한 줄로
+`ghostdeck studio`를 알려 줍니다. `stop`, `detect`, `status`는 브리지를
+쓰지 않으므로 브리지가 꺼져 있어도 계속 동작합니다.
+
 동시 Studio 키는 공식 Studio의 **로컬 복사본**
 (`~/Applications/Ulanzi Studio ADB.app`)이 필요하다. 그 복사본은
 로컬에서 만든다. 공식 `/Applications/Ulanzi Studio.app`은 쓰지도,
@@ -99,14 +134,15 @@ export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 | 명령 | 역할 |
 | --- | --- |
 | `ghostdeck detect` | 시리얼, VID/PID, USB 모드. 없으면 실패. 시리얼은 런타임만. |
-| `ghostdeck play FILE\|URL` | ADB JPEG 재생. IOHID 실패해도 play는 계속. |
-| `ghostdeck studio` | 로컬 hidshim 복사본 (`~/Applications/Ulanzi Studio ADB.app`)을 연다. 공식 `/Applications/Ulanzi Studio.app`은 쓰지 않는다. |
+| `ghostdeck play FILE\|URL` | 실행 중인 hidshim 브리지를 통해 ADB JPEG 재생. **브리지는 `ghostdeck studio`로 먼저 시작**해야 하며, 없으면 `play`는 거부하고 아무것도 띄우지 않는다. IOHID 실패해도 play는 계속. |
+| `ghostdeck studio` | **`play` 전에 실행한다.** 로컬 hidshim 복사본 (`~/Applications/Ulanzi Studio ADB.app`)을 열고, `play`가 접속하는 hidshim 브리지를 시작한다. 공식 `/Applications/Ulanzi Studio.app`은 쓰지 않는다. |
 | `ghostdeck stop` | 재생 중지, 스톡 UI 복원, 덱의 `/tmp/ghostdeck-*` 정리. |
 | `ghostdeck quit` | IOHID keeper가 있으면 종료. |
 | `ghostdeck status` | USB, shim 복사본, IOHID, 재생. |
 
 `ffmpeg`/`ffprobe`/`adb`가 없으면 `play`는 실패합니다. `yt-dlp`가 없으면 URL만
-실패하고 로컬 파일은 재생됩니다.
+실패하고 로컬 파일은 재생됩니다. 브리지가 없으면 `play`는 플레이어를
+띄우기 전에 실패하고, `stop`/`detect`/`status`는 영향을 받지 않습니다.
 
 호스트 상태는 `~/.ghostdeck/state.json`입니다. `ghostdeck studio`는
 hidshim 브리지의 표준 출력·오류를 `/tmp/d200-local-bridge.log`에
@@ -135,7 +171,10 @@ hidshim 브리지의 표준 출력·오류를 `/tmp/d200-local-bridge.log`에
 
 이 프로젝트가 브리지를 대신 멈추지 않는 이유는, 자기가 시작하지 않은
 브리지가 다른 주체(테스트나 다른 도구)의 것일 수 있기 때문입니다. 브리지를
-시작한 도구는 자기가 만든 프로세스만 소유하고, 그것만 해제합니다.
+시작한 도구는 자기가 만든 프로세스만 소유하고, 그것만 해제합니다. 그래서
+`play`는 브리지가 없으면 직접 시작하지 않고 거부합니다. 시작하면 기다리지도,
+정리하지도 않는 장기 실행 프로세스를 소유하게 되기 때문입니다. 브리지를
+소유하는 명령은 `ghostdeck studio`입니다.
 
 ## 덱이 붙어 있는데 응답하지 않을 때
 
@@ -184,7 +223,7 @@ ADB로 둡니다. 공식 Studio는 가짜 USB를 보지 않습니다.
 `~/Applications/Ulanzi Studio ADB.app`의 `libhidapi.0.dylib`가 우리
 심이다. 프로세스 안에서 `2207:0019` / `ulanzi`로 열거하고
 `/tmp/d200-adb-bridge.sock`으로 말한다. `ghostdeck studio`가 그 복사본을
-연다.
+열고 심이 말하는 브리지를 시작하므로, `play` 전에 실행 중이어야 한다.
 
 공식 `/Applications/Ulanzi Studio.app`은 쓰지도, 배포하지도 않는다.
 IOHIDUserDevice는 Apple 권한 스파이크 실패이며 제품 경로가 아니다.

@@ -282,11 +282,22 @@ def _read_state(path):
 
 
 def _state_kind(path):
-    """Classify the state path without following a planted symlink."""
+    """Classify the state path without following a planted symlink.
+
+    Only ``absent`` and ``regular`` are claims about the path itself. Everything
+    else this cannot look through -- a symlink, a fifo, a directory, or a path
+    whose parent entry is not a directory (`ENOTDIR`) or cannot be searched
+    (`EACCES`) -- is ``foreign``, which is what tells both callers to leave the
+    destination alone instead of publishing over it. `FileNotFoundError` is the
+    one failure that names an empty path; every other `OSError` escaped this
+    function before, and out of an advisory publication it reached the send loop.
+    """
     try:
         info = path.lstat()
     except FileNotFoundError:
         return "absent"
+    except OSError:
+        return "foreign"
     return "regular" if stat.S_ISREG(info.st_mode) else "foreign"
 
 
@@ -371,9 +382,10 @@ def publish_video_state(state, *, claim=False, state_path=HOST_STATE):
     """Publish the advisory record, or skip the publication.
 
     A non-claim publication runs inside the media send loop (the player's
-    ``on_progress``), so it never raises: an unwritable state root, a destination
-    that cannot be taken over, and an owner that cannot be proven gone all skip the
-    publication and let the send continue. The published JSON schema, the phase
+    ``on_progress``), so it never raises: an unwritable state root, a state root
+    that cannot be created or looked at, a record that cannot be copied, a
+    destination that cannot be taken over, and an owner that cannot be proven gone
+    all skip the publication and let the send continue. The published JSON schema, the phase
     names and the parameters are unchanged; a skipped publication leaves the file
     exactly as it was and returns the payload that was not written, so the caller's
     own state is never replaced by another process's record.
@@ -382,8 +394,27 @@ def publish_video_state(state, *, claim=False, state_path=HOST_STATE):
     state root or a foreign destination is reported at startup rather than silently.
     """
     path = Path(state_path)
-    updated = json.loads(json.dumps(state))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        updated = json.loads(json.dumps(state))
+    except (TypeError, ValueError):
+        if claim:
+            raise
+        # A record that cannot be copied cannot be published, and the caller's own
+        # object is the only copy of it: hand that back untouched.
+        emit_diagnostic(sys.stderr, dict(
+            event="statePublicationSkipped", path=str(path),
+            reason="record is not JSON-serialisable", errno=None))
+        return state
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        if claim:
+            raise
+        emit_diagnostic(sys.stderr, dict(
+            event="statePublicationSkipped", path=str(path),
+            reason="state root cannot be created",
+            errno=error.errno if type(error.errno) is int else None))
+        return updated
     if claim and updated.get("phase") != "active":
         raise RuntimeError("playback claim must be active")
     kind = _state_kind(path)

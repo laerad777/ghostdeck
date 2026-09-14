@@ -9,7 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ghostdeck import adb, devicebuild, state as gdstate, tree, usb, vhid
+from ghostdeck import adb, devicebuild, state as gdstate, studio, tree, usb, vhid
 
 VENDOR_PLAY = tree.candidate_root() / "vendor" / "d200-color-play.py"
 VENDOR_DIR = tree.candidate_root() / "vendor"
@@ -424,6 +424,13 @@ def start_play(source: str) -> None:
     # Before any device work: an unusable SOURCE must fail cheaply and name the user's own input,
     # not travel to a child process that dies on its first read (A-103).
     _validate_source(source)
+    # T19: the player's first device-side act is `connect_bridge(BRIDGE_SOCKET)` (before
+    # `videoOpen`), so with no bridge listening it dies inside the child with a raw
+    # `ConnectionRefusedError` and the user is told nothing actionable. Refuse here - after the two
+    # zero-cost checks on the user's own invocation, and before `ensure_dirs`/`devicebuild.ensure`/
+    # `usb.detect`, so a missing bridge costs nothing and no device is touched. `studio` owns this
+    # check because the bridge is studio's; `play` must not start one (see `studio.require_bridge`).
+    studio.require_bridge()
     gdstate.ensure_dirs()
     devicebuild.ensure()
     found = usb.detect()

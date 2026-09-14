@@ -1,4 +1,18 @@
 // hidshim.c - virtual D200 hidapi client for the copied Studio bundle.
+//
+// Two halves, one of which is unbuildable here. `D200_HOST_VISUAL` selects a
+// fixture transport whose header, "hidshim_host_transport.h", is not in this
+// repository and is not defined or supplied by anything else in the tree, so
+// `cc -DD200_HOST_VISUAL -fsyntax-only reference/hidshim.c` stops at that include
+// and those regions (about 220 lines) are not covered by any check this repo
+// runs. Only the production half is compiled -- the check in the brief is the
+// plain `cc -fsyntax-only reference/hidshim.c` -- and production is
+// authoritative on uncertainty semantics wherever the halves disagree. They do
+// disagree at hid_close()/hid_error(): the production branch reports the
+// `close_uncertain` flag set by the bounded active-call drain below, while the
+// fixture branch reports `host.cleanup_uncertain` and has never been re-checked
+// against it. Read the D200_HOST_VISUAL regions as unverified reference
+// material, not as a second implementation with coverage. See finding B-124.
 #ifndef D200_HOST_VISUAL
 #include <dlfcn.h>
 #endif
@@ -12,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -50,7 +65,44 @@ typedef struct hid_api_version {
 #define PID 0x0019
 #define REPORT_BYTES 1025
 #ifndef D200_HOST_VISUAL
-#define SOCKET_PATH "/tmp/d200-adb-bridge.sock"
+/* Overridable at compile time: the host model in tests/test_vendorbridge_shimlog.py
+ * must point the shim at a socket that is provably absent, and the real deck's
+ * socket is never probed by a test. The shipped build defines nothing, so the
+ * default below is what Studio gets. */
+#ifndef D200_HIDSHIM_SOCKET_PATH
+#define D200_HIDSHIM_SOCKET_PATH "/tmp/d200-adb-bridge.sock"
+#endif
+#define SOCKET_PATH D200_HIDSHIM_SOCKET_PATH
+/* FIX-5-T13: where an unreachable bridge is reported. This shim is loaded into
+ * the Studio process, which is usually launched from Finder, so its stderr goes
+ * nowhere a user can read; the record therefore goes to an append-only file.
+ * Compile-time, not an environment lookup: Studio's environment is not a
+ * trustworthy input for a path this process writes to (the same reason the
+ * bridge's own socket is not read from the environment).
+ *
+ * The file is bounded twice over: at most D200_HIDSHIM_LOG_REASONS distinct
+ * reasons per process, and never appended to once it reaches
+ * D200_HIDSHIM_LOG_LIMIT bytes. Studio enumerates in a loop, so an undecorated
+ * record would be unbounded by construction. */
+#ifndef D200_HIDSHIM_LOG_PATH
+#define D200_HIDSHIM_LOG_PATH "/tmp/d200-hidshim.log"
+#endif
+#define D200_HIDSHIM_LOG_LIMIT 4096
+#define D200_HIDSHIM_LOG_REASONS 8
+/* The socket path may be as long as a unix sockaddr_un allows (about 104 bytes);
+ * the bound below leaves room for that plus the record's fixed text, and
+ * D200_HIDSHIM_LOG_CHARS is the whole line's capacity with margin. */
+#define D200_HIDSHIM_SOCKET_CHARS 256
+#define D200_HIDSHIM_LOG_CHARS 640
+/* One wording for both this record and the `play` refusal FIX-1-T19 added. */
+#define D200_HIDSHIM_HINT "the hidshim bridge is not running; run `ghostdeck studio` first"
+/* The record must always fit: a diagnostic that is dropped because it did not
+ * fit its own buffer is the silent failure this file exists to remove. The
+ * fixed text, a pid, a millisecond clock, the errno, the reason class and the
+ * hint come to at most 320 bytes; the socket path is bounded separately. */
+#if D200_HIDSHIM_LOG_CHARS - D200_HIDSHIM_SOCKET_CHARS < 320
+#error "D200_HIDSHIM_LOG_CHARS must hold the whole record with the longest bounded socket path"
+#endif
 #endif
 #define VPATH0 "d200-adb://2207:0019/interface/0"
 #define VPATH1 "d200-adb://2207:0019/interface/1"
@@ -677,6 +729,90 @@ done:
     return result;
 }
 #ifndef D200_HOST_VISUAL
+/* FIX-5-T13: the shim used to fail silently. A D200 enumeration that cannot
+ * reach the bridge falls through to the real hidapi and returns a list without
+ * the deck, which is indistinguishable from "no deck is attached" -- the user's
+ * "buttons don't show" with no way to tell why.
+ *
+ * One bounded, one-shot record per distinct errno per process, written through
+ * a single non-blocking open/write on a regular file. Nothing here starts a
+ * bridge, prompts, blocks or forwards anything to the deck, so the shim stays
+ * passive inside a foreign process, and the real-hidapi fallthrough below is
+ * untouched (a real HID deck must still work). No serial and no capability ever
+ * enters the record: only the socket path, the errno and its class. */
+static pthread_mutex_t diagnostic_lock = PTHREAD_MUTEX_INITIALIZER;
+static int diagnostic_reasons[D200_HIDSHIM_LOG_REASONS];
+static int diagnostic_reason_count;
+/* errno of the last failed bridge probe in wait_for_daemon(), normalized to a
+ * nonzero value so a path that left errno unset still names something. */
+static int daemon_failure_errno;
+
+/* Fixed vocabulary, so no locale-dependent strerror() text is published. */
+static const char *bridge_error_class(int error)
+{
+    switch (error) {
+    case ENOENT:
+        return "absent";
+    case ECONNREFUSED:
+        return "refused";
+    case ETIMEDOUT:
+        return "timeout";
+    case EPROTO:
+        return "protocol";
+    default:
+        return "io";
+    }
+}
+
+/* True when this reason was already recorded, or when the fixed vocabulary is
+ * full. Caller holds diagnostic_lock. */
+static int diagnostic_reason_seen(int error)
+{
+    int index;
+    for (index = 0; index < diagnostic_reason_count; index++)
+        if (diagnostic_reasons[index] == error) return 1;
+    if (diagnostic_reason_count >= D200_HIDSHIM_LOG_REASONS) return 1;
+    diagnostic_reasons[diagnostic_reason_count++] = error;
+    return 0;
+}
+
+static void bridge_unreachable_diagnostic(const char *path, int error)
+{
+    int saved_errno = errno;
+    if (path == NULL) path = D200_HIDSHIM_LOG_PATH;
+    if (error <= 0) error = EIO;
+    pthread_mutex_lock(&diagnostic_lock);
+    if (diagnostic_reason_seen(error)) {
+        pthread_mutex_unlock(&diagnostic_lock);
+        errno = saved_errno;
+        return;
+    }
+    /* O_NOFOLLOW: a symlink planted at a shared /tmp path is refused rather
+     * than written through. O_CLOEXEC and 0600: the record is not a secret,
+     * but nothing here should leak a descriptor or a world-readable file. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    struct stat status;
+    if (fd >= 0 && fstat(fd, &status) == 0 && S_ISREG(status.st_mode) &&
+        status.st_size < D200_HIDSHIM_LOG_LIMIT) {
+        /* The path is bounded with a precision limit rather than left to the
+         * format, so a long socket path cannot eat the rest of the record; the
+         * `#if` above is what proves the whole line still fits. */
+        char line[D200_HIDSHIM_LOG_CHARS];
+        int length = snprintf(
+            line, sizeof(line),
+            "{\"event\":\"hidshimBridgeUnreachable\",\"pid\":%ld,"
+            "\"clock\":\"host-monotonic\",\"monotonicMs\":%lld,"
+            "\"socket\":\"%.*s\",\"errno\":%d,"
+            "\"reason\":\"%s\",\"hint\":\"%s\"}\n",
+            (long)getpid(), (long long)monotonic_ms(), D200_HIDSHIM_SOCKET_CHARS, SOCKET_PATH,
+            error, bridge_error_class(error), D200_HIDSHIM_HINT);
+        if (length > 0 && (size_t)length < sizeof(line)) (void)write(fd, line, (size_t)length);
+    }
+    if (fd >= 0) close(fd);
+    pthread_mutex_unlock(&diagnostic_lock);
+    errno = saved_errno;
+}
+
 static int wait_for_daemon(void)
 {
     int attempt, limit = daemon_waited ? 3 : 25;
@@ -684,6 +820,7 @@ static int wait_for_daemon(void)
     for (attempt = 0; attempt < limit; attempt++) {
         if (rpc("event", 0, NULL, 0, -1, D200_RPC_BUDGET_MS, NULL, 0, NULL, NULL, NULL) == 0)
             return 0;
+        daemon_failure_errno = errno ? errno : EIO;
         if (attempt + 1 < limit)
             usleep(200000);
     }
@@ -1177,13 +1314,21 @@ hid_device_info *hid_enumerate(unsigned short vendor, unsigned short product)
 {
     hid_device_info *virtual_list = NULL;
     int want_d200 = (!vendor || vendor == VID) && (!product || product == PID);
-    if (want_d200 &&
 #ifdef D200_HOST_VISUAL
-        rpc("event", 0, NULL, 0, -1, D200_RPC_BUDGET_MS, NULL, 0, NULL, NULL, NULL, NULL, d200_host_now()) == 0
+    int bridge_reachable = want_d200 &&
+        rpc("event", 0, NULL, 0, -1, D200_RPC_BUDGET_MS, NULL, 0, NULL, NULL, NULL, NULL, d200_host_now()) == 0;
 #else
-        (daemon_seen || wait_for_daemon() == 0)
+    /* FIX-5-T13: report an unreachable bridge once, with the reason, instead of
+     * falling through to the real hidapi in silence. `daemon_seen` keeps the
+     * probe itself one-per-process; the diagnostic keeps the *record* to one per
+     * distinct reason, whichever of them fires first. */
+    int bridge_reachable = want_d200;
+    if (bridge_reachable && !daemon_seen && wait_for_daemon() != 0) {
+        bridge_unreachable_diagnostic(D200_HIDSHIM_LOG_PATH, daemon_failure_errno);
+        bridge_reachable = 0;
+    }
 #endif
-        )
+    if (bridge_reachable)
     {
         hid_device_info *first = identity(0);
         hid_device_info *second = identity(1);

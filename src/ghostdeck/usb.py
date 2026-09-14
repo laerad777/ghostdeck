@@ -12,6 +12,10 @@ HID_REPORT_SIZE = 1025
 
 HID_INSTALL_HINT = "hidapi is not installed (pip install hidapi)"
 USB_INSTALL_HINT = "pyusb is not installed (pip install pyusb)"
+USB_BROKEN_HINT = (
+    "pyusb is installed but `usb.core` is not importable -- a partial, shadowed or interrupted "
+    "install; reinstall it (pip install --force-reinstall pyusb)"
+)
 
 
 def _importable(name: str) -> bool:
@@ -19,6 +23,24 @@ def _importable(name: str) -> bool:
         return importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
         return False
+
+
+def _usb_core_usable() -> str | None:
+    """None when `usb.core` -- the submodule this module actually calls -- is importable.
+
+    `find_spec("usb")` answers a different question. A partial or interrupted install, a
+    namespace-package collision, or any stub named `usb` all leave an importable `usb` without a
+    `usb.core`, and the old package-only check then called the environment healthy and let
+    `_usb_find()` degrade to "no deck" -- blaming the hardware for a broken install (T13, the same
+    class as A-004/A-108). Asked through `_importable`, so the resolution mechanism is the one the
+    module already uses: `find_spec` returns None for a package without the submodule and raises
+    `ModuleNotFoundError` when `usb` is not a package at all -- both are "not importable".
+    """
+    if not _importable("usb"):
+        return USB_INSTALL_HINT
+    if not _importable("usb.core"):
+        return USB_BROKEN_HINT
+    return None
 
 
 def missing_dependency() -> str | None:
@@ -29,9 +51,7 @@ def missing_dependency() -> str | None:
     """
     if not _importable("hid"):
         return HID_INSTALL_HINT
-    if not _importable("usb"):
-        return USB_INSTALL_HINT
-    return None
+    return _usb_core_usable()
 
 
 class MissingDependency(RuntimeError):
@@ -47,10 +67,16 @@ def _hid_module():
 
 
 def detect() -> dict:
-    adb_hit = _adb_device()
-    if adb_hit is not None:
-        return adb_hit
-    hid_hit = _hid_device()
+    try:
+        adb_hit = _adb_device()
+        if adb_hit is not None:
+            return adb_hit
+        hid_hit = _hid_device()
+    except MissingDependency:
+        # A backend that is present but broken cannot answer the bus question. `detect()` still has
+        # to return its documented dict -- the callers read the `dependency` key -- so the unusable
+        # verdict is converted here rather than escaping as a crash.
+        adb_hit = hid_hit = None
     if hid_hit is not None:
         return hid_hit
     result = {"serial": None, "vid": None, "pid": None, "mode": "none"}
@@ -62,8 +88,17 @@ def detect() -> dict:
 
 
 def virtual_hid_enumerated() -> bool:
-    """True only if 2207:0019 is on the bus while the physical deck is ADB."""
-    return bool(_adb_device() is not None and _hid_present())
+    """True only if 2207:0019 is on the bus while the physical deck is ADB.
+
+    The caller is `vhid.status()` on the `ghostdeck status` path, whose host-side fields are still
+    true when a backend is unusable and which must therefore keep its bool contract. The unusable
+    case is reported as "not enumerated" here; the environment verdict itself comes from
+    `missing_dependency()`, which `status` consults and turns into exit 2 (T13).
+    """
+    try:
+        return bool(_adb_device() is not None and _hid_present())
+    except MissingDependency:
+        return False
 
 
 def enable_adb(*, timeout: float = 15.0) -> dict:
@@ -205,12 +240,22 @@ def _hid_iface0(*, timeout: float):
 
 
 def _usb_find(vid: int, pid: int):
+    """The pyusb handle for `vid:pid`, or None when the bus has no such device.
+
+    A `usb` package whose `usb.core` cannot be imported is raised, not swallowed: the caller cannot
+    tell "the bus is empty" from "the backend is broken" otherwise, and "no device" is the answer
+    that blames the deck (T13). The boundary is the import of the submodule itself -- an exception
+    from `usb.core.find()` is a runtime failure while talking to a device that is present, which is
+    a different case and keeps returning None.
+    """
     if not _importable("usb"):
+        # No pyusb at all: this probe cannot answer, and every caller that needs an environment
+        # verdict reads it from `missing_dependency()`.
         return None
     try:
         import usb.core
-    except ImportError:
-        return None
+    except ImportError as error:
+        raise MissingDependency(USB_BROKEN_HINT) from error
     try:
         return usb.core.find(idVendor=vid, idProduct=pid)
     except Exception:

@@ -212,20 +212,61 @@ def own_state_record(path):
     return stored if isinstance(stored, dict) else None
 
 
+def _socket_inode(path):
+    """True only when `path` itself is currently an AF_UNIX socket inode.
+
+    `os.lstat`, never a following `stat`, exactly as `endpoint_identity` classifies
+    the same path: the endpoint this module binds is the path, not whatever a
+    symlink points at. Any failure to look -- including a path that no longer
+    exists -- answers False, which the caller reads as "not a socket", i.e. never
+    proof of death.
+    """
+    try:
+        return stat.S_ISSOCK(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def socket_listener_live(path):
     """True when the AF_UNIX endpoint at `path` is served or cannot be proven dead.
 
-    Only a refused connection or a missing path proves that no listener owns the
+    Only a missing path or a refused *socket* proves that no listener owns the
     endpoint. Every other failure (EMFILE, EAGAIN, a timeout, EACCES) means
     liveness cannot be excluded, so a caller must not unlink the path.
+
+    The verdict is taken from what the path *is* before the errno of a failed
+    connect is consulted, because that errno is not portable: connecting to a
+    regular file raises ENOTSOCK on macOS but ECONNREFUSED on Linux, and
+    ECONNREFUSED is exactly how a genuinely dead listener answers. Deciding from
+    the error alone therefore made the rule above hold only on macOS -- on Linux
+    `BridgeServer` classified a planted regular file as a dead endpoint and
+    unlinked it (finding A-200). No errno list can be trusted to enumerate every
+    platform's answer for "this is not a socket", so the path's own shape states
+    the precondition instead: absent is dead, a socket is probed, and anything
+    else -- a regular file, a fifo, a directory, and a symlink, which is not
+    followed here any more than `endpoint_identity` follows one -- is refused and
+    left exactly as it is.
     """
+    try:
+        present = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not stat.S_ISSOCK(present.st_mode):
+        return True
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
             probe.settimeout(1)
             probe.connect(str(path))
         return True
-    except (ConnectionRefusedError, FileNotFoundError):
+    except FileNotFoundError:
         return False
+    except ConnectionRefusedError:
+        # A refusal proves death only for the socket inode that was just probed.
+        # If the path was swapped for something else underneath the probe, it is
+        # once again a path no listener owns and nothing here may unlink.
+        return not _socket_inode(path)
     except OSError:
         return True
 
@@ -343,6 +384,13 @@ class DeviceProxy:
         self.connected_at = 0.0
         self.ready = False
         self.restoring = False
+        # FIX-5-T14: set for the whole of close(). The reader used to keep trying to
+        # revive the transport while its own teardown was closing the socket under
+        # it -- rebuilding the device proxy on a deck that is being handed back, and
+        # re-staging there, which is churn on the exact boundary this lane is
+        # instrumenting. Distinct from `closed`, which is set late (after the local
+        # adb process is reaped) and which `_send_frame` refuses to write under.
+        self.stopping = False
         self.closed = False
         self.error = None
         self.reader = None
@@ -352,6 +400,10 @@ class DeviceProxy:
         # diagnostics only -- nothing reads them to make a decision.
         self.startup_attempt = 0
         self.last_device_command = None
+        # FIX-5-T14: the total-order counter for session-boundary records. Also
+        # diagnostics only: a lost increment costs a duplicate ordinal, never a
+        # half-written record, and no code path reads it back.
+        self.event_sequence = 0
 
     def _run(self, *arguments, timeout=15):
         """Run one device command, recording it for the attribution diagnostics.
@@ -394,14 +446,20 @@ class DeviceProxy:
         first. The siblings come second because a bridge that dies (SIGKILL, host
         crash, a failed stage) never removes its own, and nothing else ages them
         out, so they accumulate on the deck's /tmp forever.
+
+        Returns `ok` / `failed` for *this instance's own* directory only, so the
+        teardown record answers "is my own staging gone", not a count of the
+        best-effort sibling sweep.
         """
+        removed = True
         try:
             path = self.remote_dir
             if self._session_dir_shape(path):
-                self._remove_staging_dir(path)
+                removed = self._remove_staging_dir(path)
             self._reap_stale_remote_dirs()
         finally:
             self.remote_dir_staged = False
+        return 'ok' if removed else 'failed'
 
     @staticmethod
     def _session_dir_shape(path):
@@ -412,10 +470,13 @@ class DeviceProxy:
         return all(c in '0123456789abcdef' for c in path[len(SESSION_DIR_PREFIX):])
 
     def _remove_staging_dir(self, path):
+        """True when the deck accepted the removal. Callers that must report the
+        outcome (the teardown summary) read it; the best-effort siblings ignore it."""
         try:
             self._run('shell', f'rm -rf {path}', timeout=5)
         except (DeviceCommandError, OSError, subprocess.SubprocessError):
-            pass
+            return False
+        return True
 
     def _reap_stale_remote_dirs(self):
         """Best-effort removal of sibling session directories that are dead leftovers.
@@ -610,10 +671,7 @@ class DeviceProxy:
         and keeps the full `_stage()` as the answer to every uncertainty.
         """
         if self._staged_entries_present() and self._restore_staged_modes():
-            emit_diagnostic(sys.stderr, dict(
-                event='transportReviveReusedStage', pid=os.getpid(),
-                clock='host-monotonic',
-            ))
+            self._session_event('transportReviveReusedStage')
             return False
         self._stage()
         return True
@@ -640,19 +698,24 @@ class DeviceProxy:
         survives a session unless the bridge that staged it removes it. The
         per-session directory has its own cleanup; this is the one path that had
         none, and only the instance that pushed it removes it.
+
+        Returns `removed` / `failed` / `skipped` for the teardown record; the
+        existing one-line output is unchanged, because it is what the operator and
+        the master's logs already grep for.
         """
         with self.condition:
             if not self.agent_staged:
-                return
+                return 'skipped'
         try:
             self._run('shell', f'rm -f {STAGED_AGENT}', timeout=5)
         except (DeviceCommandError, OSError, subprocess.SubprocessError) as error:
             print(f'bridge_agent_remove_failed path={STAGED_AGENT} error={type(error).__name__}',
                   file=sys.stderr, flush=True)
-            return
+            return 'failed'
         with self.condition:
             self.agent_staged = False
         print(f'bridge_agent_removed path={STAGED_AGENT}', file=sys.stderr, flush=True)
+        return 'removed'
 
     def _read_exact(self, stream, length, deadline=None):
         output = bytearray()
@@ -797,6 +860,36 @@ class DeviceProxy:
         self.startup_attempt += 1
         return self.startup_attempt
 
+    def _claim_event_sequence(self):
+        self.event_sequence += 1
+        return self.event_sequence
+
+    def _session_event(self, event, **fields):
+        """One ordered, absolutely timestamped session-boundary record.
+
+        FIX-5-T14: the bridge's existing records (`transportRevive`, the video
+        terminal receipt, `bridge_agent_remove_failed`) each describe one moment
+        and none of them can be placed relative to the others, so a drop could
+        only be inferred from the order in which lines happened to be printed.
+        Every boundary record now carries `hostMonotonicNs` (absolute, same clock
+        as `clock='host-monotonic'`) and a `sequence` from one counter, so the
+        next hardware log can be sorted and the last good interaction before the
+        first failure read off directly.
+
+        Diagnostics only, exactly like `_report_startup`: it never raises into a
+        caller, it is never read back, and the fields are always bounded scalars.
+        The device command's own verb is the only device-derived value any of
+        these records carry, and the session directory never does.
+        """
+        try:
+            record = dict(event=event, pid=os.getpid(), clock='host-monotonic',
+                          hostMonotonicNs=time.monotonic_ns(),
+                          sequence=self._claim_event_sequence())
+            record.update(fields)
+            emit_diagnostic(sys.stderr, record)
+        except Exception:
+            pass
+
     def _report_startup(self, attempt, stage_started, readiness_started, error):
         """One greppable record per start attempt: what it cost and how it ended.
 
@@ -929,6 +1022,8 @@ class DeviceProxy:
             target=self._heartbeat_loop, name='d200-proxy-heartbeat', daemon=True,
         )
         self.heartbeat.start()
+        self._session_event('transportSessionStart', attempt=self.startup_attempt,
+                            generation=self.connection_generation)
 
     def _adb_ready(self):
         try:
@@ -969,21 +1064,41 @@ class DeviceProxy:
             time.sleep(0.4)
         raise RuntimeError('D200 did not enumerate through ADB')
 
+    def _report_proxy_exit(self, returncode, how):
+        """FIX-5-T14: the host's view of one device-proxy process boundary.
+
+        The deck side reports its own `proxyLifecycle` records; this is the other
+        half, and it is the one the host can timestamp. `returnCode` is None when
+        the wait itself failed, and `signal` is set only for a signalled exit, so
+        "the adb transport process died" and "the deck's agent exited" can be
+        told apart in one sorted log.
+        """
+        self._session_event(
+            'transportProxyExit',
+            returnCode=(returncode if returncode is not None and returncode >= 0 else None),
+            signal=(-returncode if returncode is not None and returncode < 0 else None),
+            how=how,
+        )
+
     def _reap_proxy_process(self):
         process = self.process
         self.process = None
         if process is None:
             return
+        how, returncode = 'reap-failed', None
         try:
-            process.wait(timeout=2)
+            returncode = process.wait(timeout=2)
+            how = 'exited'
         except subprocess.TimeoutExpired:
+            how = 'killed-after-timeout'
             try:
                 process.kill()
-                process.wait(timeout=2)
+                returncode = process.wait(timeout=2)
             except OSError:
                 pass
         except OSError:
             pass
+        self._report_proxy_exit(returncode, how)
 
     def _revive_transport(self):
         """Rebuild the ADB proxy after control-eof without dropping the host unix server."""
@@ -1145,7 +1260,10 @@ class DeviceProxy:
                     return
             except (EOFError, OSError, ProtocolError) as exc:
                 with self.condition:
-                    if self.closed:
+                    # `stopping`: this instance is tearing down; a revive here would
+                    # rebuild the device proxy after STOP was sent and re-stage on a
+                    # deck that is being handed back to the stock UI.
+                    if self.closed or self.stopping:
                         return
                     if generation != self.connection_generation:
                         continue
@@ -1155,7 +1273,8 @@ class DeviceProxy:
                         self._reconnect_transport()
                     else:
                         print(f'transport_revive reason={exc}', file=sys.stderr, flush=True)
-                        emit_diagnostic(sys.stderr, dict(event='transportRevive', reason=str(exc)))
+                        self._session_event('transportRevive', reason=str(exc),
+                                            generation=generation)
                         self._revive_transport()
                 except (EOFError, OSError, ProtocolError, RuntimeError,
                         subprocess.SubprocessError, TimeoutError) as reconnect_error:
@@ -1168,13 +1287,14 @@ class DeviceProxy:
                             self.condition.notify_all()
                         return
                     print(f'transport_revive_failed error={reconnect_error}', file=sys.stderr, flush=True)
-                    emit_diagnostic(sys.stderr, dict(
-                        event='transportReviveFailed', error=str(reconnect_error)))
+                    self._session_event('transportReviveFailed', error=str(reconnect_error),
+                                        generation=self.connection_generation)
                     time.sleep(1)
                     continue
                 else:
                     print('transport_revive_succeeded', file=sys.stderr, flush=True)
-                    emit_diagnostic(sys.stderr, dict(event='transportReviveSucceeded'))
+                    self._session_event('transportReviveSucceeded',
+                                        generation=self.connection_generation)
                     continue
 
     def _reconnect_transport(self):
@@ -1569,6 +1689,9 @@ class DeviceProxy:
         if self.video is not None:
             self.video.interrupt()
         with self.condition:
+            self.stopping = True
+            self.condition.notify_all()
+        with self.condition:
             if (self.closed and self.transport_socket is None and
                     self.process is None and self.forward_port is None and
                     not self.remote_dir_staged):
@@ -1580,17 +1703,28 @@ class DeviceProxy:
                 return
         try:
             if self.transport_socket is not None:
+                self._session_event('transportStopRequested',
+                                    generation=self.connection_generation)
                 try:
                     self._send_frame(STOP)
                 except RuntimeError:
                     pass
                 deadline = time.monotonic() + 12
+                started = time.monotonic()
                 with self.condition:
                     while not self.restoring and not self.closed:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break
                         self.condition.wait(remaining)
+                    # The boundary the next hardware run needs: the deck-side proxy
+                    # acknowledges with RESTORING/RESTORED, and only then does it
+                    # start the *unshimmed* stock service again. Everything this
+                    # method does after this record is a device command issued while
+                    # the gadget is already going back to the stock UI.
+                    self._session_event(
+                        'transportStopObserved', restoring=self.restoring, closed=self.closed,
+                        waitedSeconds=round(time.monotonic() - started, 3))
         finally:
             for stream in (self.reader_stream,):
                 if stream is not None:
@@ -1605,29 +1739,54 @@ class DeviceProxy:
                     pass
             owned_ports = {self.forward_port, self.replacement_forward_port} - {None}
             self.forward_port = self.replacement_forward_port = None
+            forwards_removed = 0
             for port in owned_ports:
                 try:
                     self._run('forward', '--remove', f'tcp:{port}', timeout=5)
+                    forwards_removed += 1
                 except (RuntimeError, OSError, subprocess.SubprocessError):
                     pass
             if self.video is not None:
                 self.video.remove_forward()
+            how, process_code = 'absent', None
             if self.process is not None:
+                how = 'exited'
                 try:
-                    self.process.wait(timeout=3)
+                    process_code = self.process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
+                    how = 'terminated-after-timeout'
                     self.process.terminate()
                     try:
-                        self.process.wait(timeout=3)
+                        process_code = self.process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
+                        how = 'killed-after-timeout'
                         self.process.kill()
-                        self.process.wait(timeout=3)
+                        process_code = self.process.wait(timeout=3)
+            # Reported before the cleanup commands below, so the record order is the
+            # order the events actually happened in: this process is gone first, then
+            # the deck-side commands run.
+            self._report_proxy_exit(process_code, how)
             with self.condition:
                 self.closed = True
                 self.condition.notify_all()
             self.process = None
-            self._remove_remote_dir()
-            self._remove_staged_agent()
+            # FIX-5-T14: one summary of the post-stop cleanup, because every one of
+            # these steps is a device command issued *after* the deck-side proxy has
+            # already started the unshimmed stock service, and each of them used to
+            # fail silently or on a different line. `bridge_agent_remove_failed` in
+            # the master's playlist log is exactly this: `stagedAgent` here is
+            # 'failed' while the deck is gone. The outcome vocabulary is fixed
+            # ('ok'/'failed'/'skipped') and no device output enters the record.
+            teardown_started = time.monotonic()
+            remote_dir = self._remove_remote_dir()
+            staged_agent = self._remove_staged_agent()
+            self._session_event(
+                'transportTeardown',
+                forwardRemove=('skipped' if not owned_ports else
+                               'ok' if forwards_removed == len(owned_ports) else 'failed'),
+                remoteDir=remote_dir, stagedAgent=staged_agent,
+                seconds=round(time.monotonic() - teardown_started, 3),
+            )
             self.transport_socket = None
             self.reader_stream = None
             self.forward_port = None
@@ -1905,6 +2064,10 @@ class VideoSession:
                                                  if 'cancelRequested' in self.phase_times and value >= self.phase_times['cancelRequested']},
                            relayBytesReceived=list(self.relay_received), relayBytesSent=list(self.relay_sent),
                            relayRecordHighwater=list(self.relay_highwater),
+                           # FIX-5-T14: one ordinal from the transport's counter, so this
+                           # receipt can be ordered against the revive/stop/teardown
+                           # records of the same session instead of only timestamped.
+                           sequence=self.proxy._claim_event_sequence(),
                            controlRotations=self.proxy.completed_rotations - self.initial_rotation_count)
         emit_diagnostic(sys.stderr, receipt)
 

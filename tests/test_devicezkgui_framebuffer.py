@@ -23,7 +23,7 @@ Three things make the guard non-tautological, which is the whole risk with a har
 2. A global invariant across all scenarios is asserted from the harness's own accounting: **zero**
    `FB_SET_COLOR_KEY` calls and **zero** `close()` calls on any descriptor that did not just answer
    the `/dev/fb0` probe.
-3. `test_guard_bites_on_each_regression` sabotages the spliced section three ways and requires the
+3. `test_guard_bites_on_each_regression` sabotages the spliced section four ways and requires the
    model to *fail* each time, with the specific assertion named. The sabotage texts are matched
    exactly and a missing anchor is a hard failure, so a future refactor cannot quietly turn this
    file into a no-op.
@@ -70,16 +70,28 @@ REQUIRED_NAMES = (
 # here instead of a silently weaker guard.
 SABOTAGES = (
     (
-        "release path drops the saved key instead of restoring it (the pre-T6/T6 shape)",
+        "release path drops the saved key instead of restoring it through a fresh handle",
+        "        framebuffer_fd = -1;\n"
+        "        framebuffer_teardown = 1;\n"
+        "        if (framebuffer_configured)\n"
+        "            restore_color_key_through_fresh_handle();\n",
+        "        framebuffer_fd = -1;\n"
+        "        framebuffer_teardown = 1;\n"
+        "        framebuffer_configured = 0;\n",
+        "the release path restored through exactly one fresh handle",
+    ),
+    (
+        "release path clears the obligation when the discharge failed (the B-134/B-141 residual)",
+        "        framebuffer_fd = -1;\n"
+        "        framebuffer_teardown = 1;\n"
+        "        if (framebuffer_configured)\n"
+        "            restore_color_key_through_fresh_handle();\n",
         "        framebuffer_fd = -1;\n"
         "        framebuffer_teardown = 1;\n"
         "        if (framebuffer_configured)\n"
         "            restore_color_key_through_fresh_handle();\n"
         "        framebuffer_configured = 0;\n",
-        "        framebuffer_fd = -1;\n"
-        "        framebuffer_teardown = 1;\n"
-        "        framebuffer_configured = 0;\n",
-        "the release path restored through exactly one fresh handle",
+        "the failed discharge left the black-out obligation pending",
     ),
     (
         "probe-failure arm drops the handle without reopening (the pre-T6 shape)",
@@ -163,6 +175,7 @@ static int total_close_other;
 static int total_set_probe;
 static int total_close_probe;
 static int probe_fail_fd = -1;        /* GET fails here while fcntl() succeeds  */
+static int fail_next_fb_open;         /* the next /dev/fb0 open fails transiently */
 static int last_set_fd = -1;
 static struct color_key last_set_key;
 static struct color_key live_key;
@@ -185,6 +198,7 @@ static void reset(void)
     memset(close_on_other_fd, 0, sizeof(close_on_other_fd));
     n_fb_open = 0;
     probe_fail_fd = -1;
+    fail_next_fb_open = 0;
     last_set_fd = -1;
     framebuffer_fd = -1;
     framebuffer_configured = 0;
@@ -207,6 +221,11 @@ static int model_open(const char *path, int flags, ...)
         va_end(ap);
     }
     if (path != NULL && strcmp(path, "/dev/fb0") == 0) {
+        if (fail_next_fb_open) {         /* injected ENODEV: no handle is handed out */
+            fail_next_fb_open = 0;
+            errno = ENODEV;
+            return -1;
+        }
         fd = open("/dev/null", O_RDWR, mode);
         if (fd >= 0 && fd < FDMAX) {
             fd_answers_probe[fd] = 1;
@@ -418,6 +437,37 @@ static void scenario_release_stays_a_pass_through(void)
     app_close(app);
 }
 
+static void scenario_release_discharge_failure_is_retried(void)
+{
+    int priv, before, writes;
+    printf("\nScenario 6: the release path's own reopen fails, then the teardown retries\n");
+    reset();
+    priv = model_open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    framebuffer_fd = priv;
+    framebuffer_configured = 1;
+    original_color_key = key(0xaa, 0xbb, 0xcc);
+    before = n_fb_open;
+    writes = total_set_probe + total_set_other;
+    fail_next_fb_open = 1;                /* the discharge's one fresh reopen fails */
+    release_framebuffer_fd(priv);         /* the close() interposer path */
+    check("the release path attempted exactly one reopen of /dev/fb0, and it failed",
+          fail_next_fb_open == 0 && n_fb_open == before);
+    check("the failed discharge left the black-out obligation pending",
+          framebuffer_configured == 1 && framebuffer_fd == -1 && framebuffer_teardown == 1);
+    check("no write was attempted while the discharge had no validated handle",
+          total_set_probe + total_set_other == writes && set_on_probe_fd[priv] == 0);
+    restore_framebuffer();                /* exit-time teardown, with the fault cleared */
+    check("the teardown retry restored the saved key through a freshly validated handle",
+          last_set_fd >= 0 && last_set_fd != priv && set_on_probe_fd[last_set_fd] == 1 &&
+          memcmp(&last_set_key, &original_color_key, sizeof(original_color_key)) == 0);
+    check("the retry never wrote through or closed the released number",
+          set_on_probe_fd[priv] == 0 && set_on_other_fd[priv] == 0 &&
+          close_on_probe_fd[priv] == 0 && close_on_other_fd[priv] == 0);
+    check("teardown ended latched, handleless and obligation-free",
+          framebuffer_teardown == 1 && framebuffer_fd == -1 && framebuffer_configured == 0);
+    app_close(priv);
+}
+
 static void scenario_recycled_number_that_answers_the_probe(void)
 {
     int priv, app;
@@ -453,6 +503,7 @@ int main(int argc, char **argv)
     scenario_recycle_while_the_obligation_is_live();
     scenario_release_stays_a_pass_through();
     scenario_recycled_number_that_answers_the_probe();
+    scenario_release_discharge_failure_is_retried();
 
     printf("\nGlobal invariant across all scenarios:\n");
     printf("  SETs through a descriptor that did not answer the /dev/fb0 probe: %d\n", total_set_other);
