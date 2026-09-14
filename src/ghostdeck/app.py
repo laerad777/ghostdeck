@@ -378,21 +378,17 @@ def main() -> int:
             self.popups = []
             prefs = config.defaultWebpagePreferences()
             if prefs is not None:
-                prefs.setPreferredContentMode_(1)
+                prefs.setPreferredContentMode_(0)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
                 NSMakeRect(0, 72, 390, 772),
                 config,
             )
             self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-            self.web.setCustomUserAgent_(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
-            )
             self.web.setUIDelegate_(self)
             self.web.setNavigationDelegate_(self)
             view.addSubview_(self.web)
             self.web.loadRequest_(
-                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://m.youtube.com"))
+                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
 
             self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 48, 374, 18))
@@ -436,7 +432,7 @@ def main() -> int:
             self.note.setDrawsBackground_(False)
             self.note.setFont_(NSFont.labelFontOfSize_(10))
             self.note.setTextColor_(NSColor.secondaryLabelColor())
-            self.note.setStringValue_("영상을 열고 재생. Studio가 켜져 있으면 덱은 ADB입니다.")
+            self.note.setStringValue_("패스키가 블루투스를 물으면 비밀번호를 쓰십시오.")
             self.note.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.note)
 

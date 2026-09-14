@@ -1,0 +1,11 @@
+#!/bin/bash
+set -e
+ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+export PATH="/opt/homebrew/bin:${HOME}/Library/Android/sdk/platform-tools:${PATH}"
+export PYTHONPATH="${ROOT}/src"
+cd "$ROOT"
+PY="${HOME}/.ghostdeck/venv/bin/python"
+if [ ! -x "$PY" ]; then
+  PY="$(command -v python3)"
+fi
+exec "$PY" -m ghostdeck gui
