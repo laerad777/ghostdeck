@@ -5,7 +5,7 @@ import sys
 
 from ghostdeck import devicebuild
 from ghostdeck import play as playmod
-from ghostdeck import studio, tree, usb, vhid
+from ghostdeck import studio, tree, usb
 
 # A missing optional backend is not a hardware verdict, so it gets its own exit code (A-102).
 # Before this, `detect` printed "no device" and exited 1 for both "no deck is attached" and
@@ -26,8 +26,8 @@ _RECOVERY_HINT = "power-cycle or replug the deck (ghostdeck cannot recover it fr
 # that `parents[2]` used to produce (`missing hidshim source: .../reference/hidshim.c`, `device
 # sources missing under .../device`, ...).
 #
-# `stop` and `quit` are deliberately NOT here. They restore the deck and clean up the host, and that
-# is exactly what a user needs when `play` cannot run -- refusing them for a missing checkout would
+# `stop` is deliberately NOT here. It restores the deck and cleans up the host, and that
+# is exactly what a user needs when `play` cannot run -- refusing it for a missing checkout would
 # take away the one command that undoes a hijacked deck. `detect`/`status` are host-side diagnostics
 # that read state only, and they stay informative in an installed copy.
 _NEEDS_TREE = ("play", "studio", "build")
@@ -53,7 +53,6 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("detect")
     sub.add_parser("status")
     sub.add_parser("stop")
-    sub.add_parser("quit")
     sub.add_parser("studio")
     sub.add_parser("build")
     p_play = sub.add_parser("play")
@@ -73,9 +72,6 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "stop":
             playmod.stop()
-            return 0
-        if args.cmd == "quit":
-            vhid.quit()
             return 0
         if args.cmd == "studio":
             studio.launch()
@@ -170,7 +166,7 @@ def _status() -> int:
     found = usb.detect()
     dependency = (found or {}).get("dependency")
     # `usb=unknown` rather than `usb=none`: with an unusable backend there is no device verdict to
-    # report, and the rest of the line (vhid, shim, copy, playing) is host-side and still true, so
+    # report, and the rest of the line (shim, copy, playing) is host-side and still true, so
     # the diagnostic keeps its value while the false conclusion and the false success code go.
     mode = found["mode"] if found else "none"
     if dependency:
@@ -183,14 +179,10 @@ def _status() -> int:
         # `usb=adb` alone read as healthy. The mode is real, so it is kept and annotated.
         mode = f"{mode} ({state})"
         print(f"{detail}; {_RECOVERY_HINT}", file=sys.stderr)
-    record = vhid.status()
     print(
-        f"usb={mode} vhid={'up' if record.get('status') == 'up' else 'down'} "
-        f"iohid={'yes' if record.get('iohid') else 'no'} "
-        f"visible={'yes' if record.get('visible') else 'no'} "
+        f"usb={mode} "
         f"shim={'up' if studio.running() else 'down'} "
         f"copy={'yes' if studio.copy_exists() else 'no'} "
-        f"release_gate={record.get('release_gate', 'blocked')} "
         f"playing={'yes' if playmod.playing() else 'no'}"
     )
     if dependency:

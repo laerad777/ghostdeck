@@ -90,9 +90,8 @@ def detect() -> dict:
 def virtual_hid_enumerated() -> bool:
     """True only if 2207:0019 is on the bus while the physical deck is ADB.
 
-    The caller is `vhid.status()` on the `ghostdeck status` path, whose host-side fields are still
-    true when a backend is unusable and which must therefore keep its bool contract. The unusable
-    case is reported as "not enumerated" here; the environment verdict itself comes from
+    Host-side diagnostics call this without treating a missing backend as a hardware verdict.
+    The unusable case is reported as "not enumerated" here; the environment verdict itself comes from
     `missing_dependency()`, which `status` consults and turns into exit 2 (T13).
     """
     try:

@@ -78,7 +78,7 @@ def test_status_with_malformed_pid_in_temp_home_is_not_fatal(tmp_path):
     combined = result.stdout + result.stderr
     for text in CRASH_TEXT:
         assert text not in combined, combined
-    assert "release_gate=" in result.stdout, result.stdout
+    assert "shim=" in result.stdout, result.stdout
     # The point of the malformed pid: it is not a running player.
     assert "playing=no" in result.stdout, result.stdout
     expected = 2 if _backend_hint() else 0

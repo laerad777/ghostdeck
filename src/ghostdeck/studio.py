@@ -463,7 +463,7 @@ def require_bridge() -> None:
     path where `play` works without the copy running.
 
     Only `play` and `studio` depend on the bridge. `stop` - the recovery command - and the read-only
-    `detect`/`status`/`quit` never touch it, and that must stay true: they are exactly what a user
+    `detect`/`status` never touch it, and that must stay true: they are exactly what a user
     needs while the bridge is down. Do not move this call into `stop`.
 
     Liveness is not ownership (A-133): a live listener that no live bridge of ours owns would leave

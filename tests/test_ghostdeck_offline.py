@@ -61,7 +61,9 @@ def _assert_status_outcome(result) -> None:
     hint = _backend_hint()
     text = result.stdout + result.stderr
     assert "Traceback" not in text, text
-    assert "release_gate=" in result.stdout, result.stdout
+    assert "shim=" in result.stdout, result.stdout
+    assert "playing=" in result.stdout, result.stdout
+    assert "vhid=" not in result.stdout, result.stdout
     if hint:
         assert hint in result.stderr, (hint, result.stderr)
         assert result.returncode == 2, (result.returncode, text)
@@ -105,11 +107,12 @@ def test_cli_help_parses():
     result = _run("--help")
     assert result.returncode == 0, result.stderr
     out = result.stdout + result.stderr
-    for name in ("play", "stop", "quit", "status", "detect", "studio", "build"):
+    for name in ("play", "stop", "status", "detect", "studio", "build"):
         assert name in out
+    assert "quit" not in out
     script = _run_script(PACKAGE / "cli.py", "-h")
     assert script.returncode == 0, script.stderr
-    for name in ("play", "stop", "quit", "status", "detect", "studio", "build"):
+    for name in ("play", "stop", "status", "detect", "studio", "build"):
         assert name in script.stdout + script.stderr
 
 
@@ -184,24 +187,24 @@ def test_readmes_describe_hidshim_copy():
     assert MARKER not in ko
 
 
-def test_status_stdout_release_gate_offline_not_visible():
+def test_status_stdout_names_shim_copy_and_playing():
     status = _run("status")
-    # This test is about the CONTENT of the status line, which is printed whatever the USB verdict is.
-    # The exit code is asserted against the reason rather than pinned, so the test does not depend on
-    # whether an optional backend happens to be installed in the interpreter running the suite.
     _assert_status_outcome(status)
     out = status.stdout
-    assert "release_gate=" in out
-    assert "visible=yes" not in out
     assert "shim=" in out
     assert "copy=" in out
-def test_play_starts_vhid_after_physical_adb():
+    assert "playing=" in out
+    assert "vhid=" not in out
+    assert "release_gate=" not in out
+
+
+def test_play_does_not_start_a_virtual_hid_keeper():
     text = (PACKAGE / "play.py").read_text(encoding="utf-8")
-    switch = text.find("switch_hid_to_adb")
-    vhid_start = text.find("vhid.start()")
-    assert switch != -1 and vhid_start != -1
-    assert switch < vhid_start
-    assert "virtual HID skipped" in text
+    assert "vhid.start()" not in text
+    assert "virtual HID skipped" not in text
+    assert "switch_hid_to_adb" in text
+
+
 def test_iohid_create_does_not_raise():
     sys.path.insert(0, str(SRC))
     from ghostdeck import iohid

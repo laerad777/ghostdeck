@@ -16,7 +16,7 @@ So the tests below are about the *shape* of the failure, not about a path string
 * an installed copy must refuse with exactly one line naming the source checkout, and must not produce
   any of the old per-file messages;
 * the resolver must not trust a directory that merely looks right (a planted `vendor/`);
-* the recovery commands (`stop`, `quit`) and the read-only diagnostics (`detect`, `status`) must keep
+* the recovery command (`stop`) and the read-only diagnostics (`detect`, `status`) must keep
   working without a checkout, because that is what a user needs when `play` cannot run;
 * every runtime asset path must sit under the one root the resolver validates, so a new asset cannot
   be added outside the checked set.
@@ -104,10 +104,10 @@ def test_an_installed_copy_refuses_in_one_line_naming_the_source_tree(tmp_path, 
 
 
 def test_the_recovery_and_diagnostic_commands_still_work_without_a_checkout(tmp_path):
-    """`stop`/`quit` restore the deck; refusing them for a missing checkout would remove the only
+    """`stop` restores the deck; refusing it for a missing checkout would remove the only
     command that undoes a hijacked deck. `detect`/`status` are host-side and must stay informative."""
     site = _installed_copy(tmp_path)
-    for command in (("stop",), ("quit",), ("detect",), ("status",)):
+    for command in (("stop",), ("detect",), ("status",)):
         result = _run_installed(tmp_path, site, *command)
         combined = result.stdout + result.stderr
         assert "source checkout" not in combined, f"`{command[0]}` was gated on the tree: {combined}"

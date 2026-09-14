@@ -85,7 +85,8 @@ def test_status_does_not_present_a_hardware_conclusion_without_a_backend(monkeyp
     assert "usb=unknown" in captured.out, captured
     assert code == ENV_EXIT, (code, captured)
     # The host-side diagnostics stay available even when the USB layer cannot be probed.
-    assert "release_gate=" in captured.out, captured
+    assert "shim=" in captured.out, captured
+    assert "playing=" in captured.out, captured
 
 
 def test_status_still_exits_zero_with_a_working_environment(monkeypatch, capsys, home):
@@ -142,8 +143,8 @@ def test_main_maps_a_missing_backend_to_the_environment_exit_code(monkeypatch, c
     def boom(*args, **kwargs):
         raise usb.MissingDependency(HINT)
 
-    monkeypatch.setattr(cli.vhid, "quit", boom)
-    code = cli.main(["quit"])
+    monkeypatch.setattr(cli.playmod, "stop", boom)
+    code = cli.main(["stop"])
     captured = capsys.readouterr()
     assert code == ENV_EXIT, (code, captured)
     assert HINT in captured.err, captured
@@ -219,7 +220,7 @@ def test_status_annotates_an_offline_transport(monkeypatch, capsys, home):
     captured = capsys.readouterr()
     assert code == OFFLINE_EXIT, (code, captured)
     assert "usb=adb (offline)" in captured.out, captured
-    assert "release_gate=" in captured.out, captured
+    assert "shim=" in captured.out, captured
     assert "power-cycle" in captured.err, captured
 
 

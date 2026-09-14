@@ -159,7 +159,7 @@ def _process_start_time(pid):
 
     ``LC_ALL=C`` and ``TZ=UTC`` keep a recorded string from diverging from a later
     reading by locale or timezone, and ``-ww`` prevents truncation, exactly as
-    ``src/ghostdeck/play.py`` and ``src/ghostdeck/vhid.py`` prove ownership. Both
+    ``src/ghostdeck/play.py`` proves ownership. Both
     identity users in this module -- the device-admission lock holder and the
     published record's owner -- go through this one oracle, so the two lanes agree
     on how identity is proven. The zone pin is load-bearing, not cosmetic:

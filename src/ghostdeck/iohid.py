@@ -31,13 +31,8 @@ REPORT_DESCRIPTOR = bytes(
         0xC0,
     ]
 )
-# The single source of the 25-byte report descriptor, handed to IOHIDUserDeviceCreate by both
-# virtual-HID bindings: this module's ctypes path and `vhid._try_iohid_user_device`'s pyobjc path
-# (which imports this constant). It used to be copied verbatim into both modules with nothing tying
-# the copies together, so an edit to one side would have made only the fallback binding wrong
-# (A-136). It lives here because `vhid` can import `iohid` and not the reverse: `iohid` must stay
-# importable without objc (it is the no-pyobjc path), and `vhid` is the module that picks between
-# the two bindings.
+# The 25-byte report descriptor handed to IOHIDUserDeviceCreate. Keys during ADB
+# play go through the hidshim Studio copy, not this userspace path.
 
 
 def _cf():
@@ -45,7 +40,7 @@ def _cf():
 
     macOS-only. Returning None rather than raising is what keeps the platform a *value*: `create()`
     is already documented to answer None when it cannot make a device, so a caller on a non-Apple
-    host -- `vhid.serve()`'s binding probe, a user running `ghostdeck status` on Linux, the offline
+    host -- a user running `ghostdeck status` on Linux, the offline
     suite on a CI runner -- gets that documented answer instead of an `OSError` traceback from a
     macOS framework path (A-155, which made the `ubuntu-latest` job red by construction).
     """
@@ -85,8 +80,7 @@ def _iokit():
     `IOHIDUserDeviceCreate` is not a usable export of the IOKit umbrella on this
     macOS: ctypes still produces a FuncPtr, but the call returns NULL. The real
     symbol lives in IOHIDLib.plugin. Even with the right dylib, a non-app process
-    (the `python -m ghostdeck.vhid` keeper) still gets NULL — keys come from the
-    hidshim Studio copy, not from this CLI path.
+    still gets NULL — keys come from the hidshim Studio copy, not from this CLI path.
     """
     candidates = (
         "/System/Library/Extensions/IOHIDFamily.kext/Contents/PlugIns/IOHIDLib.plugin/Contents/MacOS/IOHIDLib",

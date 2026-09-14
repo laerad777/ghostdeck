@@ -25,7 +25,7 @@ macOS에서 Ulanzi D200으로 JPEG를 재생합니다. 덱이 ADB일 때 Studio 
 - `~/.ghostdeck/bin/d200-color-agent` (ARM Linux 바이너리, 아래 참고)
 
 `hidapi`나 `pyusb`가 없으면 `detect`/`status`/`play`는 설치 힌트와 함께
-종료 코드 `2`입니다. `build`와 `quit`는 없어도 됩니다.
+종료 코드 `2`입니다. `build`와 `stop`은 없어도 됩니다.
 
 ## 설치
 
@@ -76,7 +76,6 @@ ghostdeck stop            # 플레이어만 중지. Studio가 켜져 있으면 �
 | `ghostdeck stop` | 플레이어를 중지합니다. 브리지가 꺼져 있으면 스톡 UI를 복원하고 `/tmp/ghostdeck-*`를 지웁니다. 브리지가 살아 있으면 덱은 ADB로 남겨 Studio 키를 유지합니다. |
 | `ghostdeck detect` | 시리얼, VID/PID, USB 모드. 덱이 없으면 실패. |
 | `ghostdeck status` | USB 모드, 심 복사본, 재생 여부. |
-| `ghostdeck quit` | 쓰이지 않는 IOHID keeper가 있으면 종료합니다. |
 
 `play`는 런처입니다. 플레이어가 짧은 유예 시간을 넘기면 바로 돌아옵니다.
 루프는 `stop`까지 계속됩니다.

@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ghostdeck import adb, devicebuild, state as gdstate, studio, tree, usb, vhid
+from ghostdeck import adb, devicebuild, state as gdstate, studio, tree, usb
 
 VENDOR_PLAY = tree.candidate_root() / "vendor" / "d200-color-play.py"
 VENDOR_DIR = tree.candidate_root() / "vendor"
@@ -481,10 +481,6 @@ def start_play(source: str) -> None:
         found = usb.detect()
     if found is None or found.get("mode") != "adb":
         raise RuntimeError("deck is not in ADB after switch")
-    try:
-        vhid.start()
-    except Exception as error:
-        print(f"virtual HID skipped: {error}", file=sys.stderr)
     try:
         _kill_play()
     except RuntimeError as error:

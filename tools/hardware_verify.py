@@ -295,8 +295,6 @@ def stop_playing() -> str:
     outcomes.append(f"stop rc={result.returncode}")
     if result.returncode != 0:
         outcomes.append((result.stdout or "").strip()[:120])
-    result = cli("quit")
-    outcomes.append(f"quit rc={result.returncode}")
     return "; ".join(outcomes)
 
 
@@ -310,7 +308,7 @@ def main() -> int:
     parser.add_argument("--media", action="append", default=None,
                         help="media file to play; repeatable. Defaults to none (bring-up/teardown only).")
     parser.add_argument("--no-clean", action="store_true",
-                        help="do not run stop/quit at the end (leaves the session up for inspection)")
+                        help="do not run stop at the end (leaves the session up for inspection)")
     args = parser.parse_args()
 
     print("== baseline ==")

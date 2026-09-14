@@ -1,6 +1,6 @@
 """`ghostdeck play` must not report a successful start for a player that is not running (A-103).
 
-Everything here is device-free: `devicebuild.ensure`, `vhid.start`, `usb.detect` and
+Everything here is device-free: `devicebuild.ensure`, `usb.detect` and
 `adb.require_adb` are stubbed, `VENDOR_PLAY` is redirected to a temp script, and HOME points at
 `tmp_path`, so nothing is compiled, copied, spawned against a real deck, or written to the
 operator's `~/.ghostdeck`.
@@ -30,7 +30,7 @@ def deck_home(tmp_path, monkeypatch):
     """A stubbed deck path plus a temp HOME, so start_play can reach `Popen` and nothing else.
 
     T19 added one more precondition to reaching `Popen`: the hidshim bridge must be serving
-    `SOCKET`. It is stubbed here like every other precondition (`devicebuild.ensure`, `vhid.start`,
+    `SOCKET`. It is stubbed here like every other precondition (`devicebuild.ensure`,
     `usb.detect`, `adb.require_adb`) - liveness and ownership are two lambdas, so no test in this file
     opens a socket, and none can see or disturb a real bridge. A test that wants the refusal
     overrides `_socket_state` with `_ENDPOINT_DEAD`.
@@ -48,7 +48,6 @@ def deck_home(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "STATE_PATH", home / ".ghostdeck" / "state.json")
     monkeypatch.setattr(devicebuild, "ensure", lambda: None)
     monkeypatch.setattr(play, "_require_tools", lambda source: None)
-    monkeypatch.setattr(play.vhid, "start", lambda: None)
     monkeypatch.setattr(play.adb, "require_adb", lambda: None)
     monkeypatch.setattr(usb, "detect", lambda: {"serial": "FAKESERIAL", "mode": "adb"})
     monkeypatch.setattr(studio, "SOCKET", tmp_path / "bridge.sock")
@@ -191,7 +190,6 @@ def test_start_play_refuses_without_the_bridge_and_spawns_nothing(tmp_path, monk
     monkeypatch.setattr(play.gdstate, "ensure_dirs", forbidden)
     monkeypatch.setattr(play.devicebuild, "ensure", forbidden)
     monkeypatch.setattr(play.usb, "detect", forbidden)
-    monkeypatch.setattr(play.vhid, "start", forbidden)
     monkeypatch.setattr(play.gdstate, "update", forbidden)
     monkeypatch.setattr(
         play,

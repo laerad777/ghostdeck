@@ -24,7 +24,7 @@ at runtime, never committed.
 - `~/.ghostdeck/bin/d200-color-agent` (ARM Linux binary; see below)
 
 `detect`, `status`, and `play` exit `2` with an install hint if `hidapi` or
-`pyusb` is missing. `build` and `quit` do not need them.
+`pyusb` is missing. `build` and `stop` do not need them.
 
 ## Install
 
@@ -75,7 +75,6 @@ bridge that copy's shim sees no device.
 | `ghostdeck stop` | Stop the player. If the bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is up, leave the deck in ADB so Studio keys keep working. |
 | `ghostdeck detect` | Serial, VID/PID, USB mode. Fails if no deck. |
 | `ghostdeck status` | USB mode, shim copy, playing. |
-| `ghostdeck quit` | Stop the unused IOHID keeper, if any. |
 
 `play` is a launcher: it returns after the player has survived a short grace
 window. The player keeps looping until `stop`.

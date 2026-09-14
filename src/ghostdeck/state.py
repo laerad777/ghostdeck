@@ -16,7 +16,7 @@ PLUGIN_DIR = HOME / "plugins"
 BIN_DIR = HOME / "bin"
 LOCK_NAME = ".state.lock"
 
-# vhid record fields written by vhid._write_vhid() as nested + "vhid_<name>" pairs.
+# Legacy vhid record fields, kept so an old state.json still loads.
 _VHID_FLAGS = (("experimental", True), ("iohid", False), ("visible", False))
 _VHID_IDS = ("vhid_vid", "vhid_pid_usb")
 # pid_t is a signed 32-bit int on macOS; a larger stored value cannot be signalled.
@@ -44,7 +44,7 @@ def _state_root() -> Path:
     Everything this module creates -- the tree `ensure_dirs()` makes, the lock file, the atomic temp
     file -- is derived here, from the one path whose redirection fully isolates the module. It used
     to come from the frozen `HOME`/`PLUGIN_DIR`/`BIN_DIR` siblings instead, which are read by other
-    modules (`devicebuild`, `play`, `vhid`) and are therefore patchable independently: a caller that
+    modules (`devicebuild`, `play`) and are therefore patchable independently: a caller that
     redirected the state file but not those siblings still made `ensure_dirs()` create, and `locked()`
     lock, the *operator's* real `~/.ghostdeck` (C-148/C-154: 736 mkdir calls into the real tree in a
     single three-file test run, with the suite reporting green).
