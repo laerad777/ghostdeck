@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import re
 import sys
 import threading
@@ -46,6 +47,14 @@ def run_cli(argv: list[str]) -> CommandResult:
 
 def shim_is_up(status_stdout: str) -> bool:
     return bool(_SHIM_UP.search(status_stdout))
+
+def read_pasteboard(run=subprocess.run) -> str:
+    """Safari/Chrome copy lives on the macOS pasteboard. Tk CLIPBOARD does not."""
+    try:
+        result = run(["/usr/bin/pbpaste"], capture_output=True, text=True, check=False)
+    except OSError:
+        return ""
+    return (result.stdout or "").strip()
 
 
 class DeckRemote:
@@ -168,14 +177,29 @@ def main() -> int:
         if path:
             file_var.set(path)
 
+    def paste_link(_event=None):
+        text = read_pasteboard()
+        if not text:
+            set_error("클립보드가 비어 있습니다.")
+            return "break"
+        file_var.set(text)
+        entry.icursor("end")
+        set_error("붙여넣음.")
+        return "break"
+
     frame = tk.Frame(root, padx=10, pady=8)
     frame.pack(fill="both", expand=True)
     tk.Label(frame, textvariable=status_var, anchor="w", font=("Menlo", 11)).pack(fill="x")
     tk.Label(frame, text="파일 경로 또는 https:// 링크", anchor="w").pack(fill="x", pady=(8, 0))
     row = tk.Frame(frame)
     row.pack(fill="x", pady=(2, 4))
-    tk.Entry(row, textvariable=file_var).pack(side="left", fill="x", expand=True)
+    entry = tk.Entry(row, textvariable=file_var)
+    entry.pack(side="left", fill="x", expand=True)
+    tk.Button(row, text="붙여넣기", command=paste_link).pack(side="left", padx=(6, 0))
     tk.Button(row, text="열기", command=choose).pack(side="left", padx=(6, 0))
+    for seq in ("<Command-v>", "<Command-V>", "<Control-v>", "<Control-V>"):
+        entry.bind(seq, paste_link)
+        root.bind(seq, paste_link)
     buttons = tk.Frame(frame)
     buttons.pack(fill="x", pady=4)
     play_btn = tk.Button(buttons, text="재생", command=lambda: kick("play"))

@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ghostdeck.app import CommandResult, DeckRemote, shim_is_up
+from ghostdeck.app import CommandResult, DeckRemote, read_pasteboard, shim_is_up
 
 
 def test_shim_is_up_reads_the_status_line():
@@ -16,6 +16,24 @@ def test_shim_is_up_reads_the_status_line():
     assert not shim_is_up("usb=adb shim=down copy=yes playing=no")
     assert not shim_is_up("usb=none")
     assert not shim_is_up("usb=adb copy=yes playing=no")
+
+
+def test_read_pasteboard_uses_macos_pbpaste_not_tk():
+    class Result:
+        stdout = "  https://youtu.be/dQw4w9WgXcQ  \n"
+
+    def run(argv, **_kwargs):
+        assert argv == ["/usr/bin/pbpaste"]
+        return Result()
+
+    assert read_pasteboard(run=run) == "https://youtu.be/dQw4w9WgXcQ"
+
+
+def test_read_pasteboard_is_empty_when_pbpaste_is_missing():
+    def run(argv, **_kwargs):
+        raise OSError("no pbpaste")
+
+    assert read_pasteboard(run=run) == ""
 
 
 def test_play_starts_studio_when_the_shim_is_down():
