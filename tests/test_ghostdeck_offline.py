@@ -107,12 +107,12 @@ def test_cli_help_parses():
     result = _run("--help")
     assert result.returncode == 0, result.stderr
     out = result.stdout + result.stderr
-    for name in ("play", "stop", "status", "detect", "studio", "build"):
+    for name in ("play", "stop", "status", "detect", "studio", "build", "gui"):
         assert name in out
     assert "quit" not in out
     script = _run_script(PACKAGE / "cli.py", "-h")
     assert script.returncode == 0, script.stderr
-    for name in ("play", "stop", "status", "detect", "studio", "build"):
+    for name in ("play", "stop", "status", "detect", "studio", "build", "gui"):
         assert name in script.stdout + script.stderr
 
 

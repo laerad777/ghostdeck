@@ -55,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("stop")
     sub.add_parser("studio")
     sub.add_parser("build")
+    sub.add_parser("gui")
     p_play = sub.add_parser("play")
     p_play.add_argument("source")
     args = parser.parse_args(argv)
@@ -80,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
             studio.ensure_copy()
             devicebuild.ensure()
             return 0
+        if args.cmd == "gui":
+            from ghostdeck.app import main as gui_main
+            return gui_main()
     except usb.MissingDependency as error:
         # The backend, not the deck (A-102). No command can reach a hardware conclusion here, so
         # every one of them reports the environment and exits with the environment code.
