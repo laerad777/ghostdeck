@@ -45,8 +45,15 @@ LISTING_ARGV = f"-s {SERIAL} shell ls /tmp/ghostdeck*"
 CAT_FUNCTIONS = "cat /sys/class/zkswe_usb/zkswe0/functions"
 PROBE_ARGV = f"-s {SERIAL} shell {CAT_FUNCTIONS}"
 PHONE_PROBE_ARGV = f"-s PHONE123 shell {CAT_FUNCTIONS}"
+GETPROP_ARGV = f"-s {SERIAL} shell getprop sys.usb.config"
 RESTORE_ARGV = [CTL_STOP_ARGV, CTL_START_ARGV]
 STOP_ARGV = [DEVICES_ARGV, CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV, LISTING_ARGV]
+# After the stock-UI bounce, `stop` waits for the deck to answer again before returning, so that a
+# completed stop means the deck is usable rather than only that the restart was issued. Measured on
+# the attached deck: a session opened immediately after the bounce saw 79 frames and CLEANUP_FAILED,
+# where a 5s gap saw 293 healthy frames. That wait re-reads the serial and then probes the transport.
+RECOVERY_ARGV = [DEVICES_ARGV, GETPROP_ARGV]
+STOP_ARGV_WITH_SESSION = STOP_ARGV + RECOVERY_ARGV
 
 # Every fake adb records its own invocation FIRST, before any of its own logic runs. Without this an
 # empty `calls` list cannot be distinguished from a fake that simply never logged, which is how a
@@ -123,6 +130,8 @@ def _cli(
     system_path: str = "/usr/bin:/bin",
     tz: str | None = None,
     deck_serial: str | None = SERIAL,
+    stub_session_released: bool | None = None,
+    python_source: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str], Path]:
     """Run the CLI with a temp HOME, an explicit PATH, and a stubbed USB layer.
 
@@ -134,6 +143,15 @@ def _cli(
     It is STUBBED rather than left to the host, because otherwise every one of these tests would
     depend on whether this machine happens to have a D200 attached and a pyusb to see it. Pass None
     to model an environment where the USB layer has no verdict (no deck, or no backend).
+
+    `stub_session_released` pins `play._session_released`'s answer in the child. `stop()` waits for the
+    media session to release before bouncing the stock UI, and the bound is 8s; a test whose subject is
+    the caller's response to a refusal must not spend that 8s, and must not depend on the host's live
+    session record either. The predicate itself is covered directly, in-process, further down.
+
+    `python_source` runs that snippet instead of the CLI, in the SAME child environment, so a test can
+    assert the harness's own setup (which shared global the child actually sees) rather than re-derive
+    the environment and assert nothing about the one the tests use.
     """
     bin_dir = tmp_path / "bin"
     home = tmp_path / "home"
@@ -156,10 +174,23 @@ def _cli(
     )
     shim = tmp_path / "shim"
     shim.mkdir(exist_ok=True)
+    session_stub = (
+        ""
+        if stub_session_released is None
+        else f"_play._session_released = lambda *a, **k: {stub_session_released!r}\n"
+    )
     (shim / "sitecustomize.py").write_text(
         "# Test-only stub of the USB layer (FIX-1-T15).\n"
         "import ghostdeck.usb as _usb\n"
-        f"_usb.detect = lambda: {verdict!r}\n",
+        f"_usb.detect = lambda: {verdict!r}\n"
+        "# The player's published session record lives at a fixed /tmp path that HOME isolation\n"
+        "# cannot redirect, so a real leftover record from a manual run would be inherited by every\n"
+        "# test. Point it inside the temp tree: `stop()` reads it to decide whether a media session\n"
+        "# is still live before bouncing the stock UI.\n"
+        "import pathlib as _pathlib\n"
+        "import ghostdeck.play as _play\n"
+        f"_play._HOST_STATE = _pathlib.Path({str(tmp_path / 'host-state.json')!r})\n"
+        + session_stub,
         encoding="utf-8",
     )
     log = tmp_path / "adb.log"
@@ -172,8 +203,13 @@ def _cli(
     )
     if tz is not None:
         env["TZ"] = tz
+    command = (
+        [sys.executable, "-c", python_source]
+        if python_source is not None
+        else [sys.executable, "-m", "ghostdeck.cli", *(args or ("stop",))]
+    )
     result = subprocess.run(
-        [sys.executable, "-m", "ghostdeck.cli", *(args or ("stop",))],
+        command,
         cwd=str(ROOT),
         env=env,
         capture_output=True,
@@ -372,7 +408,7 @@ def test_stop_does_not_kill_a_recycled_pid(tmp_path):
         # A-101: the identity problem decides the exit code, never whether the deck is restored.
         # The cleanup runs in full even here, which is a real assertion because HAPPY_ADB logs
         # every invocation (see test_every_fake_adb_logs_its_invocations).
-        assert calls == STOP_ARGV, f"the deck was left unrestored: {calls}"
+        assert calls == STOP_ARGV_WITH_SESSION, f"the deck was left unrestored: {calls}"
         state = json.loads((home / ".ghostdeck" / "state.json").read_text())
         assert state["play_pid"] == victim.pid  # unclassifiable pid must not be erased
     finally:
@@ -606,7 +642,11 @@ def test_genuine_player_round_trip_is_recognised_and_stopped(tmp_path):
         )
         assert result.returncode == 0, result.stderr
         assert not _alive(ours), "stop() did not terminate its own player"
-        assert calls[-1] == STOP_ARGV[-1]
+        # The listing is the last CLEANUP call; the transport-recovery probe runs after it, so assert
+        # the listing is present rather than last. The intent is "the device cleanup ran", not the
+        # ordering of the tail.
+        assert STOP_ARGV[-1] in calls, calls
+        assert calls[-len(RECOVERY_ARGV):] == RECOVERY_ARGV, calls
         assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
         assert not (home / ".ghostdeck" / "play.pid").exists()
     finally:
@@ -743,7 +783,7 @@ def test_identity_survives_a_timezone_change_between_record_and_stop(tmp_path, m
         )
         assert result.returncode == 0, result.stderr
         assert not _alive(ours), "a TZ difference made stop() miss its own running player"
-        assert calls == STOP_ARGV
+        assert calls == STOP_ARGV_WITH_SESSION
         assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
         assert not (home / ".ghostdeck" / "play.pid").exists()
     finally:
@@ -772,7 +812,7 @@ def test_stop_runs_the_device_cleanup_even_when_the_identity_is_unknown(tmp_path
         assert "not signalling" in result.stderr, result.stderr
         assert "Traceback" not in result.stdout + result.stderr
         assert _alive(victim), "an unclassifiable pid was signalled"
-        assert calls == STOP_ARGV, f"the deck was left exactly as it was: {calls}"
+        assert calls == STOP_ARGV_WITH_SESSION, f"the deck was left exactly as it was: {calls}"
         saved = json.loads((home / ".ghostdeck" / "state.json").read_text())
         assert saved["play_pid"] == victim.pid, "the only handle on the player was erased"
     finally:
@@ -1312,10 +1352,245 @@ def test_stop_erases_the_record_once_the_deck_is_restored(tmp_path):
             HAPPY_ADB, tmp_path, "stop", pre_state={"play_pid": ours.pid}, sidecar=recorded
         )
         assert result.returncode == 0, result.stderr
-        assert calls == STOP_ARGV, calls
+        assert calls == STOP_ARGV_WITH_SESSION, calls
         assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
         assert not (home / ".ghostdeck" / "play.pid").exists()
     finally:
         if ours.poll() is None:
             ours.kill()
         ours.wait()
+
+
+# --- the release wait: no bounce may cut a live media session (FIX-5-T16) ----------------
+#
+# `stop()` waits for the media session to release before it bounces the stock UI, because the bounce
+# tears down a live session (`terminalCode: 12 D200_VS_DISCONNECTED`) and the next session then opens
+# onto an unreleased boundary (`CLEANUP_FAILED / cleanup: unproven`). These four tests cover the two
+# refusal paths and the one line that decides whether the bounce is allowed to happen at all.
+
+
+def test_stop_does_not_bounce_the_ui_when_the_session_never_releases(tmp_path):
+    """A session that does not prove its release must leave the stock UI ALONE.
+
+    Bouncing anyway is the defect this wait exists to prevent, so the refusal has to be observable in
+    the command list: a bounce issued after a failed wait is the regression, not the message.
+    """
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        recorded = _record(ours.pid, tmp_path / "home")
+        result, calls, home = _cli(
+            HAPPY_ADB,
+            tmp_path,
+            "stop",
+            pre_state={"play_pid": ours.pid},
+            sidecar=recorded,
+            stub_session_released=False,
+        )
+        assert result.returncode != 0, result.stdout
+        assert "did not release" in result.stderr, result.stderr
+        assert "Traceback" not in result.stdout + result.stderr
+        assert CTL_STOP_ARGV not in calls, f"the UI was bounced after a failed wait: {calls}"
+        assert CTL_START_ARGV not in calls, f"the UI was bounced after a failed wait: {calls}"
+        # The player IS stopped (it is ours and its identity is determinable); what is withheld is the
+        # device mutation that would cut the transport. The record stays so a re-run can finish.
+        assert not _alive(ours), "the player must still be signalled"
+        assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] == ours.pid
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+        ours.wait()
+
+
+def test_stop_keeps_both_failures_when_the_session_wedges_and_identity_is_unverifiable(tmp_path):
+    """Two independent failures must both reach the user; neither may mask the other.
+
+    The pre-existing pairing (`_cleanup_device` + identity) has a dedicated test; this is the same
+    contract for the new refusal, which is the third way `stop` can fail.
+    """
+    victim = _victim()
+    try:
+        time.sleep(0.3)
+        result, calls, _ = _cli(
+            HAPPY_ADB,
+            tmp_path,
+            "stop",
+            pre_state={"play_pid": victim.pid},
+            stub_session_released=False,
+        )
+        assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+        assert "cannot verify" in result.stderr, result.stderr
+        assert "did not release" in result.stderr, result.stderr
+        assert "Traceback" not in result.stdout + result.stderr
+        assert CTL_STOP_ARGV not in calls, calls
+        assert _alive(victim), "an unverifiable pid must never be signalled"
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_the_bounce_is_skipped_when_nothing_was_playing(tmp_path):
+    """Nothing to restore means no session can be cut, so the wait must not be entered at all.
+
+    This is what keeps fakes (which publish no record) and an idle host from paying the 8s bound, and
+    it is why `HAPPY_ADB` still reaches the bounce in the tests above it. The stub is pinned to
+    `False` and a NON-released record is planted, so a `stop()` that consulted the record without first
+    checking whether a session is recorded would refuse here.
+    """
+    (tmp_path / "host-state.json").write_text(
+        json.dumps({"video": {"status": {"cleanup": "pending"}}}), encoding="utf-8"
+    )
+    result, calls, home = _cli(HAPPY_ADB, tmp_path, "stop", stub_session_released=False)
+    assert result.returncode == 0, result.stderr
+    assert calls == STOP_ARGV, calls
+    assert not (home / ".ghostdeck" / "play.pid").exists()
+
+
+def test_stop_still_restores_the_deck_when_a_live_session_proves_its_release(tmp_path):
+    """The positive control: the wait must not turn a normal stop into a refusal.
+
+    H1's guarantee is that after a real session `stop` returns the deck to HID - the four clean
+    playlist cycles depend on it - so a live session whose record proves a clean release must still
+    reach the bounce, in that order. Without a live session this is indistinguishable from the skip
+    test above, which is why `play_pid` is set here.
+    """
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        recorded = _record(ours.pid, tmp_path / "home")
+        (tmp_path / "host-state.json").write_text(
+            json.dumps({"video": {"status": {"cleanup": "proven"}}}), encoding="utf-8"
+        )
+        result, calls, home = _cli(
+            HAPPY_ADB,
+            tmp_path,
+            "stop",
+            pre_state={"play_pid": ours.pid},
+            sidecar=recorded,
+            stub_session_released=None,
+        )
+        assert result.returncode == 0, result.stderr
+        assert calls == STOP_ARGV_WITH_SESSION, calls
+        assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+        ours.wait()
+
+
+# --- `_session_released`: the predicate the bounce is gated on (in-process) ----------------
+#
+# Reproduced in-process: the subject is the predicate's answer for a given record, and a subprocess
+# run of the real 8s bound would test the clock, not the logic.
+
+
+def _session(monkeypatch, tmp_path, text=None) -> bool:
+    from ghostdeck import play
+
+    record = tmp_path / "host-state.json"
+    if text is not None:
+        record.write_text(text if isinstance(text, str) else json.dumps(text), encoding="utf-8")
+    monkeypatch.setattr(play, "_HOST_STATE", record)
+    return play._session_released(0.5)
+
+
+def test_session_released_is_true_when_no_record_exists(monkeypatch, tmp_path):
+    """No record means no session to wait for - the /tmp path itself must never be consulted.
+
+    Asserting the module global is redirected first is the point: a predicate that reads the
+    operator's real `/tmp/d200-color-host.json` would answer from whatever this host happens to be
+    playing, which is exactly the leak that made three `stop` tests host-dependent.
+    """
+    from ghostdeck import play
+
+    monkeypatch.setattr(play, "_HOST_STATE", tmp_path / "absent.json")
+    assert play._HOST_STATE == tmp_path / "absent.json"
+    assert play._session_released(0.5) is True
+
+
+def test_session_released_true_for_a_proven_release_and_a_recordless_session(monkeypatch, tmp_path):
+    assert _session(monkeypatch, tmp_path, {"video": {"status": {"cleanup": "proven"}}}) is True
+    # A record that names no session has nothing to wait for either.
+    assert _session(monkeypatch, tmp_path, {"video": {"status": {}}}) is True
+
+
+def test_session_released_is_false_while_the_record_stays_pending(monkeypatch, tmp_path):
+    """A live session must hold the bounce back, and the wait must stay bounded."""
+    from ghostdeck import play
+
+    record = tmp_path / "host-state.json"
+    record.write_text(json.dumps({"video": {"status": {"cleanup": "pending"}}}), encoding="utf-8")
+    monkeypatch.setattr(play, "_HOST_STATE", record)
+    started = time.monotonic()
+    assert play._session_released(0.5) is False
+    elapsed = time.monotonic() - started
+    assert 0.5 <= elapsed < 3.0, f"the wait must be bounded by the timeout it was given: {elapsed}"
+
+
+def test_session_released_returns_true_when_the_release_arrives_during_the_wait(
+    monkeypatch, tmp_path
+):
+    """The wait exists because SIGTERM is asynchronous: `pending` must become `proven` at ~t+3s.
+
+    This is the measured shape from the deck, compressed: the record is replaced mid-wait, so the
+    predicate has to re-read rather than decide once.
+    """
+    import threading
+
+    from ghostdeck import play
+
+    record = tmp_path / "host-state.json"
+    record.write_text(json.dumps({"video": {"status": {"cleanup": "pending"}}}), encoding="utf-8")
+    monkeypatch.setattr(play, "_HOST_STATE", record)
+
+    def release():
+        time.sleep(0.3)
+        record.write_text(
+            json.dumps({"video": {"status": {"cleanup": "proven"}}}), encoding="utf-8"
+        )
+
+    writer = threading.Thread(target=release)
+    writer.start()
+    try:
+        started = time.monotonic()
+        assert play._session_released(5.0) is True
+        assert time.monotonic() - started < 5.0, "the wait must exit as soon as the release proves"
+    finally:
+        writer.join()
+
+
+def test_session_released_treats_an_unreadable_record_as_released(monkeypatch, tmp_path):
+    """A corrupt/partial record must not wedge `stop` for the full bound forever.
+
+    The player rewrites this file while it is being read, so a torn read is the realistic case, and
+    the honest answer is `no session is holding the transport` (released) rather than a permanent
+    refusal that leaves the deck in ADB.
+    """
+    assert _session(monkeypatch, tmp_path, "{not json") is True
+
+
+def test_the_stop_harness_redirects_the_shared_session_record_in_the_child(tmp_path):
+    """Guard the harness itself: the CHILD must see the temp record, not the operator's /tmp one.
+
+    FIX-2 found the leak this asserts against - three `stop` tests inherited a hardcoded
+    `/tmp/d200-color-host.json` and failed for 8.5s each whenever the host's record was not `proven`.
+    Asking the child, in the harness's own environment, is the only way to prove the redirect landed;
+    asserting it in-process would re-derive the environment and assert nothing about the real one.
+    """
+    from ghostdeck import play
+
+    result, _, _ = _cli(
+        HAPPY_ADB,
+        tmp_path,
+        python_source=(
+            "import ghostdeck.play as p; "
+            "print(p._HOST_STATE); "
+            "print(p._session_released(0.0))"
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    seen = result.stdout.splitlines()
+    assert seen[0] == str(tmp_path / "host-state.json"), (seen, str(play._HOST_STATE))
+    assert seen[0] != str(play._HOST_STATE), "the child inherited the real shared record path"
+    # No record was planted, so the predicate answers immediately rather than spending the bound.
+    assert seen[1] == "True", seen

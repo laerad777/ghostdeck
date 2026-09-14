@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from ghostdeck import adb, devicebuild, state as gdstate, studio, tree, usb, vhid
@@ -23,6 +24,26 @@ _ADB_TIMEOUT = 30.0
 # a successful start (A-103). The window is a grace period, not a health check: it is long enough to
 # catch an interpreter that starts and exits, and short enough to stay invisible to the user.
 _PLAY_GRACE = 1.0
+# `stop()` must not bounce the deck's stock UI while a media session is still live. Measured on the
+# attached deck: after SIGTERM the session keeps reporting `state=3 cleanup=pending` for ~2s and only
+# reaches `state=9 cleanup=proven` at about t+3s. The UI restart used to land inside that window and
+# tore the transport down (`terminalCode: 12 D200_VS_DISCONNECTED`), leaving the next session to open
+# onto an unreleased boundary (`CLEANUP_FAILED / cleanup: unproven`, tens of frames instead of ~600).
+# This is a bounded wait for the release, not a health check and not a retry loop.
+_SESSION_RELEASE_TIMEOUT = 8.0
+_SESSION_RELEASE_POLL = 0.25
+# The deck also needs time to serve commands again AFTER the stock-UI bounce, before a new session can
+# open. Measured by sweeping the gap between two sessions that share one bridge:
+#     settle 0s  -> second session 79 frames,  terminalCode 8  (CLEANUP_FAILED, cleanup unproven)
+#     settle 5s  -> second session 293 frames, terminalCode 0  (healthy)
+#     settle 15s -> second session 427 frames, terminalCode 0  (healthy)
+# So `stop()` waits for the transport to answer again before it returns, which makes the command's
+# completion mean "the deck is usable" rather than only "the restart was issued".
+_TRANSPORT_RECOVERY_TIMEOUT = 20.0
+_TRANSPORT_RECOVERY_POLL = 0.5
+# The player publishes the session record here (same path `vendor/d200-color-play.py` writes).
+# Module-level so a test can monkeypatch it: it lives in /tmp, which HOME isolation cannot redirect.
+_HOST_STATE = Path("/tmp/d200-color-host.json")
 # `adb devices -l` identifies some builds of the deck in their product/model/device fields (A-137),
 # matched as whole fields so `model:D200X` cannot be mistaken for the deck. This is an ADDITIONAL
 # accepted path only: the attached deck emits none of these fields (T15 - its line is
@@ -592,6 +613,69 @@ def _cleanup_device() -> None:
         print(listing.stdout, end="")
 
 
+def _session_released(timeout: float = _SESSION_RELEASE_TIMEOUT) -> bool:
+    """True once the media session has released, so the stock UI can safely be restarted.
+
+    `stop()` sends SIGTERM and then bounces the deck's stock UI. The bounce tears down a live media
+    session, so it must not happen until the player has actually let go. Measured on the attached
+    deck: the record sits at `state=3 cleanup=pending` for ~2s after SIGTERM and reaches
+    `state=9 cleanup=proven` at ~t+3s.
+
+    Reads the published session record rather than asking the bridge, because the record is already
+    the contract `_cleanup_device()` and the CLI report from, and it needs no bridge round trip.
+
+    When there is **no record at all** there is no session to wait for, so this returns True
+    immediately. That is not just an optimisation: a stop with nothing playing (or any run against a
+    fake adb, which never publishes a record) must not block for the whole timeout.
+
+    Returns False only when a record exists and never proofs a release within the bound. The caller
+    then leaves the stock UI alone: a deck still holding an ADB session with its UI running is a far
+    smaller failure than a transport cut mid-stream.
+    """
+    if not _HOST_STATE.is_file():
+        return True
+    deadline = time.monotonic() + timeout
+    while True:
+        released = True
+        try:
+            record = json.loads(_HOST_STATE.read_text())
+            status = (record.get("video") or {}).get("status") or {}
+            # A record that names no session has nothing to wait for either.
+            released = status.get("cleanup") == "proven" or not status
+        except (OSError, json.JSONDecodeError):
+            released = True
+        if released:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_SESSION_RELEASE_POLL)
+
+
+def _await_transport_recovery(timeout: float = _TRANSPORT_RECOVERY_TIMEOUT) -> bool:
+    """Wait until the deck can serve a command again after the stock-UI bounce.
+
+    Bounded, best-effort, and never fatal: if the transport does not come back, `stop` has still done
+    its job (the UI was restarted) and the deck's own state is the thing to report. A timeout here
+    must not turn a successful stop into a failure, which is why this returns a bool nobody raises on.
+    """
+    serial = _deck_serial()
+    if not serial:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = adb.run(
+                ["-s", serial, "shell", "getprop sys.usb.config"],
+                capture_output=True, text=True, timeout=_ADB_TIMEOUT,
+            )
+            if result.returncode == 0:
+                return True
+        except (subprocess.SubprocessError, OSError):
+            pass
+        time.sleep(_TRANSPORT_RECOVERY_POLL)
+    return False
+
+
 def stop() -> None:
     """Stop our player, then restore the deck.
 
@@ -606,17 +690,37 @@ def stop() -> None:
     """
     identity_error = None
     record_is_disposable = True
+    session_was_playing = gdstate.load().get("play_pid") is not None
     try:
         _kill_play(keep_record=True)
     except RuntimeError as error:
         identity_error = error
         record_is_disposable = False
+    # The stock-UI restart in `_cleanup_device()` tears down a live media session, so wait for the
+    # player to release first (see `_session_released`). Only a session that was actually playing can
+    # be holding the transport, so a stop with nothing playing skips the wait entirely.
+    if session_was_playing and not _session_released():
+        if identity_error is not None:
+            raise RuntimeError(
+                f"the media session did not release within {_SESSION_RELEASE_TIMEOUT:.0f}s, so the "
+                f"stock UI was left alone rather than cut the transport mid-stream; "
+                f"re-run `ghostdeck stop` (as well as: {identity_error})"
+            )
+        raise RuntimeError(
+            f"the media session did not release within {_SESSION_RELEASE_TIMEOUT:.0f}s, so the stock "
+            f"UI was left alone rather than cut the transport mid-stream; re-run `ghostdeck stop`"
+        )
     try:
         _cleanup_device()
     except RuntimeError as cleanup_error:
         if identity_error is None:
             raise
         raise RuntimeError(f"{cleanup_error} (as well as: {identity_error})") from cleanup_error
+    # The stock-UI bounce leaves the deck briefly unable to serve a new session (measured: a session
+    # opened immediately after saw 79 frames and CLEANUP_FAILED, where a 5s gap saw 293 healthy
+    # frames). Wait for the transport to answer again so `stop` returning means the deck is usable.
+    if session_was_playing:
+        _await_transport_recovery()
     if record_is_disposable:
         _clear_play_records()
     if identity_error is not None:
