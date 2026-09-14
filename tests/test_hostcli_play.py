@@ -247,12 +247,11 @@ def test_require_bridge_accepts_only_a_live_bridge_of_ours(tmp_path, monkeypatch
 
 
 def test_stop_detect_and_status_stay_usable_without_the_bridge(tmp_path, monkeypatch, deck_home):
-    """T19: only `play` and `studio` depend on the bridge, and that must stay true.
+    """T19: `play`/`studio` require a live bridge; recovery/reporting must not.
 
-    `stop` is the recovery command and `detect`/`status` are the reporting commands, so they are
-    exactly what a user runs while the bridge is down. Poisoning the liveness probe, the ownership
-    record and the requirement itself makes a future `require_bridge()` call in one of these paths
-    fail here, instead of taking the recovery command away from the user who needs it.
+    `stop` may *read* socket liveness (to skip the zkswe bounce while Studio is
+    up). It must not call `require_bridge`, must not fail when the probe says
+    dead, and `detect`/`status` still must not touch the bridge at all.
     """
     from ghostdeck import cli, play, studio, usb
 
@@ -260,10 +259,8 @@ def test_stop_detect_and_status_stay_usable_without_the_bridge(tmp_path, monkeyp
         raise AssertionError("a recovery or reporting command consulted the bridge")
 
     monkeypatch.setattr(studio, "require_bridge", forbidden)
-    monkeypatch.setattr(studio, "_socket_state", forbidden)
     monkeypatch.setattr(studio, "_bridge_owner_live", forbidden)
-    # Host-side facts, not the bridge: stubbed so the assertions below cannot depend on whether this
-    # machine happens to have a built copy in `~/Applications`.
+    monkeypatch.setattr(studio, "_socket_state", lambda: ("dead", "no listener accepted the connection"))
     monkeypatch.setattr(studio, "running", lambda: False)
     monkeypatch.setattr(studio, "copy_exists", lambda: False)
     monkeypatch.setattr(
@@ -276,8 +273,6 @@ def test_stop_detect_and_status_stay_usable_without_the_bridge(tmp_path, monkeyp
     assert cli._detect() == 0
     assert cli._status() == 0
 
-    # `stop`: the player record is empty under the temp HOME, and the only device calls it can make
-    # are stubbed to success, so a bridge consult is the only thing left that could fail this.
     monkeypatch.setattr(play, "deck_transport", lambda **kwargs: ("FAKESERIAL", "device", []))
     monkeypatch.setattr(play, "_adb_mutate", lambda argv: None)
     monkeypatch.setattr(
