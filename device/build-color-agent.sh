@@ -302,7 +302,11 @@ else
         fi
     done
 fi
-[ -n "$LIBDIR" ] || die "no libturbojpeg.a found. Install the ARM Linux development package (Debian/Ubuntu: apt-get install libturbojpeg0-dev) and set TURBOJPEG_LIB=/path/to/arm-linux/lib."
+# The archive must exist before it is inspected. Without this, an explicit TURBOJPEG_LIB that points
+# at the wrong directory (a typo, or the include dir instead of the lib dir) reached the ABI guard
+# and came back as "cannot verify the object ABI ... 'ar' failed to list its members" -- which blames
+# a corrupt archive for a missing one. The prerequisite keeps its own message and its exit code.
+[ -f "$LIBDIR/libturbojpeg.a" ] || die "no libturbojpeg.a found. Install the ARM Linux development package (Debian/Ubuntu: apt-get install libturbojpeg0-dev) and set TURBOJPEG_LIB=/path/to/arm-linux/lib."
 
 if [ -n "${TURBOJPEG_INC:-}" ]; then
     INCDIR="$TURBOJPEG_INC"

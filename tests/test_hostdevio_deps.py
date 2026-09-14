@@ -628,6 +628,33 @@ def test_the_guard_fails_closed_when_the_archiver_cannot_list_members(tmp_path):
     assert "contains no ELF object members" not in combined
 
 
+def test_a_missing_archive_is_a_prerequisite_not_a_corrupt_archive(tmp_path):
+    """T6 item 3 (B-107): `TURBOJPEG_LIB` pointing at a directory that holds no archive used to
+    reach the ABI guard and come back as "cannot verify the object ABI ... 'ar' failed to list its
+    members", which blames a *corrupt* archive for one that is merely absent and sends the user
+    looking for a damage that does not exist. The prerequisite keeps its own message.
+
+    `CC` is a stub on purpose: the assertion is about the check that runs *before* any compilation,
+    so a real cross toolchain would only add a skip on machines that lack one.
+    """
+    libdir = tmp_path / "lib"
+    libdir.mkdir()
+    stub_cc = tmp_path / "stub-cc"
+    stub_cc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub_cc.chmod(0o755)
+    result = _run_recipe(
+        str(tmp_path / "out" / "d200-color-agent"),
+        home=tmp_path,
+        extra_env={"CC": str(stub_cc), "TURBOJPEG_LIB": str(libdir)},
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "no libturbojpeg.a found" in combined
+    assert "cannot verify the object ABI" not in combined, (
+        "a missing archive was reported as an unreadable one"
+    )
+
+
 @pytest.mark.skipif(
     shutil.which("armv7-linux-gnueabihf-gcc") is None
     or not Path("/opt/homebrew/lib/libturbojpeg.a").is_file(),
