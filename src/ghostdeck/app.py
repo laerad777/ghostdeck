@@ -355,7 +355,7 @@ def main() -> int:
         if error is not None:
             ctrl.seen_watch = ""
             ctrl.note.setStringValue_(f"{type(error).__name__}: {error}")
-            if pending:
+            if pending and pending != getattr(ctrl, "seen_watch", ""):
                 _gui_kick(ctrl, "play", pending, start=pending_start)
             return
         for item in results:
@@ -363,7 +363,7 @@ def main() -> int:
                 ctrl.status.setStringValue_(item.stdout.strip().splitlines()[-1])
         last = results[-1] if results else None
         if last is None:
-            if pending:
+            if pending and pending != getattr(ctrl, "seen_watch", ""):
                 _gui_kick(ctrl, "play", pending, start=pending_start)
             return
         if last.code != 0:
@@ -378,7 +378,7 @@ def main() -> int:
             ctrl.note.setStringValue_("덱에서 재생. 창과 완전 싱크는 안 됩니다.")
         elif last.argv[:1] == ["studio"]:
             ctrl.note.setStringValue_("Studio 브리지를 시작했습니다.")
-        if pending:
+        if pending and pending != getattr(ctrl, "seen_watch", ""):
             _gui_kick(ctrl, "play", pending, start=pending_start)
 
     def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False) -> None:
@@ -389,6 +389,8 @@ def main() -> int:
         if ctrl.busy and op != "status":
             return
         if op != "status":
+            if op == "play":
+                ctrl.seen_watch = source
             _gui_set_busy(ctrl, True)
             ctrl.note.setStringValue_("재생 준비…" if op == "play" else "정지…")
         pasteboard = read_pasteboard() if op == "play" else ""
@@ -569,17 +571,6 @@ def main() -> int:
         def poll_(self, _timer):
             if not self.busy:
                 _gui_kick(self, "status", "")
-            ctrl = self
-
-            def after(raw, _err):
-                page, start = parse_watch_payload(raw)
-                page = page or _gui_href(ctrl)
-                _gui_follow(ctrl, page, start=start)
-
-            self.web.evaluateJavaScript_completionHandler_(
-                "window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href",
-                after,
-            )
 
         def userContentController_didReceiveScriptMessage_(self, _ucc, message):
             body = message.body()

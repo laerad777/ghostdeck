@@ -569,6 +569,15 @@ def test_kill_play_raises_and_erases_nothing_when_identity_is_unknown(tmp_path, 
 # --- C-103: a stranger that merely mentions the vendor path ----------------
 
 
+def test_vendor_player_argv_requires_dash_u_before_the_script():
+    from ghostdeck import play
+
+    marker = str(play.VENDOR_PLAY)
+    assert play.is_vendor_player_argv(["python", "-B", "-u", marker, "https://example.com"])
+    assert not play.is_vendor_player_argv([sys.executable, "-c", "import time", marker])
+    assert not play.is_vendor_player_argv(["gjc", "--prompt", marker])
+
+
 def test_stranger_with_vendor_path_in_argv_is_not_signalable(tmp_path):
     """C-103: the old whole-`ps`-output substring test signalled this process. It must survive.
 
