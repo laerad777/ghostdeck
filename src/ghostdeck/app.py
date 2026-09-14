@@ -118,9 +118,12 @@ def playable_source(href: str, media_src: str = "") -> str:
         path = urlparse(src).path.lower()
         if path.endswith((".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")):
             return src
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    return ""
+    host = urlparse(href).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host in _YT_HOSTS or host.endswith(".youtube.com"):
+        return ""
+    return href
 
 
 def should_start_play(seen: str, href: str, media_src: str = "") -> str:
@@ -216,6 +219,7 @@ def main() -> int:
             NSTextField,
             NSViewHeightSizable,
             NSViewMaxYMargin,
+            NSViewMinXMargin,
             NSViewWidthSizable,
             NSWindow,
             NSWindowStyleMaskClosable,
@@ -244,12 +248,34 @@ def main() -> int:
 (function(){
   if (window.__ghostdeckHooked) return;
   window.__ghostdeckHooked = true;
+  function ytId(href){
+    try {
+      var u = new URL(href, location.href);
+      if (u.searchParams.get('v')) return u.searchParams.get('v');
+      var parts = u.pathname.split('/').filter(Boolean);
+      if (parts[0] && ['shorts','embed','live','v'].indexOf(parts[0]) >= 0) return parts[1] || '';
+    } catch (e) {}
+    return '';
+  }
+  function watchUrl(){
+    var id = ytId(location.href);
+    if (!id) {
+      var el = document.querySelector('[video-id]');
+      if (el) id = el.getAttribute('video-id') || '';
+    }
+    if (!id) {
+      var canon = document.querySelector('link[rel="canonical"]');
+      if (canon) id = ytId(canon.href);
+    }
+    return id ? ('https://www.youtube.com/watch?v=' + id) : String(location.href);
+  }
+  window.__ghostdeckWatch = watchUrl;
   function post(type){
     try {
       var v = document.querySelector('video');
       window.webkit.messageHandlers.ghostdeck.postMessage({
         type: type,
-        url: String(location.href),
+        url: watchUrl(),
         src: (v && v.currentSrc) ? String(v.currentSrc) : ''
       });
     } catch (e) {}
@@ -262,10 +288,11 @@ def main() -> int:
   function scan(){ document.querySelectorAll('video').forEach(hook); }
   scan();
   new MutationObserver(scan).observe(document.documentElement, {childList:true, subtree:true});
-  var last = location.href;
+  var last = watchUrl();
   setInterval(function(){
-    if (location.href !== last){
-      last = location.href;
+    var now = watchUrl();
+    if (now !== last){
+      last = now;
       post('nav');
     }
   }, 400);
@@ -281,25 +308,41 @@ def main() -> int:
 
     def _gui_apply(ctrl, results, error) -> None:
         _gui_set_busy(ctrl, False)
+        pending = getattr(ctrl, "pending_source", "")
+        ctrl.pending_source = ""
         if error is not None:
+            ctrl.seen_watch = ""
             ctrl.note.setStringValue_(f"{type(error).__name__}: {error}")
+            if pending:
+                _gui_kick(ctrl, "play", pending)
             return
         for item in results:
             if item.argv[:1] == ["status"] and item.stdout.strip():
                 ctrl.status.setStringValue_(item.stdout.strip().splitlines()[-1])
         last = results[-1] if results else None
         if last is None:
+            if pending:
+                _gui_kick(ctrl, "play", pending)
             return
         if last.code != 0:
+            ctrl.seen_watch = ""
             ctrl.note.setStringValue_(last.detail)
         elif last.argv[:1] == ["stop"]:
+            ctrl.seen_watch = ""
             ctrl.note.setStringValue_("정지. Studio가 켜져 있으면 덱은 ADB입니다.")
         elif last.argv[:1] == ["play"]:
+            if len(last.argv) > 1:
+                ctrl.seen_watch = last.argv[1]
             ctrl.note.setStringValue_("덱에서 재생. 루프는 정지까지 계속됩니다.")
         elif last.argv[:1] == ["studio"]:
             ctrl.note.setStringValue_("Studio 브리지를 시작했습니다.")
+        if pending:
+            _gui_kick(ctrl, "play", pending)
 
     def _gui_kick(ctrl, op: str, source: str) -> None:
+        if ctrl.busy and op == "play":
+            ctrl.pending_source = source
+            return
         if ctrl.busy and op != "status":
             return
         if op != "status":
@@ -320,19 +363,19 @@ def main() -> int:
         thread.start()
 
     def _gui_follow(ctrl, href: str) -> None:
-        seen, action = page_follow_action(getattr(ctrl, "seen_watch", ""), href)
-        if not action or ctrl.busy:
+        _seen, action = page_follow_action(getattr(ctrl, "seen_watch", ""), href)
+        if not action:
             return
-        ctrl.seen_watch = seen
         if action == "stop":
             _gui_kick(ctrl, "stop", "")
-        else:
-            _gui_kick(ctrl, "play", action)
+            return
+        _gui_kick(ctrl, "play", action)
 
     class Controller(NSObject):
         def init(self):
             self = objc.super(Controller, self).init()
             self.busy = False
+            self.pending_source = ""
             self.seen_watch = ""
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, 420, 844),
@@ -402,12 +445,20 @@ def main() -> int:
             fwd.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(fwd)
 
-            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(70, 52, 342, 24))
+            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(70, 52, 248, 24))
             self.url_field.setStringValue_("https://www.youtube.com")
             self.url_field.setTarget_(self)
             self.url_field.setAction_("go:")
             self.url_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.url_field)
+
+            play_btn = NSButton.alloc().initWithFrame_(NSMakeRect(322, 52, 90, 24))
+            play_btn.setTitle_("재생")
+            play_btn.setBezelStyle_(NSBezelStyleRounded)
+            play_btn.setTarget_(self)
+            play_btn.setAction_("play:")
+            play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(play_btn)
 
             self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 32, 404, 16))
             self.status.setEditable_(False)
@@ -452,6 +503,26 @@ def main() -> int:
                 return
             self.web.loadRequest_(NSURLRequest.requestWithURL_(url))
 
+        def play_(self, _sender):
+            ctrl = self
+
+            def after(href, _err):
+                page = href if isinstance(href, str) else _gui_href(ctrl)
+                source = should_start_play(getattr(ctrl, "seen_watch", ""), page)
+                if source:
+                    _gui_kick(ctrl, "play", source)
+                    return
+                watch = youtube_watch_url(page) or playable_source(page)
+                if watch:
+                    _gui_kick(ctrl, "play", watch)
+                    return
+                ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
+
+            self.web.evaluateJavaScript_completionHandler_(
+                "window.__ghostdeckWatch ? window.__ghostdeckWatch() : window.location.href",
+                after,
+            )
+
         def poll_(self, _timer):
             if not self.busy:
                 _gui_kick(self, "status", "")
@@ -461,7 +532,10 @@ def main() -> int:
                 page = href if isinstance(href, str) else _gui_href(ctrl)
                 _gui_follow(ctrl, page)
 
-            self.web.evaluateJavaScript_completionHandler_("window.location.href", after)
+            self.web.evaluateJavaScript_completionHandler_(
+                "window.__ghostdeckWatch ? window.__ghostdeckWatch() : window.location.href",
+                after,
+            )
 
         def userContentController_didReceiveScriptMessage_(self, _ucc, message):
             body = message.body()

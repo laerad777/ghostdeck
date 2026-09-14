@@ -412,6 +412,39 @@ def _is_our_player(pid):
     return _player_identity(pid)[0]
 
 
+def _signal_host_stated_player() -> None:
+    """SIGTERM the pid published in host json if it is the vendor player.
+
+    A stale state.json pid must not leave that process holding the deck.
+    The vendor script path is matched as a whole argv token, not a substring.
+    """
+    try:
+        payload = json.loads(_HOST_STATE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    pid = payload.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return
+    env = dict(os.environ, LC_ALL="C")
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "command=", "-ww", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=_PS_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    tokens = (result.stdout or "").split()
+    if str(VENDOR_PLAY) not in tokens:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
 def _clear_play_records() -> None:
     """Erase the stored pid and the identity sidecar together (A-126).
 
@@ -437,6 +470,7 @@ def _kill_play(*, keep_record: bool = False) -> None:
     if pid is None:
         # No session is recorded, so an orphaned sidecar describes nothing and is just litter.
         _remove_identity()
+        _signal_host_stated_player()
         return
     identity, reason = _player_identity(pid)
     if identity is None:
@@ -446,13 +480,15 @@ def _kill_play(*, keep_record: bool = False) -> None:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+    else:
+        _signal_host_stated_player()
     # Determinable either way, so the record is no longer meaningful. It is cleared here unless the
     # caller still needs it to outlive its own later steps.
     if not keep_record:
         _clear_play_records()
 
 
-def start_play(source: str) -> None:
+def start_play(source: str, fit: str = "auto") -> None:
     _require_tools(source)
     adb.require_adb()
     # Before any device work: an unusable SOURCE must fail cheaply and name the user's own input,

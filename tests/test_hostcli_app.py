@@ -78,6 +78,8 @@ def test_playable_source_keeps_youtube_as_a_watch_url():
     watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert playable_source("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1") == watch
     assert playable_source(watch, "https://rr.googlevideo.com/videoplayback") == watch
+    assert playable_source("https://www.youtube.com/") == ""
+    assert playable_source("https://www.youtube.com/results?search_query=x") == ""
 
 
 def test_playable_source_uses_a_direct_media_file():

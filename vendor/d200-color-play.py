@@ -520,11 +520,16 @@ def build_video_filters(args, fps, crop):
     if args.image_resolution != "native":
         raise ValueError("only native image resolution is supported")
     source_crop = f"crop={crop}," if crop != "none" else ""
-    if crop == "none":
+    fit = getattr(args, "fit", "auto")
+    if fit == "cover" or (fit == "auto" and crop != "none"):
+        spatial_filter = "scale=960:540:force_original_aspect_ratio=increase,crop=960:540"
+        if fit == "cover":
+            source_crop = ""
+    else:
         spatial_filter = ("scale=960:540:force_original_aspect_ratio=decrease,"
                           "pad=960:540:(ow-iw)/2:(oh-ih)/2:black")
-    else:
-        spatial_filter = "scale=960:540:force_original_aspect_ratio=increase,crop=960:540"
+        if fit == "pad":
+            source_crop = ""
     timeline_filter = (
         f"setpts=PTS/{args.playback_rate:.9g},"
         if args.playback_rate != 1.0 else ""
@@ -566,6 +571,7 @@ def main():
     parser.add_argument("--hardware-scale", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--pause-stock-ui", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--crop", default="auto")
+    parser.add_argument("--fit", choices=("auto", "pad", "cover"), default="auto")
     args = parser.parse_args()
     if args.pause_stock_ui or args.studio_overlay or args.hardware_scale:
         raise SystemExit("stock zkgui remains authoritative; overlay/hardware-scale/pause-stock-ui are unsupported")
@@ -630,7 +636,7 @@ def main():
         claimed = True
         source = args.input
         if source.startswith(("http://", "https://")):
-            probe = run("yt-dlp", "--no-warnings", "-f", "bv*[height<=1080]+ba/b[height<=1080]", "-g", source, capture=True)
+            probe = run("yt-dlp", "--no-warnings", "-f", "bv*[vcodec^=avc][height<=1080]+ba/b[vcodec^=avc][height<=1080]/bv*[height<=720]+ba/b[height<=1080]", "-g", source, capture=True)
             urls = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
             if not urls:
                 raise RuntimeError("yt-dlp produced no stream URL")

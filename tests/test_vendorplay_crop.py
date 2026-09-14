@@ -26,6 +26,11 @@ def test_cropdetect_limit_sees_compressed_letterbox():
     assert "cropdetect=8:2:0" not in text
 
 
+def test_youtube_stream_prefers_avc():
+    text = PLAY.read_text(encoding="utf-8")
+    assert "vcodec^=avc" in text
+
+
 def test_usable_letterbox_keeps_a_widescreen_bar_crop():
     play = _play()
     assert play._usable_letterbox_crop(1920, 1080, 1920, 804, 0, 138) == "1920:804:0:138"
