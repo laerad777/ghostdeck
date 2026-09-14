@@ -48,14 +48,11 @@ PHONE_PROBE_ARGV = f"-s PHONE123 shell {CAT_FUNCTIONS}"
 GETPROP_ARGV = f"-s {SERIAL} shell getprop sys.usb.config"
 RESTORE_ARGV = [CTL_STOP_ARGV, CTL_START_ARGV]
 STOP_ARGV = [DEVICES_ARGV, CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV, LISTING_ARGV]
-# After the stock-UI bounce, `stop` waits for the deck to answer again before returning, so that a
-# completed stop means the deck is usable rather than only that the restart was issued. It re-reads the
-# serial, then requires `_TRANSPORT_STABLE_SAMPLES` CONSECUTIVE successful probes: the deck answers at
-# t+0.1s, dips at t+3.3s and settles at t+4.3s, so a single success returns before the dip and a new
-# session opened there died with CLEANUP_FAILED / cleanup: unproven. The stable-samples count is read
-# from the module so this fixture cannot drift from the behaviour it pins.
+# After the bounce, `stop` waits on USB HID (VID/PID), not on adbd. Poking
+# `getprop` after the bounce held the gadget in ADB and H1 never completed.
+# `_await_transport_recovery` still exists for its own tests; `stop` does not call it.
 RECOVERY_ARGV = [DEVICES_ARGV] + [GETPROP_ARGV] * 6
-STOP_ARGV_WITH_SESSION = STOP_ARGV + RECOVERY_ARGV
+STOP_ARGV_WITH_SESSION = STOP_ARGV
 
 # Every fake adb records its own invocation FIRST, before any of its own logic runs. Without this an
 # empty `calls` list cannot be distinguished from a fake that simply never logged, which is how a
@@ -148,6 +145,8 @@ def _cli(
     deck_serial: str | None = SERIAL,
     stub_session_released: bool | None = None,
     recovery_timeout: float | None = None,
+    hid_after_bounce: bool = True,
+    hid_timeout: float | None = None,
     python_source: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str], Path]:
     """Run the CLI with a temp HOME, an explicit PATH, and a stubbed USB layer.
@@ -172,6 +171,13 @@ def _cli(
     bound when the function is defined, so assigning the module global would not move it - the
     default tuple is rebound instead. (That is also why the in-process tests pass `timeout=`
     explicitly.)
+    `hid_after_bounce` is the H1 USB flip: after `stop` has issued `ctl.start zkswe`,
+    `usb.detect()` must report HID (2207:0019) rather than stay frozen on ADB.
+    Discovery still needs ADB so `_cleanup_device` can address the serial; the
+    stub switches on that first `ctl.start`. Pass False to keep the gadget in ADB
+    for the HID-stuck refusal. `deck_serial=None` stays `mode=none` (no USB
+    verdict) so the HID wait is a no-op. `hid_timeout` rebinds `_await_hid_return`'s
+    default the same way as `recovery_timeout`, so a stuck-ADB refusal is not an 8s clock test.
 
     `python_source` runs that snippet instead of the CLI, in the SAME child environment, so a test can
     assert the harness's own setup (which shared global the child actually sees) rather than re-derive
@@ -191,10 +197,15 @@ def _cli(
     adb_path.chmod(0o755)
     # The USB layer is stubbed in the CHILD, via a sitecustomize on PYTHONPATH, because these tests
     # assert real exit codes and therefore need a real subprocess.
-    verdict = (
+    adb_verdict = (
         {"serial": deck_serial, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"}
         if deck_serial
         else {"serial": None, "vid": None, "pid": None, "mode": "none"}
+    )
+    hid_verdict = (
+        {"serial": deck_serial, "vid": 0x2207, "pid": 0x0019, "mode": "hid"}
+        if deck_serial
+        else adb_verdict
     )
     shim = tmp_path / "shim"
     shim.mkdir(exist_ok=True)
@@ -209,10 +220,30 @@ def _cli(
         else "_play._await_transport_recovery.__defaults__ = "
         f"({recovery_timeout!r},)\n"
     )
+    usb_lines = [
+        "import ghostdeck.usb as _usb",
+        f"_gd_box = [{adb_verdict!r}]",
+        "def _gd_detect():",
+        "    return _gd_box[0]",
+        "_usb.detect = _gd_detect",
+    ]
+    hid_flip = ""
+    if hid_after_bounce and deck_serial:
+        # Flip detect to HID after the bounce, not after the old getprop wait:
+        # `stop` no longer pokes adbd post-bounce (that held the gadget in ADB).
+        hid_flip = (
+            f"_gd_hid = {hid_verdict!r}\n"
+            "_gd_cu = _play._cleanup_device\n"
+            "def _gd_after_bounce(*a, **k):\n"
+            "    result = _gd_cu(*a, **k)\n"
+            "    _gd_box[0] = _gd_hid\n"
+            "    return result\n"
+            "_play._cleanup_device = _gd_after_bounce\n"
+        )
     (shim / "sitecustomize.py").write_text(
-        "# Test-only stub of the USB layer (FIX-1-T15).\n"
-        "import ghostdeck.usb as _usb\n"
-        f"_usb.detect = lambda: {verdict!r}\n"
+        "# Test-only stub of the USB layer (FIX-1-T15 / T20).\n"
+        + "\n".join(usb_lines)
+        + "\n"
         "# The player's published session record lives at a fixed /tmp path that HOME isolation\n"
         "# cannot redirect, so a real leftover record from a manual run would be inherited by every\n"
         "# test. Point it inside the temp tree: `stop()` reads it to decide whether a media session\n"
@@ -221,7 +252,14 @@ def _cli(
         "import ghostdeck.play as _play\n"
         f"_play._HOST_STATE = _pathlib.Path({str(tmp_path / 'host-state.json')!r})\n"
         + session_stub
-        + recovery_stub,
+        + recovery_stub
+        + hid_flip
+        + (
+            ""
+            if hid_timeout is None
+            else "_play._await_hid_return.__defaults__ = "
+            f"({hid_timeout!r},)\n"
+        ),
         encoding="utf-8",
     )
     log = tmp_path / "adb.log"
@@ -673,11 +711,7 @@ def test_genuine_player_round_trip_is_recognised_and_stopped(tmp_path):
         )
         assert result.returncode == 0, result.stderr
         assert not _alive(ours), "stop() did not terminate its own player"
-        # The listing is the last CLEANUP call; the transport-recovery probe runs after it, so assert
-        # the listing is present rather than last. The intent is "the device cleanup ran", not the
-        # ordering of the tail.
-        assert STOP_ARGV[-1] in calls, calls
-        assert calls[-len(RECOVERY_ARGV):] == RECOVERY_ARGV, calls
+        assert calls == STOP_ARGV_WITH_SESSION, calls
         assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
         assert not (home / ".ghostdeck" / "play.pid").exists()
     finally:
@@ -1742,13 +1776,8 @@ def test_the_recovery_budget_is_finite_and_polled():
     assert play._await_transport_recovery.__defaults__ == (play._TRANSPORT_RECOVERY_TIMEOUT,)
 
 
-def test_stop_still_succeeds_when_the_deck_never_comes_back(tmp_path):
-    """The end-to-end shape: bounce, then probe, then give up quietly with a success exit code.
-
-    This is the contract after the bounce - the stock UI is already restarted, so exiting non-zero
-    would report an unrecovered deck as an unrestored one, which is the opposite of what happened.
-    The budget is pinned to one poll so this tests the shape rather than spending the real 20s.
-    """
+def test_stop_does_not_probe_adbd_after_the_bounce(tmp_path):
+    """H1: after `ctl.start zkswe`, `stop` watches USB HID and must not hold adbd open."""
     ours = _ours()
     try:
         time.sleep(0.3)
@@ -1763,17 +1792,10 @@ def test_stop_still_succeeds_when_the_deck_never_comes_back(tmp_path):
             pre_state={"play_pid": ours.pid},
             sidecar=recorded,
             stub_session_released=None,
-            recovery_timeout=0.5,
         )
         assert result.returncode == 0, result.stderr
-        assert "Traceback" not in result.stderr, result.stderr
-        # The cleanup ran, and the recovery wait probed the transport without succeeding. It is
-        # bounded, so assert the shape (cleanup, then at least one probe that never stabilises) rather
-        # than an exact poll count, which depends on the pinned budget and the poll interval.
-        assert calls[: len(STOP_ARGV)] == STOP_ARGV, calls
-        assert calls[len(STOP_ARGV)] == DEVICES_ARGV, calls
-        assert len(calls) > len(STOP_ARGV) + 1, calls
-        assert all(c == GETPROP_ARGV for c in calls[len(STOP_ARGV) + 1 :]), calls
+        assert GETPROP_ARGV not in calls, calls
+        assert calls == STOP_ARGV_WITH_SESSION, calls
         assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
     finally:
         if ours.poll() is None:
@@ -1799,3 +1821,187 @@ def test_a_stale_pending_record_does_not_hold_a_stop_with_nothing_playing(tmp_pa
     assert result.returncode == 0, result.stderr
     assert calls == STOP_ARGV, calls
     assert elapsed < 8.0, f"a stop with nothing playing paid the release bound: {elapsed:.1f}s"
+
+
+# --- `_await_hid_return`: H1 is USB HID, not "adb answers" (FIX-1-T20) -------------------------
+#
+# `_await_transport_recovery` probes `getprop sys.usb.config`, which succeeds while the gadget is
+# still 18d1:d002. H1 requires 2207:0019. These tests never write USB functions; they only read
+# `usb.detect()`'s mode.
+
+
+def test_hid_return_is_immediate_when_usb_cannot_answer(monkeypatch):
+    """Fake-adb / missing backend: `mode=none` is not a stuck gadget, so the wait is a no-op."""
+    from ghostdeck import play
+
+    monkeypatch.setattr(play.usb, "detect", lambda: {"serial": None, "vid": None, "pid": None, "mode": "none"})
+    started = time.monotonic()
+    assert play._await_hid_return(timeout=5.0) is True
+    assert time.monotonic() - started < 1.0
+
+
+def test_hid_return_is_true_when_the_gadget_is_already_hid(monkeypatch):
+    from ghostdeck import play
+
+    monkeypatch.setattr(
+        play.usb,
+        "detect",
+        lambda: {"serial": SERIAL, "vid": 0x2207, "pid": 0x0019, "mode": "hid"},
+    )
+    assert play._await_hid_return(timeout=5.0) is True
+
+
+def test_hid_return_is_false_while_the_gadget_stays_adb(monkeypatch):
+    from ghostdeck import play
+
+    monkeypatch.setattr(
+        play.usb,
+        "detect",
+        lambda: {"serial": SERIAL, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"},
+    )
+    monkeypatch.setattr(play, "_HID_RETURN_POLL", 0.0)
+    started = time.monotonic()
+    assert play._await_hid_return(timeout=0.05) is False
+    assert time.monotonic() - started < 2.0
+
+
+def test_hid_return_becomes_true_when_detect_flips_to_hid(monkeypatch):
+    """The bounce is asynchronous: ADB must become HID mid-wait, not on the first sample."""
+    from ghostdeck import play
+
+    modes = iter(
+        [
+            {"serial": SERIAL, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"},
+            {"serial": SERIAL, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"},
+            {"serial": SERIAL, "vid": 0x2207, "pid": 0x0019, "mode": "hid"},
+        ]
+    )
+
+    def detect():
+        try:
+            return next(modes)
+        except StopIteration:
+            return {"serial": SERIAL, "vid": 0x2207, "pid": 0x0019, "mode": "hid"}
+
+    monkeypatch.setattr(play.usb, "detect", detect)
+    monkeypatch.setattr(play, "_HID_RETURN_POLL", 0.0)
+    assert play._await_hid_return(timeout=5.0) is True
+
+
+def test_hid_return_waits_through_the_none_dip_before_hid(monkeypatch):
+    """After ADB the gadget drops off the bus (`none`) then reappears as HID.
+
+    Measured: t+3.2s adb, t+3.7s none, t+4.2s hid. `none` after ADB is the
+    re-enumeration dip, not "USB cannot answer".
+    """
+    from ghostdeck import play
+
+    modes = iter(
+        [
+            {"serial": SERIAL, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"},
+            {"serial": None, "vid": None, "pid": None, "mode": "none"},
+            {"serial": SERIAL, "vid": 0x2207, "pid": 0x0019, "mode": "hid"},
+        ]
+    )
+
+    def detect():
+        try:
+            return next(modes)
+        except StopIteration:
+            return {"serial": SERIAL, "vid": 0x2207, "pid": 0x0019, "mode": "hid"}
+
+    monkeypatch.setattr(play.usb, "detect", detect)
+    monkeypatch.setattr(play, "_HID_RETURN_POLL", 0.0)
+    assert play._await_hid_return(timeout=5.0) is True
+
+def test_require_hid_does_not_treat_a_first_sample_none_as_success(monkeypatch):
+    """`stop` after a real session sets require_hid: a first-sample `none` is the dip."""
+    from ghostdeck import play
+
+    monkeypatch.setattr(
+        play.usb,
+        "detect",
+        lambda: {"serial": None, "vid": None, "pid": None, "mode": "none"},
+    )
+    monkeypatch.setattr(play, "_HID_RETURN_POLL", 0.0)
+    assert play._await_hid_return(timeout=0.05, require_hid=True) is False
+    assert play._await_hid_return(timeout=0.05) is True
+
+
+def test_hid_return_is_false_when_adb_drops_off_the_bus_for_good(monkeypatch):
+    """A gadget that leaves ADB and never comes back as HID is not a successful H1."""
+    from ghostdeck import play
+
+    modes = iter(
+        [
+            {"serial": SERIAL, "vid": 0x18D1, "pid": 0xD002, "mode": "adb"},
+            {"serial": None, "vid": None, "pid": None, "mode": "none"},
+        ]
+    )
+
+    def detect():
+        try:
+            return next(modes)
+        except StopIteration:
+            return {"serial": None, "vid": None, "pid": None, "mode": "none"}
+
+    monkeypatch.setattr(play.usb, "detect", detect)
+    monkeypatch.setattr(play, "_HID_RETURN_POLL", 0.0)
+    assert play._await_hid_return(timeout=0.05) is False
+
+
+def test_the_hid_return_budget_is_finite():
+    from ghostdeck import play
+
+    assert 0 < play._HID_RETURN_POLL <= play._HID_RETURN_TIMEOUT
+    assert play._HID_RETURN_TIMEOUT == 8.0
+    assert play._await_hid_return.__defaults__ == (play._HID_RETURN_TIMEOUT,)
+
+
+def test_stop_refuses_when_the_gadget_stays_adb_after_the_bounce(tmp_path):
+    """H1: `stop` must not exit 0 while usb.detect() is still mode=adb.
+
+    The bounce still runs (the waits before it are unchanged). The HID wait is the
+    thing that turns a silent ADB leftover into a named refusal.
+    """
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        recorded = _record(ours.pid, tmp_path / "home")
+        (tmp_path / "host-state.json").write_text(
+            json.dumps({"video": {"status": {"cleanup": "proven"}}}), encoding="utf-8"
+        )
+        result, calls, home = _cli(
+            HAPPY_ADB,
+            tmp_path,
+            "stop",
+            pre_state={"play_pid": ours.pid},
+            sidecar=recorded,
+            stub_session_released=None,
+            hid_after_bounce=False,
+            hid_timeout=0.2,
+        )
+        assert result.returncode != 0, result.stdout
+        assert "Traceback" not in result.stderr, result.stderr
+        assert "still in ADB" in result.stderr, result.stderr
+        assert "2207:0019" in result.stderr, result.stderr
+        assert "ghostdeck stop" in result.stderr, result.stderr
+        assert calls[: len(STOP_ARGV)] == STOP_ARGV, calls
+        # The bounce happened; the pid is kept because HID never proved (A-126:
+        # records stay until the restore is complete — HID is part of restore).
+        assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] == ours.pid
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+        ours.wait()
+
+
+def test_stop_does_not_spend_the_hid_bound_without_a_usb_verdict(tmp_path):
+    """Acceptance: stubbed `usb.detect()` to none is an immediate no-op, not an 8s wait."""
+    started = time.monotonic()
+    result, calls, _ = _cli(NO_DEVICE_ADB, tmp_path, "stop", deck_serial=None)
+    elapsed = time.monotonic() - started
+    assert result.returncode != 0, result.stdout
+    assert "no ADB device" in result.stderr
+    assert calls == [DEVICES_ARGV]
+    assert elapsed < 8.0, f"a missing USB verdict paid the HID bound: {elapsed:.1f}s"

@@ -45,6 +45,15 @@ _TRANSPORT_RECOVERY_POLL = 0.5
 # answers at t+0.1s, the deck dips at t+3.3s, and it settles at t+4.3s, so a single success returns
 # before the dip. Six samples at 0.5s covers that gap with margin.
 _TRANSPORT_STABLE_SAMPLES = 6
+# H1: after a real session the stock-UI bounce must re-enumerate the gadget as HID
+# (2207:0019). `_await_transport_recovery` only proves adbd answers, which it does
+# while the gadget is still 18d1:d002. Bound matches the original H1 observation
+# (`detect -> mode=hid` within 5s); the poll is USB, not adb.
+_HID_RETURN_TIMEOUT = 8.0
+_HID_RETURN_POLL = 0.25
+# One HID sample is not H1: after stop rc=0 in 7.2s, detect was `none` then `adb`.
+# Four samples at 0.25s is 1s of consecutive HID past the dip.
+_HID_STABLE_SAMPLES = 4
 # The player publishes the session record here (same path `vendor/d200-color-play.py` writes).
 # Module-level so a test can monkeypatch it: it lives in /tmp, which HOME isolation cannot redirect.
 _HOST_STATE = Path("/tmp/d200-color-host.json")
@@ -695,6 +704,64 @@ def _await_transport_recovery(timeout: float = _TRANSPORT_RECOVERY_TIMEOUT) -> b
     return False
 
 
+def _usb_mode() -> str | None:
+    """The USB layer's current gadget mode, or None when it cannot answer.
+
+    `usb.detect()` matches VID/PID on the bus (18d1:d002 ADB, 2207:0019 HID). A
+    missing/broken backend is not a hardware verdict (A-102), so this returns
+    None rather than inventing `adb`/`hid`. Callers that cannot see the bus
+    skip the HID-return proof instead of hanging or blaming the deck.
+    """
+    try:
+        found = usb.detect()
+    except Exception:
+        return None
+    if not found:
+        return None
+    mode = found.get("mode")
+    if mode in (None, "none"):
+        return None
+    return str(mode)
+
+
+def _await_hid_return(timeout: float = _HID_RETURN_TIMEOUT, *, require_hid: bool = False) -> bool:
+    """True once `usb.detect()` reports a *stable* HID, proving the gadget left ADB.
+
+    The bounce (`ctl.stop`/`ctl.start zkswe`) is what re-initialises the gadget;
+    this only reads VID/PID. It does not write USB functions.
+
+    Immediate True when the USB layer never reports ADB (`none`, missing backend,
+    already HID), unless `require_hid` is set.
+
+    After a real session (`require_hid=True`) a single HID sample is not H1:
+    `stop` exited 0 in 7.2s on a hid blip, then detect was `none` and then `adb`.
+    Require `_HID_STABLE_SAMPLES` consecutive HID reads. `none` after ADB is the
+    re-enumeration dip (t+3.7s none, t+4.2s hid), not "USB cannot answer".
+    """
+    mode = _usb_mode()
+    if not require_hid and (mode is None or mode == "hid"):
+        return True
+    deadline = time.monotonic() + timeout
+    consecutive = 0
+    while True:
+        mode = _usb_mode()
+        consecutive = consecutive + 1 if mode == "hid" else 0
+        if consecutive >= _HID_STABLE_SAMPLES:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_HID_RETURN_POLL)
+
+
+def _hid_stuck_message() -> str:
+    return (
+        "the stock UI was restarted but the USB gadget is still in ADB "
+        "(usb.detect() mode=adb, VID/PID 18d1:d002 not 2207:0019) after "
+        f"{_HID_RETURN_TIMEOUT:.0f}s; the bounce did not return the deck to HID. "
+        "Replug or power-cycle the deck, then re-run `ghostdeck stop`"
+    )
+
+
 def stop() -> None:
     """Stop our player, then restore the deck.
 
@@ -735,11 +802,25 @@ def stop() -> None:
         if identity_error is None:
             raise
         raise RuntimeError(f"{cleanup_error} (as well as: {identity_error})") from cleanup_error
-    # The stock-UI bounce leaves the deck briefly unable to serve a new session (measured: a session
-    # opened immediately after saw 79 frames and CLEANUP_FAILED, where a 5s gap saw 293 healthy
-    # frames). Wait for the transport to answer again so `stop` returning means the deck is usable.
+    # H1: with no bridge, the bounce re-enumerates HID and it sticks (measured 4.2s).
+    # With the ghostdeck bridge still live, HID appears for ~0.5s then ADB returns —
+    # transportRevive writes the HID-to-ADB switch the moment the gadget leaves.
+    # That is why bounce-only "used to work" and `ghostdeck studio`+play does not.
+    # Do not demand HID while the bridge is up; start vhid so Studio keys have a
+    # HID device. Next play already calls enable_adb.
     if session_was_playing:
-        _await_transport_recovery()
+        if studio._socket_live():
+            try:
+                vhid.start()
+            except Exception as error:
+                print(f"virtual HID skipped: {error}", file=sys.stderr)
+        elif not _await_hid_return(require_hid=True):
+            hid_error = RuntimeError(_hid_stuck_message())
+            if identity_error is not None:
+                raise RuntimeError(
+                    f"{hid_error} (as well as: {identity_error})"
+                ) from hid_error
+            raise hid_error
     if record_is_disposable:
         _clear_play_records()
     if identity_error is not None:
