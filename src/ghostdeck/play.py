@@ -41,6 +41,10 @@ _SESSION_RELEASE_POLL = 0.25
 # completion mean "the deck is usable" rather than only "the restart was issued".
 _TRANSPORT_RECOVERY_TIMEOUT = 20.0
 _TRANSPORT_RECOVERY_POLL = 0.5
+# How many consecutive successful probes make the transport "settled". One is not enough: the stock UI
+# answers at t+0.1s, the deck dips at t+3.3s, and it settles at t+4.3s, so a single success returns
+# before the dip. Six samples at 0.5s covers that gap with margin.
+_TRANSPORT_STABLE_SAMPLES = 6
 # The player publishes the session record here (same path `vendor/d200-color-play.py` writes).
 # Module-level so a test can monkeypatch it: it lives in /tmp, which HOME isolation cannot redirect.
 _HOST_STATE = Path("/tmp/d200-color-host.json")
@@ -657,21 +661,36 @@ def _await_transport_recovery(timeout: float = _TRANSPORT_RECOVERY_TIMEOUT) -> b
     Bounded, best-effort, and never fatal: if the transport does not come back, `stop` has still done
     its job (the UI was restarted) and the deck's own state is the thing to report. A timeout here
     must not turn a successful stop into a failure, which is why this returns a bool nobody raises on.
+
+    **It waits for the transport to be STABLE, not merely to answer once.** The stock UI comes back up
+    before the gadget settles, and the deck goes away again a few seconds later. Measured after `stop`
+    returned, polling once a second:
+
+        t+0.1s  getprop rc=0   /proc/modules rc=0     <-- a single probe would succeed here
+        t+2.2s  getprop rc=0   /proc/modules rc=0
+        t+3.3s  getprop rc=1   /proc/modules rc=1     <-- the deck dips
+        t+4.3s  getprop rc=0   /proc/modules rc=0     <-- and settles here
+
+    Returning at t+0.1s (which the first-success version did) let a new session open into that dip and
+    die with `CLEANUP_FAILED / cleanup: unproven`. Requiring several consecutive successes past the dip
+    is what makes `stop` returning mean "the deck is usable".
     """
     serial = _deck_serial()
     if not serial:
         return False
     deadline = time.monotonic() + timeout
+    consecutive = 0
     while time.monotonic() < deadline:
         try:
             result = adb.run(
                 ["-s", serial, "shell", "getprop sys.usb.config"],
                 capture_output=True, text=True, timeout=_ADB_TIMEOUT,
             )
-            if result.returncode == 0:
-                return True
+            consecutive = consecutive + 1 if result.returncode == 0 else 0
         except (subprocess.SubprocessError, OSError):
-            pass
+            consecutive = 0
+        if consecutive >= _TRANSPORT_STABLE_SAMPLES:
+            return True
         time.sleep(_TRANSPORT_RECOVERY_POLL)
     return False
 

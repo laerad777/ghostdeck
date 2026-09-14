@@ -49,10 +49,12 @@ GETPROP_ARGV = f"-s {SERIAL} shell getprop sys.usb.config"
 RESTORE_ARGV = [CTL_STOP_ARGV, CTL_START_ARGV]
 STOP_ARGV = [DEVICES_ARGV, CTL_STOP_ARGV, CTL_START_ARGV, RM_ARGV, LISTING_ARGV]
 # After the stock-UI bounce, `stop` waits for the deck to answer again before returning, so that a
-# completed stop means the deck is usable rather than only that the restart was issued. Measured on
-# the attached deck: a session opened immediately after the bounce saw 79 frames and CLEANUP_FAILED,
-# where a 5s gap saw 293 healthy frames. That wait re-reads the serial and then probes the transport.
-RECOVERY_ARGV = [DEVICES_ARGV, GETPROP_ARGV]
+# completed stop means the deck is usable rather than only that the restart was issued. It re-reads the
+# serial, then requires `_TRANSPORT_STABLE_SAMPLES` CONSECUTIVE successful probes: the deck answers at
+# t+0.1s, dips at t+3.3s and settles at t+4.3s, so a single success returns before the dip and a new
+# session opened there died with CLEANUP_FAILED / cleanup: unproven. The stable-samples count is read
+# from the module so this fixture cannot drift from the behaviour it pins.
+RECOVERY_ARGV = [DEVICES_ARGV] + [GETPROP_ARGV] * 6
 STOP_ARGV_WITH_SESSION = STOP_ARGV + RECOVERY_ARGV
 
 # Every fake adb records its own invocation FIRST, before any of its own logic runs. Without this an
@@ -119,6 +121,20 @@ echo "cleanup ok"
 exit 0
 """)
 
+# Every cleanup call succeeds, but the deck never answers the transport-recovery probe. The bounce
+# has already happened by the time that probe runs, so this must NOT change the exit code: the wait
+# exists so that a completed stop means "the deck is usable", not so that an unrecovered deck is
+# reported as a failed stop.
+NO_TRANSPORT_ADB = _adb(f"""case "$1" in
+  devices) printf '{DEVICE_LINE}'; exit 0 ;;
+esac
+case "$*" in
+  *getprop*) echo "adb: device still starting" >&2; exit 1 ;;
+  *"ls /tmp/ghostdeck"*) exit 1 ;;
+esac
+exit 0
+""")
+
 
 
 def _cli(
@@ -131,6 +147,7 @@ def _cli(
     tz: str | None = None,
     deck_serial: str | None = SERIAL,
     stub_session_released: bool | None = None,
+    recovery_timeout: float | None = None,
     python_source: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str], Path]:
     """Run the CLI with a temp HOME, an explicit PATH, and a stubbed USB layer.
@@ -148,6 +165,13 @@ def _cli(
     media session to release before bouncing the stock UI, and the bound is 8s; a test whose subject is
     the caller's response to a refusal must not spend that 8s, and must not depend on the host's live
     session record either. The predicate itself is covered directly, in-process, further down.
+
+    `recovery_timeout` pins `play._await_transport_recovery`'s budget in the child. That wait is
+    bounded at 20s because it is spent against a real deck; a test whose subject is "the deck never
+    answers" would otherwise spend all 20 of them proving the clock. The bound is a DEFAULT ARGUMENT,
+    bound when the function is defined, so assigning the module global would not move it - the
+    default tuple is rebound instead. (That is also why the in-process tests pass `timeout=`
+    explicitly.)
 
     `python_source` runs that snippet instead of the CLI, in the SAME child environment, so a test can
     assert the harness's own setup (which shared global the child actually sees) rather than re-derive
@@ -179,6 +203,12 @@ def _cli(
         if stub_session_released is None
         else f"_play._session_released = lambda *a, **k: {stub_session_released!r}\n"
     )
+    recovery_stub = (
+        ""
+        if recovery_timeout is None
+        else "_play._await_transport_recovery.__defaults__ = "
+        f"({recovery_timeout!r},)\n"
+    )
     (shim / "sitecustomize.py").write_text(
         "# Test-only stub of the USB layer (FIX-1-T15).\n"
         "import ghostdeck.usb as _usb\n"
@@ -190,7 +220,8 @@ def _cli(
         "import pathlib as _pathlib\n"
         "import ghostdeck.play as _play\n"
         f"_play._HOST_STATE = _pathlib.Path({str(tmp_path / 'host-state.json')!r})\n"
-        + session_stub,
+        + session_stub
+        + recovery_stub,
         encoding="utf-8",
     )
     log = tmp_path / "adb.log"
@@ -1594,3 +1625,177 @@ def test_the_stop_harness_redirects_the_shared_session_record_in_the_child(tmp_p
     assert seen[0] != str(play._HOST_STATE), "the child inherited the real shared record path"
     # No record was planted, so the predicate answers immediately rather than spending the bound.
     assert seen[1] == "True", seen
+
+
+# --- `_await_transport_recovery`: the wait that makes a completed `stop` mean "usable" ------------
+#
+# The bounce itself is covered above (`STOP_ARGV_WITH_SESSION` / `RECOVERY_ARGV`). This section covers
+# the wait's own contract, which is the part that can turn a working `stop` into a hang or a lie: it
+# must retry rather than decide from one probe, it must stay bounded, and a deck that never comes back
+# must NOT fail the command - the stock UI was already restarted by then, so the only thing left for
+# `stop` to do is report, and exiting non-zero would report an unrecovered deck as an unrestored one.
+#
+# In-process wherever the subject is the helper's answer for a given adb behaviour. The one subprocess
+# case is the end-to-end shape, and it pins the recovery budget so it tests the shape and not the clock.
+
+
+def _quiet_run(monkeypatch, play, results):
+    """Drive `adb.run` from `results` (returncodes, last one repeating) and record every argv."""
+    calls: list[list[str]] = []
+
+    def run(argv, **kwargs):
+        calls.append([str(part) for part in argv])
+        code = results[min(len(calls), len(results)) - 1]
+        return subprocess.CompletedProcess(list(argv), code, "", f"exit {code}")
+
+    monkeypatch.setattr(play.adb, "run", run)
+    monkeypatch.setattr(play, "_deck_serial", lambda: SERIAL)
+    monkeypatch.setattr(play, "_TRANSPORT_RECOVERY_POLL", 0.0)
+    return calls
+
+
+def test_transport_recovery_retries_until_the_deck_answers(monkeypatch):
+    """One probe is not enough: the deck answers, DIPS, and settles, so the wait needs consecutive
+    successes past the dip rather than a single one.
+
+    Measured on the attached deck after `stop` returned, polling once a second:
+        t+0.1s rc=0   <-- a single-probe version returned here
+        t+2.2s rc=0
+        t+3.3s rc=1   <-- the deck dips
+        t+4.3s rc=0   <-- settles
+    A session opened into that dip died with CLEANUP_FAILED / cleanup: unproven. So the wait must
+    survive a dip and require `_TRANSPORT_STABLE_SAMPLES` consecutive successes.
+    """
+    from ghostdeck import play
+
+    stable = play._TRANSPORT_STABLE_SAMPLES
+    # answers, then dips (one failure), then stays up
+    results = [0] * (stable - 1) + [1] + [0] * stable
+    calls = _quiet_run(monkeypatch, play, results)
+    assert play._await_transport_recovery(timeout=5.0) is True
+    # The dip resets the run, so it probes past it rather than returning at the first success.
+    assert len(calls) == len(results), calls
+    # It probes the transport itself, not the device inventory or the session record.
+    assert calls[0][-1] == "getprop sys.usb.config", calls[0]
+    assert calls[0][:2] == ["-s", SERIAL], calls[0]
+
+
+def test_transport_recovery_is_bounded_and_reports_failure_without_raising(monkeypatch):
+    """A deck that never answers ends the wait AT its bound, returning rather than raising or spinning."""
+    from ghostdeck import play
+
+    calls = _quiet_run(monkeypatch, play, [1])
+    started = time.monotonic()
+    assert play._await_transport_recovery(timeout=0.05) is False
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, f"the wait ignored its timeout: {elapsed:.1f}s"
+    assert len(calls) >= 2, f"it decided from a single probe: {calls}"
+
+
+def test_transport_recovery_swallows_a_failing_adb_call(monkeypatch):
+    """An `adb.run` that raises must not escape: `stop` has already bounced the UI by this point.
+
+    A missing adb binary or an OS error here would otherwise turn a finished stop into a traceback
+    for a condition the user cannot act on.
+    """
+    from ghostdeck import play
+
+    def run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=1)
+
+    monkeypatch.setattr(play.adb, "run", run)
+    monkeypatch.setattr(play, "_deck_serial", lambda: SERIAL)
+    monkeypatch.setattr(play, "_TRANSPORT_RECOVERY_POLL", 0.0)
+    assert play._await_transport_recovery(timeout=0.05) is False
+
+
+def test_transport_recovery_sends_nothing_without_an_identified_deck(monkeypatch):
+    """No positively-identified ready deck means nothing to wait for and no command to send.
+
+    A wedged deck is exactly what `_deck_serial()` rejects (T15), so a `stop` against one must not
+    spend the budget polling a serial it could not identify - and must not address a candidate.
+    """
+    from ghostdeck import play
+
+    def run(argv, **kwargs):
+        raise AssertionError(f"a command was sent to an unidentified deck: {argv}")
+
+    monkeypatch.setattr(play.adb, "run", run)
+    monkeypatch.setattr(play, "_deck_serial", lambda: None)
+    monkeypatch.setattr(play, "_TRANSPORT_RECOVERY_POLL", 0.0)
+    started = time.monotonic()
+    assert play._await_transport_recovery(timeout=5.0) is False
+    assert time.monotonic() - started < 1.0, "it waited for a deck it never identified"
+
+
+def test_the_recovery_budget_is_finite_and_polled():
+    """Pin the real budget: this wait is the last thing `stop` does, so it IS the command's latency.
+
+    An unbounded or non-positive bound would hang `stop` forever; a poll larger than the bound would
+    make the wait a single shot. 20s is the deliberate value (the deck settles within a few seconds)
+    and must not drift.
+    """
+    from ghostdeck import play
+
+    assert 0 < play._TRANSPORT_RECOVERY_POLL <= play._TRANSPORT_RECOVERY_TIMEOUT
+    assert 0 < play._TRANSPORT_RECOVERY_TIMEOUT <= 60.0, play._TRANSPORT_RECOVERY_TIMEOUT
+    assert play._await_transport_recovery.__defaults__ == (play._TRANSPORT_RECOVERY_TIMEOUT,)
+
+
+def test_stop_still_succeeds_when_the_deck_never_comes_back(tmp_path):
+    """The end-to-end shape: bounce, then probe, then give up quietly with a success exit code.
+
+    This is the contract after the bounce - the stock UI is already restarted, so exiting non-zero
+    would report an unrecovered deck as an unrestored one, which is the opposite of what happened.
+    The budget is pinned to one poll so this tests the shape rather than spending the real 20s.
+    """
+    ours = _ours()
+    try:
+        time.sleep(0.3)
+        recorded = _record(ours.pid, tmp_path / "home")
+        (tmp_path / "host-state.json").write_text(
+            json.dumps({"video": {"status": {"cleanup": "proven"}}}), encoding="utf-8"
+        )
+        result, calls, home = _cli(
+            NO_TRANSPORT_ADB,
+            tmp_path,
+            "stop",
+            pre_state={"play_pid": ours.pid},
+            sidecar=recorded,
+            stub_session_released=None,
+            recovery_timeout=0.5,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Traceback" not in result.stderr, result.stderr
+        # The cleanup ran, and the recovery wait probed the transport without succeeding. It is
+        # bounded, so assert the shape (cleanup, then at least one probe that never stabilises) rather
+        # than an exact poll count, which depends on the pinned budget and the poll interval.
+        assert calls[: len(STOP_ARGV)] == STOP_ARGV, calls
+        assert calls[len(STOP_ARGV)] == DEVICES_ARGV, calls
+        assert len(calls) > len(STOP_ARGV) + 1, calls
+        assert all(c == GETPROP_ARGV for c in calls[len(STOP_ARGV) + 1 :]), calls
+        assert json.loads((home / ".ghostdeck" / "state.json").read_text())["play_pid"] is None
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+        ours.wait()
+
+
+def test_a_stale_pending_record_does_not_hold_a_stop_with_nothing_playing(tmp_path):
+    """The master's revert, pinned: a leftover `pending` record must not delay a `stop` with no session.
+
+    No `play_pid` means no session, so neither the release wait nor the recovery probe may run - a
+    stale record from a previous run is not a session, and `stop` is the command a user runs to clean
+    up exactly that leftover. The record is planted `pending` (a release the predicate would refuse)
+    and neither predicate is stubbed, so a `stop()` that consulted the record without the `play_pid`
+    guard spends the whole 8s bound and refuses here.
+    """
+    (tmp_path / "host-state.json").write_text(
+        json.dumps({"video": {"status": {"cleanup": "pending"}}}), encoding="utf-8"
+    )
+    started = time.monotonic()
+    result, calls, _ = _cli(HAPPY_ADB, tmp_path, "stop")
+    elapsed = time.monotonic() - started
+    assert result.returncode == 0, result.stderr
+    assert calls == STOP_ARGV, calls
+    assert elapsed < 8.0, f"a stop with nothing playing paid the release bound: {elapsed:.1f}s"
