@@ -62,7 +62,7 @@ ARMv7 Linux 크로스 gcc와 ARM Linux `libturbojpeg.a`가 필요합니다
 ghostdeck studio          # hidshim 복사본 + 브리지. 먼저 실행
 ghostdeck play video.mp4  # ADB JPEG 재생
 ghostdeck stop            # 플레이어만 중지. Studio가 켜져 있으면 유지
-ghostdeck gui             # 상태 / 재생 / 정지 창
+ghostdeck gui             # 창에 유튜브. 보고 있는 영상을 덱에서 재생
 ```
 
 `~/Applications/Ulanzi Studio ADB.app`을 직접 열지 마십시오. 브리지 없이
@@ -77,7 +77,7 @@ ghostdeck gui             # 상태 / 재생 / 정지 창
 | `ghostdeck stop` | 플레이어를 중지합니다. 브리지가 꺼져 있으면 스톡 UI를 복원하고 `/tmp/ghostdeck-*`를 지웁니다. 브리지가 살아 있으면 덱은 ADB로 남겨 Studio 키를 유지합니다. |
 | `ghostdeck detect` | 시리얼, VID/PID, USB 모드. 덱이 없으면 실패. |
 | `ghostdeck status` | USB 모드, 심 복사본, 재생 여부. |
-| `ghostdeck gui` | 상태, 파일 선택, 재생(심이 꺼져 있으면 studio 먼저), 정지. 호스트 플레이어가 아닙니다. |
+| `ghostdeck gui` | 창에 유튜브. 열린 영상을 덱에서 재생. 로컬 파일은 파일 버튼. 호스트 플레이어가 아닙니다. |
 
 `play`는 런처입니다. 플레이어가 짧은 유예 시간을 넘기면 바로 돌아옵니다.
 루프는 `stop`까지 계속됩니다.

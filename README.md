@@ -61,7 +61,7 @@ Studio app. It still fails at the agent step until that binary exists.
 ghostdeck studio          # hidshim copy + bridge; run this first
 ghostdeck play video.mp4  # JPEG play over ADB
 ghostdeck stop            # stop the player; Studio stays if it is up
-ghostdeck gui             # status / play / stop window
+ghostdeck gui             # YouTube in the window; play that video on the deck
 ```
 
 Do not open `~/Applications/Ulanzi Studio ADB.app` by hand. Without the
@@ -76,7 +76,7 @@ bridge that copy's shim sees no device.
 | `ghostdeck stop` | Stop the player. If the bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is up, leave the deck in ADB so Studio keys keep working. |
 | `ghostdeck detect` | Serial, VID/PID, USB mode. Fails if no deck. |
 | `ghostdeck status` | USB mode, shim copy, playing. |
-| `ghostdeck gui` | Status, file picker, play (starts studio if the shim is down), stop. Not a host player. |
+| `ghostdeck gui` | YouTube in a native window. Play the open video on the deck. File button for a local clip. Not a host player. |
 
 `play` is a launcher: it returns after the player has survived a short grace
 window. The player keeps looping until `stop`.
