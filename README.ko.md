@@ -1,8 +1,8 @@
 # ghostdeck
 
-macOS에서 Ulanzi D200 계열 덱으로 JPEG 영상을 재생합니다. 물리 덱이
-ADB일 때 공식 Ulanzi Studio가 키를 보낼 수 있도록 유저스페이스 가상
-HID를 올릴 수 있습니다.
+macOS에서 Ulanzi D200 계열 덱으로 JPEG 영상을 재생합니다. ADB 재생 중
+키는 유저스페이스 가상 HID가 아니라 `ghostdeck studio`가 띄운 로컬
+hidshim Studio 복사본을 탑니다.
 
 버전 **0.1.0**. 라이선스: MIT (`LICENSE`, `NOTICE`).
 English: [README.md](README.md).
@@ -134,10 +134,10 @@ studio`가 브리지와 로컬 Studio 복사본을 모두 시작합니다.
 | 명령 | 역할 |
 | --- | --- |
 | `ghostdeck detect` | 시리얼, VID/PID, USB 모드. 없으면 실패. 시리얼은 런타임만. |
-| `ghostdeck play FILE\|URL` | 실행 중인 hidshim 브리지를 통해 ADB JPEG 재생. **브리지는 `ghostdeck studio`로 먼저 시작**해야 하며, 없으면 `play`는 거부하고 아무것도 띄우지 않는다. IOHID 실패해도 play는 계속. |
+| `ghostdeck play FILE\|URL` | 실행 중인 hidshim 브리지를 통해 ADB JPEG 재생. **브리지는 `ghostdeck studio`로 먼저 시작**해야 하며, 없으면 `play`는 거부하고 아무것도 띄우지 않는다. |
 | `ghostdeck studio` | **`play` 전에 실행한다.** 로컬 hidshim 복사본 (`~/Applications/Ulanzi Studio ADB.app`)을 열고, `play`가 접속하는 hidshim 브리지를 시작한다. 공식 `/Applications/Ulanzi Studio.app`은 쓰지 않는다. |
-| `ghostdeck stop` | 재생 중지, 스톡 UI 복원, 덱의 `/tmp/ghostdeck-*` 정리. |
-| `ghostdeck quit` | IOHID keeper가 있으면 종료. |
+| `ghostdeck stop` | 플레이어 중지. 브리지가 꺼져 있으면 스톡 UI 복원과 `/tmp/ghostdeck-*` 정리. 브리지가 살아 있으면 가젯은 ADB로 두고 키를 유지한다. |
+| `ghostdeck quit` | IOHID keeper가 있으면 종료. 키 경로가 아니다. |
 | `ghostdeck status` | USB, shim 복사본, IOHID, 재생. |
 
 `ffmpeg`/`ffprobe`/`adb`가 없으면 `play`는 실패합니다. `yt-dlp`가 없으면 URL만
@@ -155,19 +155,19 @@ hidshim 브리지의 표준 출력·오류를 `/tmp/d200-local-bridge.log`에
 
 | 소유자 | 소유 대상 | 해제 방법 |
 | --- | --- | --- |
-| `ghostdeck stop` | 덱의 스톡 UI, `/tmp/ghostdeck-*` | `ghostdeck stop` 실행 |
+| `ghostdeck stop` | 플레이어. 스톡 UI와 `/tmp/ghostdeck-*`는 **브리지가 꺼져 있을 때만** | `ghostdeck stop` 실행 |
 | **브리지** (`ghostdeck studio`) | 스테이징된 에이전트 `/tmp/d200-color-agent`, `/dev/fb0` 블랙아웃, 덱을 잡고 있는 ADB 모드 | 브리지 프로세스 종료 |
 
 다른 명령을 찾아보기 전에 알아 둘 두 가지:
 
 - **`ghostdeck stop`은 브리지를 멈추지 않고 `/tmp/d200-color-agent`도
   지우지 않습니다.** 브리지를 멈추는 `ghostdeck` 명령은 없습니다. 브리지는
-  별도의 장기 실행 프로세스이며, 브리지가 살아 있으면 `stop`이 스톡 UI를
-  복원한 뒤에도 덱은 ADB 모드로 남습니다. 스테이징된 에이전트는 브리지
-  자신의 정리 단계에서 제거됩니다.
-- **덱은 브리지가 사라진 뒤에만 HID로 돌아갑니다.** `stop`이 종료 `0`으로
-  끝났는데도 덱이 ADB로 남아 있다면 정상입니다. `stop`을 다시 실행하지 말고
-  브리지(hidshim Studio 복사본)를 종료하십시오.
+  별도의 장기 실행 프로세스입니다. 브리지가 살아 있으면 `stop`은 플레이어만
+  죽이고 `zkswe`는 건드리지 않습니다. 덱은 ADB로 남고 Studio 키가 유지됩니다.
+  스테이징된 에이전트는 브리지 자신의 정리 단계에서 제거됩니다.
+- **덱은 브리지가 사라진 뒤 `stop`(또는 다시 꽂기)해야 HID로 돌아갑니다.**
+  Studio가 열린 채로 `stop`이 `0`인데 덱이 ADB인 것은 정상입니다. HID가
+  필요하면 hidshim 복사본/브리지를 먼저 끄고 `ghostdeck stop`을 실행하십시오.
 
 이 프로젝트가 브리지를 대신 멈추지 않는 이유는, 자기가 시작하지 않은
 브리지가 다른 주체(테스트나 다른 도구)의 것일 수 있기 때문입니다. 브리지를

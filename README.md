@@ -1,8 +1,8 @@
 # ghostdeck
 
-Play JPEG video on a Ulanzi D200-class deck from macOS, and optionally
-present a userspace virtual HID so official Ulanzi Studio can send keys
-while the physical deck is in ADB.
+Play JPEG video on a Ulanzi D200-class deck from macOS. Keys during ADB
+play go through a local hidshim copy of Studio (`ghostdeck studio`), not
+through a userspace virtual HID.
 
 Version **0.1.0**. License: MIT (see `LICENSE` and `NOTICE`).
 Korean: [README.ko.md](README.ko.md).
@@ -134,10 +134,10 @@ written or shipped.
 | Command | Purpose |
 | --- | --- |
 | `ghostdeck detect` | Print serial, VID/PID, and USB mode (HID `2207:0019` or ADB `18d1:d002`). Fails if no deck is found. Serial is discovered at runtime; it is not baked into the source. |
-| `ghostdeck play FILE\|URL` | ADB JPEG play through the running hidshim bridge. **Start the bridge with `ghostdeck studio` first**; with none running, `play` refuses and spawns nothing. Optional IOHID attempt does not block play. |
+| `ghostdeck play FILE\|URL` | ADB JPEG play through the running hidshim bridge. **Start the bridge with `ghostdeck studio` first**; with none running, `play` refuses and spawns nothing. |
 | `ghostdeck studio` | **Run this before `play`.** Launch the **local** hidshim copy (`~/Applications/Ulanzi Studio ADB.app`) and start the hidshim bridge that `play` connects to. Official `/Applications/Ulanzi Studio.app` is not written. |
-| `ghostdeck stop` | Stop playback, restore stock UI, clear `/tmp/ghostdeck-*` on the deck. |
-| `ghostdeck quit` | Tear down the IOHID keeper if any. |
+| `ghostdeck stop` | Stop the player. If the hidshim bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is live, leave the gadget in ADB (Studio keeps the keys). |
+| `ghostdeck quit` | Tear down the IOHID keeper if any. It is not the key path. |
 | `ghostdeck status` | USB mode, shim copy, IOHID, playing. |
 
 `ffmpeg`, `ffprobe`, and `adb` missing: `play` fails. `yt-dlp` missing:
@@ -155,19 +155,20 @@ them is a `ghostdeck` command:
 
 | Owner | Owns | Released by |
 | --- | --- | --- |
-| `ghostdeck stop` | the stock UI on the deck, and `/tmp/ghostdeck-*` | running `ghostdeck stop` |
+| `ghostdeck stop` | the player; stock UI and `/tmp/ghostdeck-*` **only when the bridge is down** | running `ghostdeck stop` |
 | the **bridge** (`ghostdeck studio`) | the staged agent `/tmp/d200-color-agent`, the `/dev/fb0` black-out, and the ADB-mode hold on the deck | the bridge process exiting |
 
 Two consequences worth knowing before you go looking for the wrong command:
 
 - **`ghostdeck stop` does not stop the bridge and does not remove
   `/tmp/d200-color-agent`.** No `ghostdeck` command stops the bridge: it is a
-  separate long-lived process, and a running bridge keeps the deck in ADB mode
-  after `stop` has restored the stock UI. The staged agent is cleaned up by the
-  bridge's own teardown.
-- **The deck returns to HID only once the bridge is gone.** If `stop` exited `0`
-  and the deck still enumerates as ADB, that is expected: end the bridge
-  (quit the hidshim Studio copy) rather than re-running `stop`.
+  separate long-lived process. While it is running, `stop` kills the player
+  and does **not** bounce `zkswe`; the deck stays ADB so Studio keys keep
+  working. The staged agent is cleaned up by the bridge's own teardown.
+- **The deck returns to HID only once the bridge is gone, then `stop` (or
+  a replug).** If `stop` exited `0` and the deck still enumerates as ADB
+  with Studio open, that is expected. Quit the hidshim copy / bridge first
+  if you want HID back, then `ghostdeck stop`.
 
 The bridge is not stopped on your behalf because a bridge it did not start may
 be someone else's — including one a test or another tool is using. Any tool
