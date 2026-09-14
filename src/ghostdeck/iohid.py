@@ -80,15 +80,31 @@ def _cf():
 
 
 def _iokit():
-    """IOKit, or None when this host does not provide it. See `_cf()` for why this is a value."""
-    try:
-        lib = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/IOKit.framework/IOKit")
-    except OSError:
-        return None
-    lib.IOHIDUserDeviceCreate.restype = c_void_p
-    lib.IOHIDUserDeviceCreate.argtypes = [c_void_p, c_void_p]
-    lib.IOHIDUserDeviceScheduleWithRunLoop.argtypes = [c_void_p, c_void_p, c_void_p]
-    return lib
+    """IOKit HID user-device entry points, or None when this host does not provide them.
+
+    `IOHIDUserDeviceCreate` is not a usable export of the IOKit umbrella on this
+    macOS: ctypes still produces a FuncPtr, but the call returns NULL. The real
+    symbol lives in IOHIDLib.plugin. Even with the right dylib, a non-app process
+    (the `python -m ghostdeck.vhid` keeper) still gets NULL — keys come from the
+    hidshim Studio copy, not from this CLI path.
+    """
+    candidates = (
+        "/System/Library/Extensions/IOHIDFamily.kext/Contents/PlugIns/IOHIDLib.plugin/Contents/MacOS/IOHIDLib",
+        "/System/Library/Frameworks/IOKit.framework/IOKit",
+    )
+    for path in candidates:
+        try:
+            lib = ctypes.cdll.LoadLibrary(path)
+        except OSError:
+            continue
+        try:
+            lib.IOHIDUserDeviceCreate.restype = c_void_p
+            lib.IOHIDUserDeviceCreate.argtypes = [c_void_p, c_void_p]
+            lib.IOHIDUserDeviceScheduleWithRunLoop.argtypes = [c_void_p, c_void_p, c_void_p]
+        except AttributeError:
+            continue
+        return lib
+    return None
 
 
 def create(vid: int = HID_VID, pid: int = HID_PID, product: str = "ulanzi") -> c_void_p | None:

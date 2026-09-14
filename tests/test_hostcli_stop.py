@@ -254,6 +254,8 @@ def _cli(
         + session_stub
         + recovery_stub
         + hid_flip
+        + "import ghostdeck.studio as _studio\n"
+        + "_studio._socket_live = lambda: False\n"
         + (
             ""
             if hid_timeout is None
@@ -2005,3 +2007,38 @@ def test_stop_does_not_spend_the_hid_bound_without_a_usb_verdict(tmp_path):
     assert "no ADB device" in result.stderr
     assert calls == [DEVICES_ARGV]
     assert elapsed < 8.0, f"a missing USB verdict paid the HID bound: {elapsed:.1f}s"
+
+
+def test_stop_reopens_hidshim_copy_when_the_bridge_is_live(monkeypatch):
+    """Keys are the hidshim Studio copy, not CLI vhid. IOHIDUserDeviceCreate returns
+    NULL in a non-app process on this host, so `stop` must re-open the copy while
+    the bridge is live rather than demand HID or start a sleeper vhid."""
+    from ghostdeck import play, studio
+
+    launched = []
+    monkeypatch.setattr(play, "_kill_play", lambda **k: None)
+    monkeypatch.setattr(play, "_session_released", lambda *a, **k: True)
+    monkeypatch.setattr(play, "_cleanup_device", lambda: None)
+    monkeypatch.setattr(play, "_clear_play_records", lambda: None)
+    monkeypatch.setattr(play.gdstate, "load", lambda: {"play_pid": 1})
+    monkeypatch.setattr(studio, "_socket_live", lambda: True)
+    monkeypatch.setattr(studio, "running", lambda: False)
+    monkeypatch.setattr(studio, "launch", lambda: launched.append("launch"))
+    play.stop()
+    assert launched == ["launch"]
+
+
+def test_stop_does_not_relaunch_a_running_hidshim_copy(monkeypatch):
+    from ghostdeck import play, studio
+
+    launched = []
+    monkeypatch.setattr(play, "_kill_play", lambda **k: None)
+    monkeypatch.setattr(play, "_session_released", lambda *a, **k: True)
+    monkeypatch.setattr(play, "_cleanup_device", lambda: None)
+    monkeypatch.setattr(play, "_clear_play_records", lambda: None)
+    monkeypatch.setattr(play.gdstate, "load", lambda: {"play_pid": 1})
+    monkeypatch.setattr(studio, "_socket_live", lambda: True)
+    monkeypatch.setattr(studio, "running", lambda: True)
+    monkeypatch.setattr(studio, "launch", lambda: launched.append("launch"))
+    play.stop()
+    assert launched == []

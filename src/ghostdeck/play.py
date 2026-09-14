@@ -806,14 +806,17 @@ def stop() -> None:
     # With the ghostdeck bridge still live, HID appears for ~0.5s then ADB returns —
     # transportRevive writes the HID-to-ADB switch the moment the gadget leaves.
     # That is why bounce-only "used to work" and `ghostdeck studio`+play does not.
-    # Do not demand HID while the bridge is up; start vhid so Studio keys have a
-    # HID device. Next play already calls enable_adb.
+    # Do not demand HID while the bridge is up. Keys come from the hidshim Studio
+    # copy (IOHIDUserDevice from a CLI vhid process returns NULL on this host).
+    # Re-open the copy if it is down; `launch()` will not quit it while the
+    # bridge is live. Next play already calls enable_adb.
     if session_was_playing:
         if studio._socket_live():
             try:
-                vhid.start()
+                if not studio.running():
+                    studio.launch()
             except Exception as error:
-                print(f"virtual HID skipped: {error}", file=sys.stderr)
+                print(f"hidshim Studio copy skipped: {error}", file=sys.stderr)
         elif not _await_hid_return(require_hid=True):
             hid_error = RuntimeError(_hid_stuck_message())
             if identity_error is not None:
