@@ -105,6 +105,17 @@ def youtube_watch_url(href: str) -> str:
         return f"https://www.youtube.com/watch?v={parts[1]}"
     return ""
 
+def page_follow_action(seen_watch: str, href: str) -> tuple[str, str]:
+    """When the YouTube page changes: (new_seen, play_url | 'stop' | '')."""
+    watch = youtube_watch_url(href)
+    if watch == seen_watch:
+        return seen_watch, ""
+    if watch:
+        return watch, watch
+    if seen_watch:
+        return "", "stop"
+    return "", ""
+
 def ensure_store_id(path: Path, mint) -> str:
     """One UUID for WKWebsiteDataStore so YouTube login and cache survive relaunch."""
     if path.is_file():
@@ -183,7 +194,13 @@ def main() -> int:
         )
         from Foundation import NSURL, NSURLRequest, NSTimer
         from PyObjCTools import AppHelper
-        from WebKit import WKWebView, WKWebViewConfiguration
+        from WebKit import (
+            WKUserContentController,
+            WKUserScript,
+            WKWebView,
+            WKWebViewConfiguration,
+            WKWebsiteDataStore,
+        )
     except ImportError:
         print(
             "ghostdeck gui needs pyobjc-framework-Cocoa and pyobjc-framework-WebKit on macOS",
@@ -192,10 +209,35 @@ def main() -> int:
         return 2
 
     remote = DeckRemote()
-    pause_js = (
-        "document.querySelectorAll('video,audio').forEach"
-        "(function(v){v.pause();v.muted=true;})"
-    )
+    hook_js = """
+(function(){
+  if (window.__ghostdeckHooked) return;
+  window.__ghostdeckHooked = true;
+  function post(type){
+    try {
+      window.webkit.messageHandlers.ghostdeck.postMessage({
+        type: type,
+        url: String(location.href)
+      });
+    } catch (e) {}
+  }
+  function hook(v){
+    if (v.__ghostdeck) return;
+    v.__ghostdeck = true;
+    v.addEventListener('play', function(){ post('play'); });
+  }
+  function scan(){ document.querySelectorAll('video').forEach(hook); }
+  scan();
+  new MutationObserver(scan).observe(document.documentElement, {childList:true, subtree:true});
+  var last = location.href;
+  setInterval(function(){
+    if (location.href !== last){
+      last = location.href;
+      post('nav');
+    }
+  }, 400);
+})();
+"""
 
     def _gui_href(ctrl) -> str:
         url = ctrl.web.URL()
@@ -246,10 +288,21 @@ def main() -> int:
         )
         thread.start()
 
+    def _gui_follow(ctrl, href: str) -> None:
+        seen, action = page_follow_action(getattr(ctrl, "seen_watch", ""), href)
+        if not action or ctrl.busy:
+            return
+        ctrl.seen_watch = seen
+        if action == "stop":
+            _gui_kick(ctrl, "stop", "")
+        else:
+            _gui_kick(ctrl, "play", action)
+
     class Controller(NSObject):
         def init(self):
             self = objc.super(Controller, self).init()
             self.busy = False
+            self.seen_watch = ""
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, 390, 844),
                 NSWindowStyleMaskTitled
@@ -276,6 +329,17 @@ def main() -> int:
                 )
             )
             config.setWebsiteDataStore_(WKWebsiteDataStore.dataStoreForIdentifier_(uid))
+            config.preferences().setJavaScriptCanOpenWindowsAutomatically_(True)
+            ucc = WKUserContentController.alloc().init()
+            ucc.addScriptMessageHandler_name_(self, "ghostdeck")
+            ucc.addUserScript_(
+                WKUserScript.alloc().initWithSource_injectionTime_forMainFrameOnly_(
+                    hook_js, 0, False
+                )
+            )
+            config.setUserContentController_(ucc)
+            self.ucc = ucc
+            self.popups = []
             prefs = config.defaultWebpagePreferences()
             if prefs is not None:
                 prefs.setPreferredContentMode_(1)
@@ -285,10 +349,10 @@ def main() -> int:
             )
             self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             self.web.setCustomUserAgent_(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
-                "Mobile/15E148 Safari/604.1"
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
             )
+            self.web.setUIDelegate_(self)
             view.addSubview_(self.web)
             self.web.loadRequest_(
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://m.youtube.com"))
@@ -353,7 +417,6 @@ def main() -> int:
                 page = href if isinstance(href, str) else _gui_href(ctrl)
                 watch = youtube_watch_url(page or _gui_href(ctrl))
                 if watch:
-                    ctrl.web.evaluateJavaScript_completionHandler_(pause_js, None)
                     _gui_kick(ctrl, "play", watch)
                     return
                 _gui_kick(ctrl, "play", "")
@@ -366,6 +429,65 @@ def main() -> int:
         def poll_(self, _timer):
             if not self.busy:
                 _gui_kick(self, "status", "")
+            ctrl = self
+
+            def after(href, _err):
+                page = href if isinstance(href, str) else _gui_href(ctrl)
+                _gui_follow(ctrl, page)
+
+            self.web.evaluateJavaScript_completionHandler_("window.location.href", after)
+
+        def userContentController_didReceiveScriptMessage_(self, _ucc, message):
+            body = message.body()
+            kind = ""
+            href = ""
+            try:
+                kind = str(body.objectForKey_("type") or "")
+                href = str(body.objectForKey_("url") or "")
+            except Exception:
+                if isinstance(body, dict):
+                    kind = str(body.get("type") or "")
+                    href = str(body.get("url") or "")
+            watch = youtube_watch_url(href or _gui_href(self))
+            if kind == "play" and watch:
+                self.seen_watch = watch
+                if not self.busy:
+                    _gui_kick(self, "play", watch)
+                return
+            _gui_follow(self, href or _gui_href(self))
+
+        def webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures_(
+            self, webView, configuration, _navigationAction, _features
+        ):
+            popup = WKWebView.alloc().initWithFrame_configuration_(
+                NSMakeRect(0, 0, 390, 640),
+                configuration,
+            )
+            popup.setCustomUserAgent_(webView.customUserAgent())
+            popup.setUIDelegate_(self)
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, 390, 640),
+                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+                NSBackingStoreBuffered,
+                False,
+            )
+            win.setTitle_("로그인")
+            win.contentView().addSubview_(popup)
+            popup.setFrame_(win.contentView().bounds())
+            popup.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            win.center()
+            win.makeKeyAndOrderFront_(None)
+            self.popups.append((win, popup))
+            return popup
+
+        def webViewDidClose_(self, webView):
+            kept = []
+            for win, popup in self.popups:
+                if popup is webView:
+                    win.close()
+                else:
+                    kept.append((win, popup))
+            self.popups = kept
 
         def openFile_(self, _sender):
             panel = NSOpenPanel.openPanel()
@@ -380,6 +502,10 @@ def main() -> int:
             _gui_kick(self, "play", str(url.path()))
 
         def windowWillClose_(self, _notification):
+            try:
+                self.ucc.removeScriptMessageHandlerForName_("ghostdeck")
+            except Exception:
+                pass
             NSApp.terminate_(None)
 
     app = NSApplication.sharedApplication()
