@@ -105,6 +105,31 @@ def youtube_watch_url(href: str) -> str:
         return f"https://www.youtube.com/watch?v={parts[1]}"
     return ""
 
+def playable_source(href: str, media_src: str = "") -> str:
+    """Page or media URL to send to play. YouTube stays a watch URL so ads do not restart."""
+    href = (href or "").strip()
+    watch = youtube_watch_url(href)
+    if watch:
+        return watch
+    src = (media_src or "").strip()
+    if src.startswith("blob:") or "googlevideo.com" in src:
+        src = ""
+    if src.startswith("http://") or src.startswith("https://"):
+        path = urlparse(src).path.lower()
+        if path.endswith((".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")):
+            return src
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    return ""
+
+
+def should_start_play(seen: str, href: str, media_src: str = "") -> str:
+    """Empty if this is the same video (YouTube ads fire play again on the same watch URL)."""
+    source = playable_source(href, media_src)
+    if not source or source == seen:
+        return ""
+    return source
+
 def is_google_login_host(host: str) -> bool:
     """accounts.google.* is a desktop WebAuthn page; mobile YouTube asks for Bluetooth instead."""
     host = (host or "").lower().split(":")[0]
@@ -113,7 +138,7 @@ def is_google_login_host(host: str) -> bool:
     return host == "accounts.youtube.com" or host == "accounts.google.com" or host.startswith("accounts.google.")
 
 def page_follow_action(seen_watch: str, href: str) -> tuple[str, str]:
-    """When the YouTube page changes: (new_seen, play_url | 'stop' | '')."""
+    """When the page changes: (new_seen, play_url | 'stop' | ''). Same YouTube id is a no-op."""
     watch = youtube_watch_url(href)
     if watch == seen_watch:
         return seen_watch, ""
@@ -188,7 +213,6 @@ def main() -> int:
             NSFont,
             NSMakeRect,
             NSObject,
-            NSOpenPanel,
             NSTextField,
             NSViewHeightSizable,
             NSViewMaxYMargin,
@@ -222,9 +246,11 @@ def main() -> int:
   window.__ghostdeckHooked = true;
   function post(type){
     try {
+      var v = document.querySelector('video');
       window.webkit.messageHandlers.ghostdeck.postMessage({
         type: type,
-        url: String(location.href)
+        url: String(location.href),
+        src: (v && v.currentSrc) ? String(v.currentSrc) : ''
       });
     } catch (e) {}
   }
@@ -252,8 +278,6 @@ def main() -> int:
 
     def _gui_set_busy(ctrl, on: bool) -> None:
         ctrl.busy = on
-        ctrl.play_btn.setEnabled_(not on)
-        ctrl.stop_btn.setEnabled_(not on)
 
     def _gui_apply(ctrl, results, error) -> None:
         _gui_set_busy(ctrl, False)
@@ -305,42 +329,13 @@ def main() -> int:
         else:
             _gui_kick(ctrl, "play", action)
 
-    def _open_google_login(ctrl, request) -> None:
-        config = WKWebViewConfiguration.alloc().init()
-        config.setWebsiteDataStore_(ctrl.web.configuration().websiteDataStore())
-        config.preferences().setJavaScriptCanOpenWindowsAutomatically_(True)
-        page = config.defaultWebpagePreferences()
-        if page is not None:
-            page.setPreferredContentMode_(0)
-        popup = WKWebView.alloc().initWithFrame_configuration_(
-            NSMakeRect(0, 0, 560, 720),
-            config,
-        )
-        popup.setUIDelegate_(ctrl)
-        popup.setNavigationDelegate_(ctrl)
-        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, 560, 720),
-            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
-            NSBackingStoreBuffered,
-            False,
-        )
-        win.setTitle_("Google 로그인")
-        win.contentView().addSubview_(popup)
-        popup.setFrame_(win.contentView().bounds())
-        popup.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        win.center()
-        win.makeKeyAndOrderFront_(None)
-        NSApp.activateIgnoringOtherApps_(True)
-        popup.loadRequest_(request)
-        ctrl.popups.append((win, popup))
-
     class Controller(NSObject):
         def init(self):
             self = objc.super(Controller, self).init()
             self.busy = False
             self.seen_watch = ""
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 390, 844),
+                NSMakeRect(0, 0, 420, 844),
                 NSWindowStyleMaskTitled
                 | NSWindowStyleMaskClosable
                 | NSWindowStyleMaskMiniaturizable
@@ -380,7 +375,7 @@ def main() -> int:
             if prefs is not None:
                 prefs.setPreferredContentMode_(0)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(0, 72, 390, 772),
+                NSMakeRect(0, 80, 420, 764),
                 config,
             )
             self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -391,7 +386,30 @@ def main() -> int:
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
 
-            self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 48, 374, 18))
+            back = NSButton.alloc().initWithFrame_(NSMakeRect(8, 52, 28, 24))
+            back.setTitle_("‹")
+            back.setBezelStyle_(NSBezelStyleRounded)
+            back.setTarget_(self)
+            back.setAction_("back:")
+            back.setAutoresizingMask_(NSViewMaxYMargin)
+            view.addSubview_(back)
+
+            fwd = NSButton.alloc().initWithFrame_(NSMakeRect(38, 52, 28, 24))
+            fwd.setTitle_("›")
+            fwd.setBezelStyle_(NSBezelStyleRounded)
+            fwd.setTarget_(self)
+            fwd.setAction_("forward:")
+            fwd.setAutoresizingMask_(NSViewMaxYMargin)
+            view.addSubview_(fwd)
+
+            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(70, 52, 342, 24))
+            self.url_field.setStringValue_("https://www.youtube.com")
+            self.url_field.setTarget_(self)
+            self.url_field.setAction_("go:")
+            self.url_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            view.addSubview_(self.url_field)
+
+            self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 32, 404, 16))
             self.status.setEditable_(False)
             self.status.setBezeled_(False)
             self.status.setDrawsBackground_(False)
@@ -400,39 +418,13 @@ def main() -> int:
             self.status.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.status)
 
-            play_btn = NSButton.alloc().initWithFrame_(NSMakeRect(8, 18, 118, 28))
-            play_btn.setTitle_("이 영상 재생")
-            play_btn.setBezelStyle_(NSBezelStyleRounded)
-            play_btn.setTarget_(self)
-            play_btn.setAction_("play:")
-            play_btn.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(play_btn)
-            self.play_btn = play_btn
-
-            stop_btn = NSButton.alloc().initWithFrame_(NSMakeRect(130, 18, 60, 28))
-            stop_btn.setTitle_("정지")
-            stop_btn.setBezelStyle_(NSBezelStyleRounded)
-            stop_btn.setTarget_(self)
-            stop_btn.setAction_("stop:")
-            stop_btn.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(stop_btn)
-            self.stop_btn = stop_btn
-
-            open_btn = NSButton.alloc().initWithFrame_(NSMakeRect(194, 18, 56, 28))
-            open_btn.setTitle_("파일")
-            open_btn.setBezelStyle_(NSBezelStyleRounded)
-            open_btn.setTarget_(self)
-            open_btn.setAction_("openFile:")
-            open_btn.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(open_btn)
-
-            self.note = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 2, 374, 14))
+            self.note = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 4, 404, 24))
             self.note.setEditable_(False)
             self.note.setBezeled_(False)
             self.note.setDrawsBackground_(False)
             self.note.setFont_(NSFont.labelFontOfSize_(10))
             self.note.setTextColor_(NSColor.secondaryLabelColor())
-            self.note.setStringValue_("패스키가 블루투스를 물으면 비밀번호를 쓰십시오.")
+            self.note.setStringValue_("아무 사이트. 영상 재생이면 덱도 재생. 광고는 무시합니다.")
             self.note.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.note)
 
@@ -443,21 +435,22 @@ def main() -> int:
             AppHelper.callAfter(lambda: _gui_kick(self, "status", ""))
             return self
 
-        def play_(self, _sender):
-            ctrl = self
+        def back_(self, _sender):
+            self.web.goBack_(None)
 
-            def after(href, _err):
-                page = href if isinstance(href, str) else _gui_href(ctrl)
-                watch = youtube_watch_url(page or _gui_href(ctrl))
-                if watch:
-                    _gui_kick(ctrl, "play", watch)
-                    return
-                _gui_kick(ctrl, "play", "")
+        def forward_(self, _sender):
+            self.web.goForward_(None)
 
-            self.web.evaluateJavaScript_completionHandler_("window.location.href", after)
-
-        def stop_(self, _sender):
-            _gui_kick(self, "stop", "")
+        def go_(self, _sender):
+            raw = str(self.url_field.stringValue() or "").strip()
+            if not raw:
+                return
+            if "://" not in raw:
+                raw = "https://" + raw
+            url = NSURL.URLWithString_(raw)
+            if url is None:
+                return
+            self.web.loadRequest_(NSURLRequest.requestWithURL_(url))
 
         def poll_(self, _timer):
             if not self.busy:
@@ -474,29 +467,33 @@ def main() -> int:
             body = message.body()
             kind = ""
             href = ""
+            src = ""
             try:
                 kind = str(body.objectForKey_("type") or "")
                 href = str(body.objectForKey_("url") or "")
+                src = str(body.objectForKey_("src") or "")
             except Exception:
                 if isinstance(body, dict):
                     kind = str(body.get("type") or "")
                     href = str(body.get("url") or "")
-            watch = youtube_watch_url(href or _gui_href(self))
-            if kind == "play" and watch:
-                self.seen_watch = watch
-                if not self.busy:
-                    _gui_kick(self, "play", watch)
+                    src = str(body.get("src") or "")
+            href = href or _gui_href(self)
+            if kind == "play":
+                source = should_start_play(getattr(self, "seen_watch", ""), href, src)
+                if source and not self.busy:
+                    self.seen_watch = source
+                    _gui_kick(self, "play", source)
                 return
-            _gui_follow(self, href or _gui_href(self))
+            _gui_follow(self, href)
 
-        def webView_decidePolicyForNavigationAction_decisionHandler_(self, webView, action, handler):
-            request = action.request() if action is not None else None
-            url = request.URL() if request is not None else None
-            host = str(url.host()) if url is not None and url.host() is not None else ""
-            if is_google_login_host(host) and webView is self.web:
-                _open_google_login(self, request)
-                handler(0)
+        def webView_didCommitNavigation_(self, webView, _nav):
+            if webView is not self.web:
                 return
+            url = webView.URL()
+            if url is not None:
+                self.url_field.setStringValue_(str(url.absoluteString()))
+
+        def webView_decidePolicyForNavigationAction_decisionHandler_(self, _webView, _action, handler):
             handler(1)
 
         def webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures_(
@@ -517,7 +514,7 @@ def main() -> int:
                 NSBackingStoreBuffered,
                 False,
             )
-            win.setTitle_("Google 로그인")
+            win.setTitle_("ghostdeck")
             win.contentView().addSubview_(popup)
             popup.setFrame_(win.contentView().bounds())
             popup.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -539,17 +536,6 @@ def main() -> int:
                     kept.append((win, popup))
             self.popups = kept
 
-        def openFile_(self, _sender):
-            panel = NSOpenPanel.openPanel()
-            panel.setCanChooseFiles_(True)
-            panel.setCanChooseDirectories_(False)
-            panel.setAllowedFileTypes_(["mp4", "mov", "mkv", "webm", "m4v"])
-            if panel.runModal() != 1:
-                return
-            url = panel.URL()
-            if url is None:
-                return
-            _gui_kick(self, "play", str(url.path()))
 
         def windowWillClose_(self, _notification):
             try:

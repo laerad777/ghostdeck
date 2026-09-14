@@ -17,6 +17,8 @@ from ghostdeck.app import (
     resolve_source,
     shim_is_up,
     youtube_watch_url,
+    playable_source,
+    should_start_play,
 )
 
 
@@ -70,6 +72,24 @@ def test_ensure_store_id_reuses_the_same_uuid(tmp_path):
     second = ensure_store_id(path, lambda: "22222222-2222-2222-2222-222222222222")
     assert first == "11111111-1111-1111-1111-111111111111"
     assert second == first
+
+
+def test_playable_source_keeps_youtube_as_a_watch_url():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert playable_source("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1") == watch
+    assert playable_source(watch, "https://rr.googlevideo.com/videoplayback") == watch
+
+
+def test_playable_source_uses_a_direct_media_file():
+    page = "https://example.com/watch"
+    media = "https://cdn.example.com/clip.mp4"
+    assert playable_source(page, media) == media
+
+
+def test_should_start_play_ignores_the_same_youtube_video():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert should_start_play(watch, watch, "https://rr.googlevideo.com/videoplayback") == ""
+    assert should_start_play("", watch) == watch
 
 
 def test_empty_field_plays_a_copied_url():
