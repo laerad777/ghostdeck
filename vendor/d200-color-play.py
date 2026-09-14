@@ -654,7 +654,13 @@ def main():
                                fpsNumerator=fps.numerator, fpsDenominator=fps.denominator), deadline, cancel)
         if not answer["accepted"]:
             open_rejected = True
-            raise RuntimeError(f"video OPEN failed with code {answer['resultCode']}")
+            # FIX-5-T16: the bridge's own `error` text is why it refused, and it used to be
+            # dropped here, so a named refusal (an unproven session boundary) reached the user
+            # as a bare `code 1`. The validator above already bounded it (no NUL, <= 252 bytes),
+            # so it is safe to show; without it the fix would refuse silently in effect.
+            detail = answer.get("error")
+            raise RuntimeError(f"video OPEN failed with code {answer['resultCode']}"
+                               + (f": {detail}" if detail else ""))
         credentials = dict(session=session, epoch=1, capability=answer["capability"])
         state["video"].update(epoch=1, capability=answer["capability"])
         state["diagnostics"] = diagnostics.snapshot()

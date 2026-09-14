@@ -1613,10 +1613,30 @@ class DeviceProxy:
     def video_open(self, request):
         session = request['session']
         deadline = time.monotonic() + 10
+        # FIX-5-T16: this guard IS the bridge's whole cross-session refusal, and its predicate is
+        # unchanged -- `self.video` (the previous owner of this slot, assigned only here and never
+        # cleared) must have proven it released the deck. What changed is that it now NAMES the
+        # reason instead of answering a bare `resultCode 1` that reached the user as nothing.
+        #
+        # The predicate was NOT widened, and it was measured rather than assumed. Over the 119
+        # same-process session transitions in the master's own hardware log
+        # (`/tmp/d200-local-bridge.log`), a refusal keyed on "previous cleanup != proven" fires on
+        # 32 of them: 28 successors never played a frame, but 4 played >=1000 frames and finished
+        # `cleanup: proven` themselves (10088, 8496, 4691, 2158 frames). Narrowing it further does
+        # not help: adding "and the transport never re-established" makes it WORSE, not better
+        # (75.0% precise against 78.1%), because the transport is usually replaced by a fresh one.
+        # So the guard stays as it is and says why it fired. See the report's measurement table.
         with self.condition:
-            if (self.video_opening or (self.video is not None and
-                    self.video.status['cleanup'] != 'proven')):
-                return video_response(request, 1)
+            if self.video_opening:
+                return video_response(
+                    request, 1,
+                    error='another video session is already opening on this bridge')
+            if self.video is not None and self.video.status['cleanup'] != 'proven':
+                return video_response(
+                    request, 1,
+                    error=('the previous video session has not proven it released the deck '
+                           '(cleanup: ' + self.video.status['cleanup'] + '); refusing to open a '
+                           'second session onto a boundary the bridge cannot prove is clean'))
             if self.video is not None and self.video.session == session:
                 return video_response(request, 4)
             self.video_opening = True
@@ -1867,6 +1887,13 @@ class VideoSession:
         self.native_terminal = None
         self.diagnostic_emitted = False
         self.first_failure = None
+        # FIX-5-T16: the code for the failure *this bridge* observed, in the deck's own
+        # vocabulary. The relay reports a DISCONNECTED/EOF shape that never reaches the
+        # deck as a terminal STATUS, so without this the receipt published the status
+        # field's initial `terminalCode: 0` (OK) next to `cleanup: unproven` -- a
+        # placeholder that reads as success. Diagnostics only; the wire status is not set
+        # from it, because that contract belongs to the deck's STATUS replies.
+        self.observed_failure_reason = None
         self.first_relay_observation = None
         self.media_io = dict(producerRead=None, producerWrite=None, consumerRead=None, consumerWrite=None)
         self.created_at = time.monotonic()
@@ -2055,7 +2082,18 @@ class VideoSession:
                            firstFailure=None if self.first_failure is None else dict(self.first_failure),
                            firstRelayObservation=self.first_relay_observation,
                            state=self.status['state'],
-                           terminalCode=self.status['terminalCode'], cleanup=self.status['cleanup'],
+                           # FIX-5-T16, the reporting reconciliation: `terminalCode` is the
+                           # deck's field and starts at 0 (OK), so a session the relay lost
+                           # before any terminal STATUS published `0 + cleanup: unproven` --
+                           # a placeholder that reads like success while the deck's own agent
+                           # reported 13 (RESULT_CANCELLED) for the same session. Both codes
+                           # are now named and the placeholder is labelled, because the
+                           # bridge cannot prove which of them the host should trust.
+                           terminalCode=self.status['terminalCode'],
+                           terminalCodeSource=('deck' if self.native_terminal is not None
+                                               else 'unset'),
+                           observedReason=self.observed_failure_reason,
+                           cleanup=self.status['cleanup'],
                            cancelPhase=self.status['cancelPhase'], hostMonotonic=now,
                            elapsedSeconds=now - self.created_at, phases=dict(self.phase_times),
                            phaseElapsedSeconds={key: value - self.created_at for key, value in self.phase_times.items()},
@@ -2266,6 +2304,29 @@ class VideoSession:
                 target += length
         return video_wire.decode_record(bytes(data), direction=video_wire.PRODUCER)
 
+    @staticmethod
+    def _observed_reason(error):
+        """The deck's vocabulary code for the failure this bridge saw (T16, diagnostics only)."""
+        if isinstance(error, TimeoutError):
+            return video_wire.TIMEOUT
+        if isinstance(error, (video_wire.ProtocolError, ValueError)):
+            return video_wire.PROTOCOL
+        if isinstance(error, (EOFError, OSError, subprocess.SubprocessError)):
+            return video_wire.DISCONNECTED
+        return video_wire.PROTOCOL
+
+    def ended_cleanly(self):
+        """True only for the fully proven DONE the host itself requires.
+
+        The host's own completion check is `state == STATE_DONE and cleanup == "proven"`
+        (vendor/d200-color-play.py). Used by the report's cross-session measurement; no
+        admission path consults it (see `video_open`).
+        """
+        with self.condition:
+            return (self.status['cleanup'] == 'proven' and
+                    self.status['state'] == video_wire.STATE_DONE and
+                    self.status['terminalCode'] == video_wire.OK)
+
     def relay(self, local):
         terminal = False
         try:
@@ -2313,6 +2374,7 @@ class VideoSession:
                 terminal = self._pump(local, native, local_state, native_state)
         except (EOFError, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             self.record_failure('unknown', error)
+            self.observed_failure_reason = self._observed_reason(error)
             with self.condition:
                 if self.status['cleanup'] != 'proven':
                     self.status.update(cleanup='unproven')
