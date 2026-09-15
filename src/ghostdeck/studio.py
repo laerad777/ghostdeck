@@ -64,6 +64,30 @@ def copy_exists() -> bool:
     return COPY.is_dir() and SHIM.is_file() and REAL.is_file() and EXE.is_file()
 
 
+def _shim_is_stale() -> bool:
+    """True when the copy's shim was built from an older `hidshim.c` than the tree has now.
+
+    `copy_exists()` alone was the whole precondition for reuse, so the copy built on 2026-09-09 kept
+    serving after `hidshim.c` changed twice on 2026-09-14 (150 added lines: the bridge-unreachable
+    diagnostic and its one-line hint). Measured on that copy's `libhidapi.0.dylib`: none of
+    `/tmp/d200-hidshim.log`, `the hidshim bridge is not running` or `ghostdeck studio` are present,
+    so a shim that could not reach the bridge said nothing and left no record -- Studio simply looked
+    like it would not attach, with no way to tell why. The same defect `devicebuild._stale()` already
+    closed for the ARM caches (A-166); the copy kept it.
+
+    Only the C source is compared: `clang` has no dependency file here, so what matters is whether the
+    installed image could predate a source edit, and a source that cannot be stat()ed counts as stale
+    (producing the artifact is the safe answer, and it keeps this failure at the compiler, which can
+    explain itself, rather than here).
+    """
+    if not HIDSHIM_SRC.is_file():
+        return False
+    try:
+        return HIDSHIM_SRC.stat().st_mtime > SHIM.stat().st_mtime
+    except OSError:
+        return True
+
+
 def _copy_pids() -> list[int]:
     """PIDs whose live command line IS this copy's own executable, as argv[0].
 
@@ -126,8 +150,6 @@ def _quit_copy(*, timeout: float = 15.0) -> None:
 
 
 def launch() -> None:
-    ensure_copy()
-    devicebuild.ensure()
     endpoint, reason = _socket_state()
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         # Refuse before touching the copy: quitting a healthy shim for a bridge that then cannot
@@ -143,11 +165,18 @@ def launch() -> None:
             f"Studio against an unidentified bridge. Stop that process, or remove {SOCKET} if it is "
             f"a leftover, and retry"
         )
-    if endpoint == _ENDPOINT_DEAD:
+    if endpoint == _ENDPOINT_DEAD or (copy_exists() and _shim_is_stale()):
         # Studio holds HID interface 0 while it runs, so the HID-to-ADB switch needs
         # the copy stopped first; a restarted bridge also leaves an already running
-        # copy holding a dead shim, so it is relaunched either way.
+        # copy holding a dead shim, so it is relaunched either way. A stale shim needs the same
+        # treatment for a different reason: `ensure_copy()` replaces the bundle, and a running
+        # process keeps its OLD image mapped, so without this the freshly built shim would sit on
+        # disk while the stale one went on serving.
         _quit_copy()
+    # After the refusals, so nothing is rebuilt or copied on a path that then declines to open
+    # Studio.
+    ensure_copy()
+    devicebuild.ensure()
     _ensure_bridge()
     subprocess.run(["/usr/bin/open", str(COPY)], check=True, timeout=15)
     deadline = time.monotonic() + 20
@@ -159,7 +188,7 @@ def launch() -> None:
 
 
 def ensure_copy() -> None:
-    if copy_exists():
+    if copy_exists() and not _shim_is_stale():
         return
     _require_build_tools()
     if not ORIGINAL.is_dir():
