@@ -2587,18 +2587,32 @@ class BridgeState:
 def _peer_pid(connection):
     """The peer's pid for `connection`, or None when this platform will not say.
 
-    `LOCAL_PEERPID` is the Darwin option; it lives in the SDK's `sys/un.h`, not in Python's `socket`
-    module, so the numeric value is written out with the level it belongs to (`SOL_LOCAL`). Anything
-    unreadable is None, which `BridgeState.open` treats as "cannot prove dead" and therefore keeps
-    the existing claim rather than stealing it.
+    Darwin exposes it as `LOCAL_PEERPID`, a single int at `SOL_LOCAL`; that option lives in the SDK's
+    `sys/un.h` rather than in Python's `socket`, so the numeric values are written out here. Linux
+    exposes `SO_PEERCRED`, a `struct ucred {pid, uid, gid}`, which Python does export.
+
+    Anything unreadable is None, which `BridgeState.open` treats as "cannot prove dead" and therefore
+    keeps the existing claim rather than stealing a live client's handle. The macOS runner and the
+    Linux one both answer, so the reclaim this exists for works on both; a third platform that
+    answers neither keeps the old leak rather than gaining a new way to break a working client.
     """
-    SOL_LOCAL = 0
-    LOCAL_PEERPID = 0x002
     if connection is None:
         return None
+    if sys.platform == 'darwin':
+        SOL_LOCAL = 0
+        LOCAL_PEERPID = 0x002
+        try:
+            raw = connection.getsockopt(SOL_LOCAL, LOCAL_PEERPID, struct.calcsize('i'))
+            pid = struct.unpack('i', raw)[0]
+        except (OSError, struct.error, TypeError):
+            return None
+        return pid if pid > 0 else None
+    option = getattr(socket, 'SO_PEERCRED', None)
+    if type(option) is not int:
+        return None
     try:
-        raw = connection.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4)
-        pid = struct.unpack('i', raw)[0]
+        raw = connection.getsockopt(socket.SOL_SOCKET, option, struct.calcsize('3i'))
+        pid = struct.unpack('3i', raw)[0]
     except (OSError, struct.error, TypeError):
         return None
     return pid if pid > 0 else None

@@ -124,7 +124,6 @@ def test_pid_alive_only_calls_a_reaped_process_dead():
 
 
 @pytest.fixture()
-
 def short_scratch():
     """An AF_UNIX endpoint lives in 104 bytes, so the wire test needs a short path."""
     directory = Path(tempfile.mkdtemp(prefix="vendorbridge-handleowner-", dir="/tmp"))
@@ -134,6 +133,57 @@ def short_scratch():
         shutil.rmtree(directory, ignore_errors=True)
 
 
+class _FakeConnection:
+    """A stand-in whose `getsockopt` is scripted, so both platform branches are reachable."""
+
+    def __init__(self, raw=b"", error=None):
+        self.raw = raw
+        self.error = error
+
+    def getsockopt(self, level, option, size):
+        if self.error is not None:
+            raise self.error
+        return self.raw
+
+
+def test_the_linux_peer_credential_branch_reads_the_first_int(monkeypatch):
+    """`SO_PEERCRED` is `struct ucred {pid, uid, gid}`; only the pid is the owner.
+
+    This branch exists because the Darwin-only first revision passed on macOS and failed on the
+    ubuntu runner, where nothing could name the peer: the reclaim silently did not happen, and the
+    wire test caught it. Every unreadable shape must answer None, which keeps the claim.
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(socket, "SO_PEERCRED", 0x11, raising=False)
+    import struct as _struct
+
+    assert bridge._peer_pid(_FakeConnection(_struct.pack("3i", 4242, 0, 0))) == 4242
+    assert bridge._peer_pid(_FakeConnection(_struct.pack("3i", 0, 0, 0))) is None
+    assert bridge._peer_pid(_FakeConnection(b"\x01\x02")) is None
+    assert bridge._peer_pid(_FakeConnection(error=OSError(92, "not supported"))) is None
+    assert bridge._peer_pid(None) is None
+
+
+def test_a_platform_without_a_peer_option_degrades_to_no_owner(monkeypatch):
+    """A host that cannot name the peer keeps the old behaviour instead of a wrong one."""
+    monkeypatch.setattr(sys, "platform", "freebsd14")
+    monkeypatch.delattr(socket, "SO_PEERCRED", raising=False)
+    assert bridge._peer_pid(_FakeConnection()) is None
+
+
+def _peer_pid_supported():
+    """True when this host can name a unix-socket peer, which is what reclamation keys on.
+
+    Both CI runners answer -- `LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux -- but a host that
+    answers neither keeps the old leak by design, so this test asserts nothing there rather than
+    encoding a platform assumption it cannot meet.
+    """
+    if sys.platform == "darwin":
+        return True
+    return type(getattr(socket, "SO_PEERCRED", None)) is int
+
+
+@pytest.mark.skipif(not _peer_pid_supported(), reason="host cannot name a unix-socket peer")
 def test_a_real_disconnect_and_restart_pair_reattaches(short_scratch):
     """End to end over a real socket: killed client, then a successor on the same handle number.
 
@@ -172,6 +222,8 @@ def test_a_real_disconnect_and_restart_pair_reattaches(short_scratch):
         )
         out, _ = opener.communicate(timeout=30)
         assert '"accepted":true' in out, out
+        # The opener is reaped, so its pid is provably gone before the successor arrives.
+        assert bridge._pid_alive(opener.pid) is False, "precondition: the opener really exited"
         # The opener has exited; the successor reuses handle 1, exactly as a restarted Studio does.
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(5)
