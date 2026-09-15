@@ -69,20 +69,30 @@ def ensure() -> None:
 
 
 def _compile_proxy_preload() -> None:
-    compiler = gcc()
     proxy = DEVICE / "d200-zkgui-proxy.c"
     preload = DEVICE / "d200-zkgui-preload.c"
     if not proxy.is_file() or not preload.is_file():
         raise RuntimeError(f"device sources missing under {DEVICE}")
     out_proxy = gdstate.BIN_DIR / "d200-zkgui-proxy"
     out_preload = gdstate.BIN_DIR / "libd200-zkgui-preload.so"
+    # Resolved only once something needs compiling. `gcc()` used to be called unconditionally at the
+    # top, so a host with a complete cache and no cross compiler on PATH -- the normal machine after
+    # the toolchain is removed, and every launchd context, which starts with no PATH at all -- died
+    # at "armv7-linux-gnueabihf-gcc not on PATH" before the cache was ever consulted. Reproduced with
+    # `env -i PYTHONPATH=src python -c 'from ghostdeck import devicebuild; devicebuild.ensure()'`:
+    # RuntimeError, although all three artifacts under ~/.ghostdeck/bin were present. The A-166 rule
+    # is that a fresh source wins; it never said an unreachable compiler invalidates a fresh cache.
+    compiler: str | None = None
     if _stale(proxy, out_proxy):
+        compiler = gcc()
         subprocess.run(
             [compiler, "-O2", "-Wall", "-Wextra", str(proxy), "-o", str(out_proxy), "-pthread"],
             check=True,
             timeout=120,
         )
     if _stale(preload, out_preload):
+        if compiler is None:
+            compiler = gcc()
         subprocess.run(
             [
                 compiler,

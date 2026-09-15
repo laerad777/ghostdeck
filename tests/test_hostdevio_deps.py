@@ -394,6 +394,39 @@ def test_a_cached_object_is_rebuilt_when_its_source_changes(tmp_path, monkeypatc
     )
 
 
+def test_a_complete_cache_does_not_need_the_cross_compiler(tmp_path, monkeypatch):
+    """`gcc()` was resolved before the cache was consulted, so a warm cache still required it.
+
+    Measured with `env -i PYTHONPATH=src python -c 'from ghostdeck import devicebuild;
+    devicebuild.ensure()'` (the environment every launchd context starts in, which has no PATH at
+    all): `RuntimeError: armv7-linux-gnueabihf-gcc not on PATH`, although all three artifacts under
+    `~/.ghostdeck/bin` were present and nothing needed compiling. The A-166 rule is that a newer
+    source wins; it never said an unreachable compiler invalidates a current cache.
+    """
+    device, bindir, _, runs = _stub_devicebuild(monkeypatch, tmp_path)
+
+    def _no_compiler():
+        raise RuntimeError("armv7-linux-gnueabihf-gcc not on PATH")
+
+    monkeypatch.setattr(devicebuild, "gcc", _no_compiler)
+
+    # First pass with a working compiler to fill the cache, then re-run with none available.
+    monkeypatch.setattr(devicebuild, "gcc", lambda: "stub-armv7-gcc")
+    devicebuild._compile_proxy_preload()
+    assert len(runs) == 2, "precondition: the cache had to be cold"
+
+    monkeypatch.setattr(devicebuild, "gcc", _no_compiler)
+    devicebuild._compile_proxy_preload()  # must not raise: both objects are current
+    assert len(runs) == 2, "the cache was bypassed even though nothing was stale"
+
+    # The other half: a stale source must still demand the compiler.
+    newer = time.time() + 5
+    os.utime(device / "d200-zkgui-proxy.c", (newer, newer))
+    with pytest.raises(RuntimeError) as excinfo:
+        devicebuild._compile_proxy_preload()
+    assert "armv7-linux-gnueabihf-gcc not on PATH" in str(excinfo.value)
+
+
 def test_ensure_republishes_rebuilt_binaries_into_vendor(tmp_path, monkeypatch):
     """The other half of A-166: `vendor/` was re-stamped from the cache, so staleness was invisible."""
     device, _, vendor, runs = _stub_devicebuild(monkeypatch, tmp_path)
