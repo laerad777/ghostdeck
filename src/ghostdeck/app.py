@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from ghostdeck import cli
+from ghostdeck import cli, studio
 
 _SHIM_UP = re.compile(r"(?:^|\s)shim=up(?:\s|$)")
 _YT_HOSTS = {
@@ -58,6 +58,20 @@ def run_cli(argv: list[str]) -> CommandResult:
 
 def shim_is_up(status_stdout: str) -> bool:
     return bool(_SHIM_UP.search(status_stdout))
+
+
+def bridge_down(detail: str) -> bool:
+    """True when `play` refused because the bridge is not up, so `studio` is the remedy.
+
+    `shim=up` only reports the copy process, and the copy outlives its bridge: `studio` starts both,
+    but a bridge that dies (or a foreign listener on the endpoint) leaves the copy running. The
+    window gated its one recovery step on `shim`, so in that state it ran `play` directly, `play`
+    refused, and every later press failed the same way until a human ran `ghostdeck studio` by hand.
+    `status` cannot answer this instead: it must stay usable while the bridge is down (T19), so it
+    never consults the bridge. The refusal text is therefore the signal, matched on the phrase
+    `studio` exports so a reword cannot silently break recovery.
+    """
+    return studio.BRIDGE_DOWN in (detail or "")
 
 
 def read_pasteboard(run=subprocess.run) -> str:
@@ -218,7 +232,15 @@ class DeckRemote:
             argv.extend(["--start", f"{start:.3f}"])
         if not loop:
             argv.append("--no-loop")
-        results.append(self._run(argv))
+        played = self._run(argv)
+        results.append(played)
+        # `shim=up` said the copy was running, so `studio` was skipped -- but the bridge it needs was
+        # gone, and `play` refused. Start it now and retry once: this is the same recovery the
+        # shim-down branch already does, reached from the failure instead of from `status`.
+        if played.code != 0 and bridge_down(played.detail):
+            results.append(self._run(["studio"]))
+            if results[-1].code == 0:
+                results.append(self._run(argv))
         return results
 
 

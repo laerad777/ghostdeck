@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from ghostdeck.app import (
     CommandResult,
     DeckRemote,
+    bridge_down,
     ensure_store_id,
     is_google_login_host,
     read_pasteboard,
@@ -29,6 +30,16 @@ def test_shim_is_up_reads_the_status_line():
     assert not shim_is_up("usb=adb shim=down copy=yes playing=no")
     assert not shim_is_up("usb=none")
     assert not shim_is_up("usb=adb copy=yes playing=no")
+
+
+def test_bridge_down_matches_the_refusal_play_actually_raises():
+    """The phrase is shared with `studio`, so a reword cannot silently stop recovery working."""
+    from ghostdeck import studio
+
+    assert bridge_down(f"{studio.BRIDGE_DOWN} (no listener accepted the connection), and ...")
+    assert not bridge_down("no D200 on USB")
+    assert not bridge_down("")
+    assert not bridge_down(studio.BRIDGE_DOWN[:-1] + "!")
 
 
 def test_read_pasteboard_uses_macos_pbpaste_not_tk():
@@ -170,6 +181,73 @@ def test_play_skips_studio_when_the_shim_is_already_up():
     DeckRemote(run).play("/tmp/clip.mp4")
     assert calls == [["status"], ["play", "/tmp/clip.mp4"]]
     assert ["studio"] not in calls
+
+
+def test_play_recovers_when_the_copy_is_up_but_its_bridge_is_gone():
+    """The reported stuck state: `shim=up` skipped `studio`, and `play` refused every time.
+
+    `studio` starts the copy and the bridge, but the copy outlives the bridge, so `shim=up` alone
+    does not mean `play` will work. The first `play` is expected to refuse; the window must then
+    start the bridge and retry rather than reporting the same failure until a human runs `studio`.
+    """
+    from ghostdeck import studio
+
+    calls: list[list[str]] = []
+    refused = CommandResult(["play", "/tmp/clip.mp4"], 1, "", studio.BRIDGE_DOWN + " (none)")
+    play_calls = 0
+
+    def run(argv):
+        nonlocal play_calls
+        calls.append(list(argv))
+        if argv[0] == "status":
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        if argv[0] == "studio":
+            return CommandResult(argv, 0, "", "")
+        play_calls += 1
+        return refused if play_calls == 1 else CommandResult(argv, 0, "", "")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [
+        ["status"],
+        ["play", "/tmp/clip.mp4"],
+        ["studio"],
+        ["play", "/tmp/clip.mp4"],
+    ]
+    assert results[-1].code == 0, "the retry after starting the bridge must be reported"
+
+
+def test_play_does_not_retry_a_failure_studio_cannot_fix():
+    """A refusal that is not about the bridge must not spend a `studio` bring-up on it."""
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv[0] == "status":
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        return CommandResult(argv, 1, "", "no D200 on USB")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [["status"], ["play", "/tmp/clip.mp4"]]
+    assert results[-1].code == 1
+
+
+def test_play_does_not_retry_when_starting_the_bridge_fails():
+    """One retry at most: a `studio` that failed is reported, not looped on."""
+    from ghostdeck import studio
+
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv[0] == "status":
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        if argv[0] == "studio":
+            return CommandResult(argv, 1, "", "official Studio.app is missing")
+        return CommandResult(argv, 1, "", studio.BRIDGE_DOWN + " (none)")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [["status"], ["play", "/tmp/clip.mp4"], ["studio"]]
+    assert results[-1].code == 1
 
 
 def test_play_does_not_call_play_if_studio_fails():

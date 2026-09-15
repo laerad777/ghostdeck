@@ -38,6 +38,11 @@ _ENDPOINT_LIVE = "live"
 _ENDPOINT_DEAD = "dead"
 _ENDPOINT_UNDETERMINABLE = "undeterminable"
 _PROBE_TIMEOUT = 0.4
+# The one phrase that means "the bridge `play` needs is not up". `play` owns the refusal (it is the
+# command that needs the bridge) and the GUI matches on this phrase to decide whether running
+# `studio` can fix the failure it just saw. Shared rather than duplicated so the two cannot drift:
+# a reworded refusal would otherwise silently stop the window from recovering.
+BRIDGE_DOWN = "the hidshim bridge is not running"
 
 # A deck that has just re-enumerated through ADB answers device commands late, the HID-to-ADB
 # switch report itself is flaky, and the bridge exits on the first rejected device command, so
@@ -481,7 +486,7 @@ def require_bridge() -> None:
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         raise _undeterminable_endpoint(probe_reason)
     raise RuntimeError(
-        f"the hidshim bridge is not running ({probe_reason}), and the player reaches the deck "
+        f"{BRIDGE_DOWN} ({probe_reason}), and the player reaches the deck "
         f"through it: run `ghostdeck studio` first (it starts the bridge and the Studio copy), then "
         f"re-run `ghostdeck play`"
     )
