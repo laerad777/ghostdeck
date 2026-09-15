@@ -2541,14 +2541,28 @@ class BridgeState:
         with self.lock:
             transport.hid_handles = self.handles
 
-    def open(self, handle, endpoint):
+    def open(self, handle, endpoint, owner=None):
         if endpoint not in (0, 1):
             raise ProtocolError('invalid interface')
         capability = secrets.token_hex(32)
         with self.lock:
             if handle in self.handles:
-                raise ProtocolError('handle already open')
-            self.handles[handle] = (capability, endpoint)
+                # The shim numbers handles per PROCESS from 1 (hidshim.c: `next_handle = 1`), while
+                # this registry is global to the bridge. A client that exits without closing -- or
+                # is killed, or just loses its connection -- therefore leaves a handle its successor
+                # reuses by number, and `handle already open` refused the new client FOREVER: a
+                # restarted Studio could not attach at all, and only restarting the bridge cleared
+                # it. Reclaim the entry when the process that opened it is provably gone; a live
+                # owner keeps its claim, so a genuine double-open is still refused.
+                # Only PROVEN death reclaims. A live owner -- including one whose pid could not be
+                # read (`_pid_alive(None)` is True) -- keeps its claim, because stealing a live
+                # client's handle would break a working Studio, which is the worse failure.
+                record = self.handles[handle]
+                if not _pid_alive(record[2]):
+                    self.handles.pop(handle, None)
+                else:
+                    raise ProtocolError('handle already open')
+            self.handles[handle] = (capability, endpoint, owner)
         return capability
 
     def authorize(self, handle, capability):
@@ -2570,6 +2584,44 @@ class BridgeState:
         return record is None or not secrets.compare_digest(record[0], capability or '')
 
 
+def _peer_pid(connection):
+    """The peer's pid for `connection`, or None when this platform will not say.
+
+    `LOCAL_PEERPID` is the Darwin option; it lives in the SDK's `sys/un.h`, not in Python's `socket`
+    module, so the numeric value is written out with the level it belongs to (`SOL_LOCAL`). Anything
+    unreadable is None, which `BridgeState.open` treats as "cannot prove dead" and therefore keeps
+    the existing claim rather than stealing it.
+    """
+    SOL_LOCAL = 0
+    LOCAL_PEERPID = 0x002
+    if connection is None:
+        return None
+    try:
+        raw = connection.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4)
+        pid = struct.unpack('i', raw)[0]
+    except (OSError, struct.error, TypeError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_alive(pid):
+    """True when `pid` names a live process. Unknown or untrustworthy input is alive.
+
+    Deliberately conservative: `os.kill(pid, 0)` answers EPERM for a live process this one may not
+    signal, so only ESRCH is proof of death. A missing pid (a client that could not be identified)
+    must never read as dead, or a second live opener would silently steal a handle.
+    """
+    if type(pid) is not int or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 class BridgeHandler(socketserver.StreamRequestHandler):
     # No buffered read-ahead: the byte after OPEN's newline belongs to D2JF.
     rbufsize = 0
@@ -2582,7 +2634,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                 self.connection.settimeout(5)
             data = self.rfile.readline(MAX_MESSAGE + 1)
             request = parse_message(data)
-            response = self.server.dispatch(request)
+            response = self.server.dispatch(request, self.connection)
             if request.get('op') == 'videoOpen' and response['accepted']:
                 owner = self.server.state.transport.video
             encoded = framed_json(response)
@@ -2637,7 +2689,7 @@ class BridgeServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.endpoint = endpoint_identity(self.path)
         os.chmod(self.path, 0o600)
 
-    def dispatch(self, request):
+    def dispatch(self, request, connection=None):
         operation = request.get('op')
         if operation in ('videoOpen', 'videoStatus', 'videoCancel'):
             validate_video_request(request)
@@ -2669,7 +2721,7 @@ class BridgeServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             }
         if operation == 'open':
             endpoint = request.get('interface', 0)
-            capability = self.state.open(handle, endpoint)
+            capability = self.state.open(handle, endpoint, owner=_peer_pid(connection))
             return {'schemaVersion': 1, 'accepted': True, 'capability': capability}
         capability = request.get('capability')
         endpoint = self.state.authorize(handle, capability)

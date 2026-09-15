@@ -219,10 +219,10 @@ def test_the_host_surfaces_the_bridge_refusal_instead_of_a_bare_code(short_scrat
     endpoint = short_scratch / "bridge.sock"
     original = bridge.BridgeServer.dispatch
 
-    def refusing_dispatch(server, request):
+    def refusing_dispatch(server, request, connection=None):
         if request.get('op') == 'videoOpen':
             return bridge.video_response(request, wire.BUSY, error=refusal)
-        return original(server, request)
+        return original(server, request, connection)
 
     bridge.BridgeServer.dispatch = refusing_dispatch
     server = bridge.BridgeServer(endpoint, bridge.BridgeState(proxy))
