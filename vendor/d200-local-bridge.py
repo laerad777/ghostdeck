@@ -2732,6 +2732,12 @@ class BridgeServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 'openHandles': open_handles,
                 'outputsAcked': outputs_acked,
                 'inputsReceived': inputs_received,
+                # The deck's own serial, so the shim can present the device under the identity the
+                # OS and Studio already know. Studio keys its remembered device on the serial: with
+                # the deck in HID mode IOKit reports the real one, so a fixed placeholder made the
+                # ADB-mode device look like a DIFFERENT deck and the UI showed "not connected"
+                # even though openHandles showed it attached. Read from `--serial`, never stored.
+                'serial': self.state.transport.serial or '',
             }
         if operation == 'open':
             endpoint = request.get('interface', 0)

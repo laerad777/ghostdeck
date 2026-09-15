@@ -123,6 +123,41 @@ def test_pid_alive_only_calls_a_reaped_process_dead():
         assert bridge._pid_alive(junk) is True, junk
 
 
+def test_the_event_reply_advertises_the_deck_serial(tmp_path):
+    """The bridge must tell the shim which serial to present, rather than the shim inventing one.
+
+    Measured on the attached deck: the shim enumerated `GHOSTDECKVHID00000` while Studio's own
+    `CurrentDeviceType` was the deck's real serial, so one deck appeared under two identities.
+    Whether that mismatch is what the UI showed as "not connected" was NOT proven -- Studio imports
+    `hid_open_path` (path-keyed), not `hid_open`, and the deck had dropped off USB before an
+    end-to-end check could run. This test only pins the fact that was measured: the value is passed
+    through from `--serial` instead of being a constant.
+    """
+    state = make_state(tmp_path)
+    state.transport.serial = "SN-UNDER-TEST"
+    server = bridge.BridgeServer.__new__(bridge.BridgeServer)
+    server.state = state
+
+    reply = server.dispatch({"schemaVersion": 1, "op": "event", "handle": 0, "interface": 0,
+                             "timeoutMs": -1})
+    assert reply["accepted"] is True
+    assert reply["serial"] == "SN-UNDER-TEST"
+
+
+def test_the_serial_field_is_the_one_the_bridge_was_started_with(tmp_path):
+    """The value is read from `--serial`, never stored: nothing here may invent a serial."""
+    proxy = bridge.DeviceProxy(
+        str(tmp_path / "no-such-adb"), "SN-UNDER-TEST",
+        tmp_path / "d200-zkgui-proxy", tmp_path / "libd200-zkgui-preload.so",
+    )
+    state = bridge.BridgeState(proxy)
+    server = bridge.BridgeServer.__new__(bridge.BridgeServer)
+    server.state = state
+    reply = server.dispatch({"schemaVersion": 1, "op": "event", "handle": 0, "interface": 0,
+                             "timeoutMs": -1})
+    assert reply["serial"] == "SN-UNDER-TEST"
+
+
 @pytest.fixture()
 def short_scratch():
     """An AF_UNIX endpoint lives in 104 bytes, so the wire test needs a short path."""

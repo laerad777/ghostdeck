@@ -137,6 +137,22 @@ static void *real_hidapi;
 #endif
 static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t next_handle = 1;
+/* The deck's own serial, as the bridge reports it in its `event` reply. The shim used to invent
+ * `GHOSTDECKVHID00000`, which is not the identity of any real deck: measured on the attached deck,
+ * the shim enumerated that placeholder while Studio's own `CurrentDeviceType` held the deck's real
+ * serial, so one deck appeared under two identities. Presenting the real one is the point.
+ *
+ * Whether that mismatch is what Studio showed as "not connected" is NOT proven: Studio imports
+ * `hid_open_path` (path-keyed), not `hid_open`, and the deck dropped off USB before an end-to-end
+ * check could run. Empty until the first successful `event`, so a bridge that never answers -- or an
+ * older one that omits the field -- keeps the documented placeholder. */
+static wchar_t bridge_serial[65];
+static int bridge_serial_length;
+
+static const wchar_t *virtual_serial(void)
+{
+    return bridge_serial_length ? bridge_serial : L"GHOSTDECKVHID00000";
+}
 #ifdef D200_HOST_VISUAL
 static virtual_device *host_devices;
 #else
@@ -538,7 +554,7 @@ static int parse_reply(const char *answer, size_t length, const char *operation,
     /* Both bridge implementations emit integer schemaVersion 1. Unknown
      * metadata is grammar-checked, not searched for protocol field names. */
     json_parser p = {0};
-    const json_node *report = NULL, *capability = NULL;
+    const json_node *report = NULL, *capability = NULL, *serial_value = NULL;
     int accepted = 0, schema = 0;
     unsigned i;
     if (!answer || !operation || length == 0 || length >= JSON_BYTES ||
@@ -565,6 +581,11 @@ static int parse_reply(const char *answer, size_t length, const char *operation,
         } else if (json_key(&p, key, "report")) {
             if (value->type != 's' || value->length % 2 || value->length > REPORT_BYTES * 2) return -1;
             report = value;
+        } else if (json_key(&p, key, "serial")) {
+            /* Optional: an older bridge omits it, and the placeholder then stands. Bounded by the
+             * storage it is copied into, so a long value cannot overrun it. */
+            if (value->type != 's') return -1;
+            serial_value = value;
         }
     }
     if (!accepted || !schema || (!strcmp(operation, "open") && !capability) ||
@@ -573,6 +594,23 @@ static int parse_reply(const char *answer, size_t length, const char *operation,
     if (capability)
         for (i = 0; i < capability->length; i++)
             if (json_hex(p.strings[capability->offset + i]) < 0) return -1;
+    if (serial_value && serial_value->length) {
+        size_t limit = serial_value->length < 64 ? serial_value->length : 64;
+        pthread_mutex_lock(&handle_lock);
+        for (i = 0; i < limit; i++) {
+            /* `p.strings`, not `p.text`: strings holds the DECODED values, and reading the raw JSON
+             * buffer at a string offset returns the surrounding source instead (observed as the
+             * serial coming out as `":[0,0],"inputsRe`). `capability` above reads the same table. */
+            unsigned char c = p.strings[serial_value->offset + i];
+            /* The serial is presented as a wide string; anything outside the printable ASCII the
+             * deck itself uses would be a protocol surprise, so such a reply is not adopted. */
+            if (c < 0x20 || c > 0x7e) { limit = 0; break; }
+            bridge_serial[i] = (wchar_t)c;
+        }
+        bridge_serial[limit] = 0;
+        bridge_serial_length = (int)limit;
+        pthread_mutex_unlock(&handle_lock);
+    }
     if (report) {
         for (i = 0; i < report->length; i++)
             if (json_hex(p.strings[report->offset + i]) < 0) return -1;
@@ -1033,7 +1071,7 @@ static hid_device_info *identity(int interface_number)
     info->path = strdup(interface_number ? VPATH1 : VPATH0);
     info->vendor_id = VID;
     info->product_id = PID;
-    info->serial_number = wcsdup(L"GHOSTDECKVHID00000");
+    info->serial_number = wcsdup(virtual_serial());
     info->release_number = 0xffff;
     info->manufacturer_string = wcsdup(L"Zkswe");
     info->product_string = wcsdup(L"ulanzi");
@@ -1089,7 +1127,10 @@ hid_device *hid_open(unsigned short vendor, unsigned short product,
                      const wchar_t *serial)
 {
     if (vendor == VID && product == PID) {
-        if (serial && wcscmp(serial, L"GHOSTDECKVHID00000")) {
+        /* Both the placeholder and the deck's real serial are accepted: Studio opens by the serial
+         * it enumerated (now the real one), while the placeholder stays valid so a caller holding
+         * the older identity -- and every existing test -- keeps working. */
+        if (serial && wcscmp(serial, virtual_serial()) && wcscmp(serial, L"GHOSTDECKVHID00000")) {
 #ifdef D200_HOST_VISUAL
             d200_host_error(NULL, ENODEV);
 #endif
@@ -1601,11 +1642,14 @@ int hid_get_product_string(hid_device *device, wchar_t *output, size_t maximum)
 
 int hid_get_serial_number_string(hid_device *device, wchar_t *output, size_t maximum)
 {
+    /* Must agree with `identity()`: Studio reads the serial back from the open handle and matches it
+     * to the enumeration entry, so returning a different string than it enumerated by would break
+     * the match it just made. */
 #ifdef D200_HOST_VISUAL
-    return host_string(device, output, maximum, L"GHOSTDECKVHID00000");
+    return host_string(device, output, maximum, virtual_serial());
 #else
     if (is_virtual(device))
-        return virtual_string(output, maximum, L"GHOSTDECKVHID00000");
+        return virtual_string(output, maximum, virtual_serial());
     int (*function)(hid_device *, wchar_t *, size_t) = sym("hid_get_serial_number_string");
     return function ? function(device, output, maximum) : -1;
 #endif
