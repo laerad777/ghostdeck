@@ -747,14 +747,21 @@ class _FakeHidModule:
 
 
 def _drive_enable_adb(monkeypatch, *, usb_present: bool):
-    """Reach the post-switch poll with pyusb present or absent.
+    """Reach the post-switch poll with pyusb present or absent, over an empty bus.
 
-    Only `_hid_iface0` and the hidapi device are faked. `detect()` is left as the real function, so
-    the verdict under test is the one the product actually computes from the real backend state.
+    `_hid_iface0`, the hidapi device and the pyusb handle are faked: `detect()` and `enable_adb()`
+    are left real, so the verdict under test is the one the product computes. The handle is faked
+    because the alternative is the physical bus, and these three cases are about the state after a
+    switch that did not take: with the deck attached as ADB, `detect()` answered `mode=adb` and
+    `enable_adb()` returned early, so this file only passed on a host without the deck
+    (`test_the_hardware_verdict_is_still_reached_when_every_backend_works`, the same class of
+    environment coupling as the macOS CI failures). An empty bus is what "the deck is not there in
+    either mode" means; the backend-availability verdicts still come from the patched `_importable`.
     """
     monkeypatch.setattr(usb, "_importable", lambda name: name != "usb" or usb_present)
     monkeypatch.setattr(usb, "_hid_iface0", lambda *, timeout: {"path": b"/dev/fake"})
     monkeypatch.setattr(usb, "_hid_module", lambda: _FakeHidModule())
+    monkeypatch.setattr(usb, "_usb_find", lambda vid, pid: None)
 
 
 def test_a_missing_pyusb_is_reported_as_a_package_not_an_unswitched_deck(monkeypatch):
