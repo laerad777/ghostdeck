@@ -1645,6 +1645,67 @@ def test_session_released_treats_an_unreadable_record_as_released(monkeypatch, t
     assert _session(monkeypatch, tmp_path, "{not json") is True
 
 
+def test_session_released_when_the_recorded_player_is_gone(monkeypatch, tmp_path):
+    """A player killed before it could write `proven` must not wedge `stop` forever.
+
+    The record only advances to `cleanup=proven` from the player, so a player that died -- or was
+    killed -- leaves `phase=active cleanup=pending` for good. Waiting on the proof alone then made
+    every retry fail: measured on the attached deck, two consecutive `stop` runs both exited 1 with
+    "did not release within 8s" while the recorded pid was already dead. A dead process cannot be
+    holding the transport, which is the whole thing this wait protects.
+    """
+    from ghostdeck import play
+
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    record = tmp_path / "host-state.json"
+    record.write_text(
+        json.dumps({"pid": gone.pid, "video": {"status": {"cleanup": "pending"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(play, "_HOST_STATE", record)
+    started = time.monotonic()
+    assert play._session_released(5.0) is True
+    assert time.monotonic() - started < 1.0, "it waited out the bound for a dead owner"
+
+
+def test_session_released_is_false_while_a_LIVE_player_stays_pending(monkeypatch, tmp_path):
+    """The other half: a live owner still holds the bounce back, bounded by the timeout.
+
+    This is what keeps the new "owner is gone" escape hatch from becoming a way to cut a live media
+    session mid-stream -- the failure the 8s wait exists to avoid.
+    """
+    from ghostdeck import play
+
+    record = tmp_path / "host-state.json"
+    record.write_text(
+        json.dumps({"pid": os.getpid(), "video": {"status": {"cleanup": "pending"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(play, "_HOST_STATE", record)
+    started = time.monotonic()
+    assert play._session_released(0.5) is False
+    elapsed = time.monotonic() - started
+    assert 0.5 <= elapsed < 3.0, f"the wait must stay bounded: {elapsed}"
+
+
+def test_record_owner_alive_treats_an_unanswerable_probe_as_alive(monkeypatch, tmp_path):
+    """`ps` failing to answer must not read as a release: that is how a live session gets cut."""
+    from ghostdeck import play
+
+    assert play._record_owner_alive({"pid": os.getpid()}) is True
+    assert play._record_owner_alive({}) is True
+    assert play._record_owner_alive({"pid": "1234"}) is True
+    for junk in (True, 0, -1, None):
+        assert play._record_owner_alive({"pid": junk}) is True, junk
+
+    def no_answer(pid):
+        return None, "ps exited 1"
+
+    monkeypatch.setattr(play, "_probe_start_time", no_answer)
+    assert play._record_owner_alive({"pid": 4242}) is True, "an unreadable ps looked like a release"
+
+
 def test_the_stop_harness_redirects_the_shared_session_record_in_the_child(tmp_path):
     """Guard the harness itself: the CHILD must see the temp record, not the operator's /tmp one.
 

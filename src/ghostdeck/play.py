@@ -717,6 +717,22 @@ def _cleanup_device() -> None:
         print(listing.stdout, end="")
 
 
+def _record_owner_alive(record: dict) -> bool:
+    """True while the process that published `record` is still running.
+
+    Tri-state would be better, but the caller only needs the one direction that is provable: a pid
+    `ps` cannot find is gone. An unreadable `ps` answers True so an unanswerable probe never looks
+    like a release -- the wait is what keeps `stop` from cutting a live session mid-stream.
+    """
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return True
+    start, unknown = _probe_start_time(pid)
+    if unknown is not None:
+        return True
+    return start is not None
+
+
 def _session_released(timeout: float = _SESSION_RELEASE_TIMEOUT) -> bool:
     """True once the media session has released, so the stock UI can safely be restarted.
 
@@ -732,9 +748,16 @@ def _session_released(timeout: float = _SESSION_RELEASE_TIMEOUT) -> bool:
     immediately. That is not just an optimisation: a stop with nothing playing (or any run against a
     fake adb, which never publishes a record) must not block for the whole timeout.
 
-    Returns False only when a record exists and never proofs a release within the bound. The caller
-    then leaves the stock UI alone: a deck still holding an ADB session with its UI running is a far
-    smaller failure than a transport cut mid-stream.
+    A record whose owner is gone counts as released. This is the case that used to hang: a player
+    killed before it could write `cleanup=proven` leaves the record at `phase=active`
+    `cleanup=pending` forever, so waiting on the proof alone made `stop` fail on every retry (measured:
+    two consecutive `stop` runs both exited 1 with "did not release within 8s", while the recorded pid
+    23530 was already dead). A dead process cannot still be holding the transport, which is the whole
+    thing this wait protects.
+
+    Returns False only when a record exists, its owner is still alive, and it never proofs a release
+    within the bound. The caller then leaves the stock UI alone: a deck still holding an ADB session
+    with its UI running is a far smaller failure than a transport cut mid-stream.
     """
     if not _HOST_STATE.is_file():
         return True
@@ -745,7 +768,11 @@ def _session_released(timeout: float = _SESSION_RELEASE_TIMEOUT) -> bool:
             record = json.loads(_HOST_STATE.read_text())
             status = (record.get("video") or {}).get("status") or {}
             # A record that names no session has nothing to wait for either.
-            released = status.get("cleanup") == "proven" or not status
+            released = (
+                status.get("cleanup") == "proven"
+                or not status
+                or not _record_owner_alive(record)
+            )
         except (OSError, json.JSONDecodeError):
             released = True
         if released:
