@@ -14,6 +14,8 @@ from ghostdeck.app import (
     bridge_down,
     ensure_store_id,
     is_google_login_host,
+    parse_status_fields,
+    status_text,
     read_pasteboard,
     resolve_source,
     shim_is_up,
@@ -30,6 +32,39 @@ def test_shim_is_up_reads_the_status_line():
     assert not shim_is_up("usb=adb shim=down copy=yes playing=no")
     assert not shim_is_up("usb=none")
     assert not shim_is_up("usb=adb copy=yes playing=no")
+
+
+def test_the_window_shows_a_readable_state_instead_of_the_raw_status_line():
+    """The window is what someone watches a video through, so `usb=adb shim=up …` is not the text."""
+    assert status_text("usb=adb shim=up copy=yes playing=yes") == "덱 ADB · 재생 중"
+    assert status_text("usb=adb shim=up copy=yes playing=no") == "덱 ADB · 멈춤"
+    assert status_text("usb=hid shim=down copy=yes playing=no") == "덱 HID · 멈춤 · 브리지 꺼짐"
+    assert status_text("usb=none shim=down copy=no playing=no") == "덱 없음 · 멈춤 · 브리지 꺼짐"
+
+
+def test_a_bridge_that_is_up_is_not_worth_saying_in_the_window():
+    """`브리지 꺼짐` is the state where 재생 has something to do; the healthy case stays quiet."""
+    assert "브리지" not in status_text("usb=adb shim=up copy=yes playing=no")
+
+
+def test_an_annotated_transport_mode_is_still_read_as_its_mode():
+    """`status` appends `(offline)` to a wedged transport; the window must not lose the mode."""
+    assert status_text("usb=adb (offline) shim=up copy=yes playing=no") == "덱 ADB · 멈춤"
+    assert status_text("usb=unknown shim=down copy=yes playing=no") == "덱 알 수 없음 · 멈춤 · 브리지 꺼짐"
+
+
+def test_unknown_status_text_never_renders_as_a_wrong_state():
+    """Empty or unrecognised output must say so, not silently claim the deck is idle."""
+    assert status_text("") == "상태를 읽지 못했습니다"
+    assert status_text("something else entirely") == "상태를 읽지 못했습니다"
+
+
+def test_status_fields_ignore_keys_this_window_does_not_know():
+    """The CLI owns the line; a field added later must not be rendered as one of these four."""
+    parsed = parse_status_fields("usb=adb shim=up copy=yes playing=no future=whatever")
+    assert parsed == {"usb": "adb", "shim": "up", "copy": "yes", "playing": "no"}
+    # Only the summary line counts: anything printed before it is not part of the state.
+    assert parse_status_fields("warning: something\nusb=adb shim=up copy=yes playing=no")["usb"] == "adb"
 
 
 def test_bridge_down_matches_the_refusal_play_actually_raises():

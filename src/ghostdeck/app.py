@@ -16,6 +16,14 @@ from urllib.parse import parse_qs, urlparse
 from ghostdeck import cli, studio
 
 _SHIM_UP = re.compile(r"(?:^|\s)shim=up(?:\s|$)")
+# The fields `status` prints. Parsed by name so a new field cannot be mistaken for a value.
+_STATUS_FIELDS = ("usb", "shim", "copy", "playing")
+_USB_TEXT = {
+    "adb": "덱 ADB",
+    "hid": "덱 HID",
+    "none": "덱 없음",
+    "unknown": "덱 알 수 없음",
+}
 _YT_HOSTS = {
     "youtu.be",
     "youtube.com",
@@ -58,6 +66,66 @@ def run_cli(argv: list[str]) -> CommandResult:
 
 def shim_is_up(status_stdout: str) -> bool:
     return bool(_SHIM_UP.search(status_stdout))
+
+
+def parse_status_fields(status_stdout: str) -> dict[str, str]:
+    """`usb=adb shim=up copy=yes playing=no` as a dict, ignoring anything unrecognised.
+
+    The CLI prints one `key=value` line and owns that format; the window only reads it. Only the last
+    line is considered, because that is where `print` puts the summary if anything else has written to
+    stdout, and unknown keys are dropped rather than guessed at, so a future field cannot be rendered
+    as one of these.
+    """
+    lines = (status_stdout or "").strip().splitlines()
+    if not lines:
+        return {}
+    fields = {}
+    for token in lines[-1].split():
+        key, separator, value = token.partition("=")
+        if separator and key in _STATUS_FIELDS:
+            fields[key] = value
+    return fields
+
+
+def status_text(status_stdout: str) -> str:
+    """A one-line summary for the window, in Korean.
+
+    The CLI's raw line is `usb=adb shim=up copy=yes playing=no`, which reads as a debug dump in a
+    window someone is using to watch a video. The two facts that matter are where the deck is and
+    whether it is playing; a bridge that is down is worth saying only when it is, because that is the
+    state in which pressing 재생 will start it.
+    """
+    fields = parse_status_fields(status_stdout)
+    if not fields:
+        return "상태를 읽지 못했습니다"
+    piece = [_USB_TEXT.get(fields.get("usb", ""), f"덱 {fields.get('usb')}")]
+    piece.append("재생 중" if fields.get("playing") == "yes" else "멈춤")
+    if fields.get("shim") == "down":
+        piece.append("브리지 꺼짐")
+    return " · ".join(piece)
+
+
+def status_dot_color(status_stdout: str):
+    """An `NSColor` for the status dot, or None when AppKit is not loadable.
+
+    Colour is the part that is read without looking: green only while the deck is actually playing,
+    red when there is no usable deck, amber when the deck is there but the bridge is down (the one
+    state where pressing 재생 has something to do), and grey when it is simply idle and ready.
+    """
+    fields = parse_status_fields(status_stdout)
+    if not fields:
+        return None
+    try:
+        from AppKit import NSColor
+    except ImportError:
+        return None
+    if fields.get("usb", "").startswith("none") or fields.get("usb") == "unknown":
+        return NSColor.systemRedColor()
+    if fields.get("playing") == "yes":
+        return NSColor.systemGreenColor()
+    if fields.get("shim") == "down":
+        return NSColor.systemOrangeColor()
+    return NSColor.secondaryLabelColor()
 
 
 def bridge_down(detail: str) -> bool:
@@ -367,6 +435,13 @@ def main() -> int:
 
     def _gui_set_busy(ctrl, on: bool) -> None:
         ctrl.busy = on
+        # The window is a remote for a CLI that takes seconds per press (a `play` waits for the player
+        # to survive its grace window). Without this the buttons looked inert and were re-pressable
+        # while a command was still in flight, which the log showed as stacked players.
+        for name in ("play_btn", "stop_btn"):
+            button = getattr(ctrl, name, None)
+            if button is not None:
+                button.setEnabled_(not on)
 
     def _gui_apply(ctrl, results, error) -> None:
         _gui_set_busy(ctrl, False)
@@ -382,7 +457,11 @@ def main() -> int:
             return
         for item in results:
             if item.argv[:1] == ["status"] and item.stdout.strip():
-                ctrl.status.setStringValue_(item.stdout.strip().splitlines()[-1])
+                ctrl.status.setStringValue_(status_text(item.stdout))
+                dot = getattr(ctrl, "dot", None)
+                colour = status_dot_color(item.stdout)
+                if dot is not None and colour is not None:
+                    dot.setTextColor_(colour)
         last = results[-1] if results else None
         if last is None:
             if pending and pending != getattr(ctrl, "seen_watch", ""):
@@ -393,13 +472,13 @@ def main() -> int:
             ctrl.note.setStringValue_(last.detail)
         elif last.argv[:1] == ["stop"]:
             ctrl.seen_watch = ""
-            ctrl.note.setStringValue_("정지. Studio가 켜져 있으면 덱은 ADB입니다.")
+            ctrl.note.setStringValue_("멈췄습니다.")
         elif last.argv[:1] == ["play"]:
             if len(last.argv) > 1:
                 ctrl.seen_watch = last.argv[1]
-            ctrl.note.setStringValue_("덱에서 재생. 창과 완전 싱크는 안 됩니다.")
+            ctrl.note.setStringValue_("덱에서 재생 중입니다. 창이 멈추거나 끊겨도 덱은 계속 재생됩니다.")
         elif last.argv[:1] == ["studio"]:
-            ctrl.note.setStringValue_("Studio 브리지를 시작했습니다.")
+            ctrl.note.setStringValue_("브리지를 켰습니다. 이제 재생할 수 있습니다.")
         if pending and pending != getattr(ctrl, "seen_watch", ""):
             _gui_kick(ctrl, "play", pending, start=pending_start)
 
@@ -414,7 +493,7 @@ def main() -> int:
             if op == "play":
                 ctrl.seen_watch = source
             _gui_set_busy(ctrl, True)
-            ctrl.note.setStringValue_("재생 준비…" if op == "play" else "정지…")
+            ctrl.note.setStringValue_("재생 준비 중…" if op == "play" else "멈추는 중…")
         pasteboard = read_pasteboard() if op == "play" else ""
         thread = threading.Thread(
             target=_busy_call,
@@ -447,8 +526,16 @@ def main() -> int:
             self.pending_source = ""
             self.pending_start = 0.0
             self.seen_watch = ""
+            # One place for the layout numbers. A browser-shaped window rather than a phone-shaped
+            # one: the page IS the content, so the web view takes the space and the controls sit in
+            # a single toolbar row that stays legible at the minimum size.
+            W, H = 980, 780
+            BAR_H, BAR_Y = 34, 46
+            WEB_Y = BAR_Y + BAR_H + 10
+            RIGHT = 104          # width of each of the two action buttons
+            GAP = 8
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 420, 844),
+                NSMakeRect(0, 0, W, H),
                 NSWindowStyleMaskTitled
                 | NSWindowStyleMaskClosable
                 | NSWindowStyleMaskMiniaturizable
@@ -456,9 +543,13 @@ def main() -> int:
                 NSBackingStoreBuffered,
                 False,
             )
-            self.window.setTitle_("ghostdeck")
+            self.window.setTitle_("ghostdeck — 덱 플레이어")
             self.window.setReleasedWhenClosed_(False)
-            self.window.setMinSize_((320, 560))
+            self.window.setMinSize_((460, 420))
+            # `initWithContentRect` is a request, and the toolbar's autolayout can leave the window at
+            # its minimum instead of the requested size (observed: 460x808 for a 980x780 request).
+            # Setting the frame after the content view exists makes the requested size authoritative.
+            self.window.setContentSize_((W, H))
             self.window.center()
             view = self.window.contentView()
 
@@ -488,7 +579,7 @@ def main() -> int:
             if prefs is not None:
                 prefs.setPreferredContentMode_(0)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(0, 80, 420, 764),
+                NSMakeRect(0, WEB_Y, W, H - WEB_Y),
                 config,
             )
             self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -499,7 +590,7 @@ def main() -> int:
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
 
-            back = NSButton.alloc().initWithFrame_(NSMakeRect(8, 52, 28, 24))
+            back = NSButton.alloc().initWithFrame_(NSMakeRect(10, BAR_Y, 32, BAR_H))
             back.setTitle_("‹")
             back.setBezelStyle_(NSBezelStyleRounded)
             back.setTarget_(self)
@@ -507,7 +598,7 @@ def main() -> int:
             back.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(back)
 
-            fwd = NSButton.alloc().initWithFrame_(NSMakeRect(38, 52, 28, 24))
+            fwd = NSButton.alloc().initWithFrame_(NSMakeRect(46, BAR_Y, 32, BAR_H))
             fwd.setTitle_("›")
             fwd.setBezelStyle_(NSBezelStyleRounded)
             fwd.setTarget_(self)
@@ -515,37 +606,70 @@ def main() -> int:
             fwd.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(fwd)
 
-            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(70, 52, 248, 24))
+            # The field takes whatever is left over; the two action buttons keep their width and ride
+            # the right edge, so resizing moves the URL field and nothing overlaps.
+            url_w = W - 86 - (2 * RIGHT + GAP + 10)
+            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(86, BAR_Y, url_w, BAR_H))
             self.url_field.setStringValue_("https://www.youtube.com")
             self.url_field.setTarget_(self)
             self.url_field.setAction_("go:")
+            self.url_field.setFont_(NSFont.systemFontOfSize_(12))
             self.url_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.url_field)
 
-            play_btn = NSButton.alloc().initWithFrame_(NSMakeRect(322, 52, 90, 24))
-            play_btn.setTitle_("재생")
-            play_btn.setBezelStyle_(NSBezelStyleRounded)
-            play_btn.setTarget_(self)
-            play_btn.setAction_("play:")
-            play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
-            view.addSubview_(play_btn)
+            # Play AND stop. The stop path has always existed (`DeckRemote.stop` -> `ghostdeck stop`),
+            # but no control ever called it, so a video started from this window could only be stopped
+            # from a terminal -- which is exactly what this window exists to avoid.
+            self.play_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(W - 10 - 2 * RIGHT - GAP, BAR_Y, RIGHT, BAR_H)
+            )
+            self.play_btn.setTitle_("▶  재생")
+            self.play_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.play_btn.setFont_(NSFont.boldSystemFontOfSize_(13))
+            self.play_btn.setTarget_(self)
+            self.play_btn.setAction_("play:")
+            self.play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.play_btn)
 
-            self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 32, 404, 16))
+            self.stop_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(W - 10 - RIGHT, BAR_Y, RIGHT, BAR_H)
+            )
+            self.stop_btn.setTitle_("■  정지")
+            self.stop_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.stop_btn.setFont_(NSFont.systemFontOfSize_(13))
+            self.stop_btn.setTarget_(self)
+            self.stop_btn.setAction_("stop:")
+            self.stop_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.stop_btn)
+
+            # A status dot plus the summary. The dot is the only thing that has to be read at a
+            # glance; the text says which deck state it is.
+            self.dot = NSTextField.alloc().initWithFrame_(NSMakeRect(12, 24, 14, 18))
+            self.dot.setEditable_(False)
+            self.dot.setBezeled_(False)
+            self.dot.setDrawsBackground_(False)
+            self.dot.setFont_(NSFont.systemFontOfSize_(12))
+            self.dot.setStringValue_("●")
+            self.dot.setTextColor_(NSColor.secondaryLabelColor())
+            self.dot.setAutoresizingMask_(NSViewMaxYMargin)
+            view.addSubview_(self.dot)
+
+            self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(30, 24, W - 42, 18))
             self.status.setEditable_(False)
             self.status.setBezeled_(False)
             self.status.setDrawsBackground_(False)
-            self.status.setFont_(NSFont.userFixedPitchFontOfSize_(10))
-            self.status.setStringValue_("usb=? shim=? copy=? playing=?")
+            self.status.setFont_(NSFont.systemFontOfSize_(12))
+            self.status.setStringValue_("상태 확인 중…")
             self.status.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.status)
 
-            self.note = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 4, 404, 24))
+            self.note = NSTextField.alloc().initWithFrame_(NSMakeRect(12, 6, W - 24, 16))
             self.note.setEditable_(False)
             self.note.setBezeled_(False)
             self.note.setDrawsBackground_(False)
-            self.note.setFont_(NSFont.labelFontOfSize_(10))
+            self.note.setFont_(NSFont.labelFontOfSize_(11))
             self.note.setTextColor_(NSColor.secondaryLabelColor())
-            self.note.setStringValue_("아무 사이트. 영상 재생이면 덱도 재생. 광고는 무시합니다.")
+            self.note.setStringValue_("아무 사이트나 열고 재생을 누르면 덱에서 재생됩니다. 광고는 무시합니다.")
             self.note.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.note)
 
@@ -574,6 +698,13 @@ def main() -> int:
             self.web.loadRequest_(NSURLRequest.requestWithURL_(url))
 
         def play_(self, _sender):
+            """Play the video on this page on the deck, and start it in the window too.
+
+            Reading the URL is not enough on its own: `stop_` pauses the page's video so it can stop
+            cleanly, and a paused page never fires the `play` event this window listens for -- so after
+            one 정지 a later 재생 found the right URL and nothing happened. Resuming the page here makes
+            재생 work on its own terms instead of depending on a listener elsewhere.
+            """
             ctrl = self
 
             def after(raw, _err):
@@ -585,9 +716,26 @@ def main() -> int:
                     return
                 ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
 
+            # Resume first, then read the current URL: a paused video is the normal state after 정지.
             self.web.evaluateJavaScript_completionHandler_(
-                "window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href",
+                "document.querySelectorAll('video').forEach(function(v){ if (v.paused) v.play().catch(function(){}); });"
+                " (window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href)",
                 after,
+            )
+
+        def stop_(self, _sender):
+            """Stop the deck player AND the page's video, so the stop actually sticks.
+
+            Clearing `seen_watch` alone was not enough: the page kept playing, its `play` listener
+            fired again, and `should_start_play("")` treats an unknown seen-id as a NEW video -- so the
+            deck restarted on the next event and 정지 looked broken (observed: `playing=no` for a
+            moment, then `playing=yes` again with the page's own YouTube id). Pausing the page first
+            is what makes the stop hold; the deck stop runs after it, so no `play` can slip between.
+            """
+            self.seen_watch = ""
+            self.web.evaluateJavaScript_completionHandler_(
+                "document.querySelectorAll('video').forEach(function(v){v.pause()}); null",
+                lambda _result, _error: _gui_kick(self, "stop", ""),
             )
 
         def poll_(self, _timer):
@@ -647,7 +795,7 @@ def main() -> int:
                 NSBackingStoreBuffered,
                 False,
             )
-            win.setTitle_("ghostdeck")
+            win.setTitle_("ghostdeck — 덱 플레이어")
             win.contentView().addSubview_(popup)
             popup.setFrame_(win.contentView().bounds())
             popup.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
