@@ -12,8 +12,9 @@ belongs in the repository as a first-class artifact instead of in a scratch file
 
 Design rules, learned the hard way
 ----------------------------------
-1. **Opt-in only.** It refuses to run unless `GHOSTDECK_HW_TEST=1`. It must never run
-   in CI, where there is no deck, and never by accident.
+1. **Opt-in only.** It refuses to run unless `GHOSTDECK_HW_TEST=1`. Hosted GitHub
+   runners must never set that (they have no deck). The self-hosted `d200` job is
+   the one place the guard is satisfied by construction.
 2. **One pass, no retry loop.** An earlier scratch harness ran three cycles and
    repeatedly `pkill`ed the bridge and killed the adb server between steps. That
    hammering is the most likely cause of a deck that dropped off the USB bus
@@ -301,7 +302,7 @@ def stop_playing() -> str:
 def main() -> int:
     if os.environ.get(ENV_GATE) != "1":
         print(f"SKIP: real-hardware verification is opt-in; set {ENV_GATE}=1 to run it.")
-        print("      It drives the attached deck (HID <-> ADB) and must not run in CI.")
+        print("      It drives the attached deck (HID <-> ADB) and must not run on a hosted runner.")
         return 2
 
     parser = argparse.ArgumentParser(description=__doc__)

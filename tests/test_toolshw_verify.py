@@ -201,8 +201,13 @@ def test_hardware_workflow_is_self_hosted_opt_in_and_runs_the_existing_verifier(
     assert "tools/hardware_verify.py" in text
     # Push would race a single physical deck; the comment is the contract, the trigger is the proof.
     assert "push:" not in text.split("jobs:")[0]
-    # `set -u` plus `"${media[@]}"` on an empty array is unbound (first runner job, 17s).
+    # `set -u` plus an empty array expansion is unbound (first runner job, 17s).
     assert "media[@]" not in text
+    # play→stop is the point of a deck-attached job; a 2s testsrc is generated when
+    # GHOSTDECK_HW_MEDIA is unset, because sample clips are not in git.
+    assert "ffmpeg" in text
+    assert "testsrc" in text
+    assert "--media" in text
 
 
 def test_hardware_verifier_stages_device_binaries_before_the_bridge():

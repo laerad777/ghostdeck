@@ -48,15 +48,15 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-          # `--media` is not passed unless the runner sets GHOSTDECK_HW_MEDIA: sample clips
-          # are not in git. Without it the verifier still covers bring-up, the deck answering,
-          # restore to HID, and nothing staged left. Launchd PATH has no Homebrew, so adb
-          # would otherwise be missing even on this machine.
-          if [ -n "${GHOSTDECK_HW_MEDIA:-}" ]; then
-            PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py --media "$GHOSTDECK_HW_MEDIA"
-          else
-            PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py
+          # Sample clips are not in git. A 2s 540x960 testsrc is enough to prove play→stop
+          # on the attached deck (item 6). GHOSTDECK_HW_MEDIA overrides it with a real file.
+          clip=${GHOSTDECK_HW_MEDIA:-}
+          if [ -z "$clip" ]; then
+            clip=${RUNNER_TEMP:-/tmp}/gd-hw.mp4
+            ffmpeg -y -f lavfi -i testsrc=duration=2:size=540x960:rate=30 \
+              -pix_fmt yuv420p -an "$clip"
           fi
+          PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py --media "$clip"
 
       - name: Upload the verifier's output on failure
         if: failure()
