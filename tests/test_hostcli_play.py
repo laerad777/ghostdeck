@@ -54,6 +54,13 @@ def deck_home(tmp_path, monkeypatch):
     monkeypatch.setattr(studio, "BRIDGE_STATE", tmp_path / "bridge.pid")
     monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    # `play` chooses between `require_bridge` (refuse and name `ghostdeck studio`) and starting the
+    # bridge itself, based on whether the official app is installed. That decision must be pinned, or
+    # every test here would answer differently on a host that has it. The default is "installed"
+    # because that is the documented contract; the Studio-free host is exercised explicitly below.
+    official = tmp_path / "Ulanzi Studio.app"
+    official.mkdir()
+    monkeypatch.setattr(studio, "ORIGINAL", official)
     return home
 
 
@@ -210,6 +217,82 @@ def test_start_play_refuses_without_the_bridge_and_spawns_nothing(tmp_path, monk
     assert spawned == [], spawned
     # `ensure_dirs` is poisoned above, so a state file here would mean the refusal ran late.
     assert not (deck_home / ".ghostdeck" / "state.json").exists()
+
+
+def test_play_brings_up_the_bridge_itself_when_studio_is_not_installed(tmp_path, monkeypatch, deck_home):
+    """Video playback must not require the official Studio app (the whole point of decoupling).
+
+    The bridge is a byte-transparent transport started from `--adb`/`--serial` alone; Studio is only
+    the keys glued to that transport. `launch()` ran `ensure_copy()` -- which hard-fails with
+    "install official Studio at ..." -- before `_ensure_bridge()`, so a host without
+    `/Applications/Ulanzi Studio.app` could not start a bridge, and `play` therefore refused for a
+    reason that had nothing to do with playing video. With no app there is no `studio` command to
+    run, so `play` owns the bridge itself.
+    """
+    from ghostdeck import play, studio
+
+    monkeypatch.setattr(studio, "ORIGINAL", tmp_path / "no-official-studio.app")
+    monkeypatch.setattr(
+        studio, "_socket_state", lambda: (studio._ENDPOINT_DEAD, "absent"))
+    # `bridge_up()` is the Studio-free path and is what `play` must choose here.
+    started: list[int] = []
+    monkeypatch.setattr(studio, "bridge_up", lambda: started.append(1))
+    monkeypatch.setattr(play, "VENDOR_PLAY", _player(tmp_path, "import time\ntime.sleep(60)\n"))
+
+    play.start_play(str(_source(tmp_path)))
+    assert started == [1], "play did not bring the bridge up itself"
+
+    import os
+    import signal
+
+    from ghostdeck import state
+
+    os.kill(state.load()["play_pid"], signal.SIGTERM)
+
+
+def test_play_still_requires_studio_to_have_started_the_bridge_when_it_is_installed(
+    tmp_path, monkeypatch, deck_home
+):
+    """With the app present the old contract stands: `play` refuses and names the command to run.
+
+    That is the documented rule -- a tool that starts a bridge owns exactly that process, and `play`
+    returns before the session ends, so it has no lifecycle for one. The exemption above exists only
+    for the host where that rule leaves no way forward at all.
+    """
+    from ghostdeck import play, studio
+
+    # The fixture already pins `ORIGINAL` at an existing directory (Studio installed) and a live
+    # bridge; this test makes the bridge absent, which is the state whose remedy is `ghostdeck
+    # studio`. `bridge_up` must not be reached: Studio is what starts the bridge on this host.
+    monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_DEAD, "absent"))
+    monkeypatch.setattr(
+        studio, "bridge_up", lambda: pytest.fail("play started a bridge Studio should have started")
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        play.start_play(str(_source(tmp_path)))
+    message = str(excinfo.value)
+    assert "hidshim bridge is not running" in message, message
+    assert "ghostdeck studio" in message, message
+
+
+def test_bridge_up_alone_refuses_a_stranger_and_an_undeterminable_endpoint(tmp_path, monkeypatch):
+    """The Studio-free path must not become a way to adopt a listener that is not ours (A-133)."""
+    from ghostdeck import studio
+
+    monkeypatch.setattr(studio, "SOCKET", tmp_path / "bridge.sock")
+    monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: False)
+    with pytest.raises(RuntimeError) as excinfo:
+        studio.bridge_up()
+    assert f"no live {studio.BRIDGE.name} of ours owns it" in str(excinfo.value)
+
+    monkeypatch.setattr(
+        studio, "_socket_state", lambda: (studio._ENDPOINT_UNDETERMINABLE, "EMFILE")
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        studio.bridge_up()
+    assert "leaving the endpoint alone" in str(excinfo.value), excinfo.value
 
 
 def test_require_bridge_accepts_only_a_live_bridge_of_ours(tmp_path, monkeypatch):

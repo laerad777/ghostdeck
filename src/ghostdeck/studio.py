@@ -149,6 +149,33 @@ def _quit_copy(*, timeout: float = 15.0) -> None:
     raise RuntimeError("hidshim Studio copy did not stop")
 
 
+def bridge_up() -> None:
+    """Bring up the bridge alone -- no Studio copy, no build, no official app.
+
+    The bridge is a byte-transparent transport to the deck's own zkgui process; `_spawn_bridge`
+    starts it from `--adb` and `--serial` and nothing else. Studio is only the *keys*, glued to the
+    same transport through the hidshim copy, so a host without `/Applications/Ulanzi Studio.app` can
+    still play video -- it just loses the button/key surface. `launch()` did not allow that: it ran
+    `ensure_copy()` (which hard-fails with "install official Studio at ...") before `_ensure_bridge()`,
+    so a missing app made `ghostdeck studio` fail, and therefore made `play` fail with it.
+
+    This exists so those two capabilities stop sharing a failure. It is the same ownership rule
+    `launch()` follows -- whoever starts a bridge owns exactly that process -- and the same
+    refusals (A-133 ownership, undeterminable endpoint) apply, so neither path can adopt a stranger's
+    listener.
+    """
+    endpoint, reason = _socket_state()
+    if endpoint == _ENDPOINT_UNDETERMINABLE:
+        raise _undeterminable_endpoint(reason)
+    if endpoint == _ENDPOINT_LIVE and not _bridge_owner_live():
+        raise RuntimeError(
+            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to use "
+            f"an unidentified bridge. Stop that process, or remove {SOCKET} if it is a leftover, and "
+            f"retry"
+        )
+    _ensure_bridge()
+
+
 def launch() -> None:
     endpoint, reason = _socket_state()
     if endpoint == _ENDPOINT_UNDETERMINABLE:
@@ -486,6 +513,45 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
     except subprocess.TimeoutExpired:
         child.kill()
         child.wait(timeout=timeout)
+
+
+def require_bridge_or_start_it() -> None:
+    """`require_bridge()`, or start one when this host has no Studio to start it instead.
+
+    `play` calls this. The distinction exists because the two hosts have different remedies for the
+    same missing bridge:
+
+    * Studio installed -- `studio` is the command that owns a bridge, and a tool that starts one owns
+      exactly that process. `play` returns as soon as the player survives its grace window while the
+      bridge must serve the whole session, so it has no lifecycle for one. Refuse, and name
+      `ghostdeck studio` as the fix -- T19 unchanged.
+    * No Studio -- there is no `studio` command that can work (it hard-fails at `ensure_copy()` with
+      "install official Studio at ..."), so refusing would name a command the user cannot run and
+      block video playback for a reason unrelated to playing video. The bridge is a
+      byte-transparent transport started from `--adb`/`--serial` alone; Studio is only the keys
+      glued to it. So `play` brings it up and owns it.
+
+    Both branches run through the same refusals first, so neither can adopt a stranger's listener
+    (A-133) or act on an endpoint it cannot classify. Nothing device-side happens until the endpoint
+    has been classified, which is what keeps T19's "costs nothing" property intact for the refusal
+    path.
+    """
+    if ORIGINAL.is_dir():
+        require_bridge()
+        return
+    endpoint, reason = _socket_state()
+    if endpoint == _ENDPOINT_UNDETERMINABLE:
+        raise _undeterminable_endpoint(reason)
+    if endpoint == _ENDPOINT_LIVE:
+        if _bridge_owner_live():
+            return
+        raise RuntimeError(
+            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to use "
+            f"an unidentified bridge. Stop that process, or remove {SOCKET} if it is a leftover, and "
+            f"retry"
+        )
+    # No Studio and no bridge: this is the one path where `play` owns the process it starts.
+    bridge_up()
 
 
 def require_bridge() -> None:

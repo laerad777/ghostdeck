@@ -21,7 +21,7 @@ macOS에서 Ulanzi D200으로 JPEG를 재생합니다. 덱이 ADB일 때 Studio 
 - Python 3.11+
 - `PATH`의 `adb`, `ffmpeg`, `ffprobe` (URL이면 `yt-dlp`)
 - `hidapi`, `pyusb` (`device` extra)
-- Studio 키를 쓰려면 공식 `/Applications/Ulanzi Studio.app`
+- Studio 키를 쓰려면 공식 `/Applications/Ulanzi Studio.app`. 없어도 `ghostdeck bridge`(또는 `ghostdeck play`)가 같은 영상 전송로를 띄웁니다. 잃는 건 버튼이지 재생이 아닙니다. `studio`는 앱이 필요하고 없으면 실패합니다.
 - `~/.ghostdeck/bin/d200-color-agent` (ARM Linux 바이너리, 아래 참고)
 
 `hidapi`나 `pyusb`가 없으면 `detect`/`status`/`play`는 설치 힌트와 함께
@@ -59,7 +59,8 @@ ARMv7 Linux 크로스 gcc와 ARM Linux `libturbojpeg.a`가 필요합니다
 ## 사용
 
 ```bash
-ghostdeck studio          # hidshim 복사본 + 브리지. 먼저 실행
+ghostdeck studio          # hidshim 복사본 + 브리지. 먼저 실행 (공식 Studio 필요)
+ghostdeck bridge          # 브리지만. Studio 없이
 ghostdeck play video.mp4  # ADB JPEG 재생
 ghostdeck stop            # 플레이어만 중지. Studio가 켜져 있으면 유지
 ghostdeck gui             # 브라우저. 열린 영상을 덱에서 재생
@@ -72,8 +73,9 @@ ghostdeck gui             # 브라우저. 열린 영상을 덱에서 재생
 
 | 명령 | 하는 일 |
 | --- | --- |
-| `ghostdeck studio` | 로컬 hidshim 복사본과 `play`가 붙는 브리지를 시작합니다. 공식 Studio는 건드리지 않습니다. |
-| `ghostdeck play FILE\|URL` | 실행 중인 브리지로 재생합니다. 브리지가 없으면 거부합니다. |
+| `ghostdeck studio` | 로컬 hidshim 복사본과 `play`가 붙는 브리지를 시작합니다. 공식 앱이 필요하며 그 앱은 건드리지 않습니다. |
+| `ghostdeck bridge` | 브리지만 시작합니다. 복사본도 공식 앱도 필요 없습니다. 영상 전송로는 그것들과 별개입니다. |
+| `ghostdeck play FILE\|URL` | 실행 중인 브리지로 재생합니다. 브리지가 없으면 거부하지만, 공식 앱이 없는 호스트에서는 직접 브리지를 띄웁니다. |
 | `ghostdeck stop` | 플레이어를 중지합니다. 브리지가 꺼져 있으면 스톡 UI를 복원하고 `/tmp/ghostdeck-*`를 지웁니다. 브리지가 살아 있으면 덱은 ADB로 남겨 Studio 키를 유지합니다. |
 | `ghostdeck detect` | 시리얼, VID/PID, USB 모드. 덱이 없으면 실패. |
 | `ghostdeck status` | USB 모드, 심 복사본, 재생 여부. |

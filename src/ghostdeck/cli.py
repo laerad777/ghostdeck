@@ -30,7 +30,7 @@ _RECOVERY_HINT = "power-cycle or replug the deck (ghostdeck cannot recover it fr
 # is exactly what a user needs when `play` cannot run -- refusing it for a missing checkout would
 # take away the one command that undoes a hijacked deck. `detect`/`status` are host-side diagnostics
 # that read state only, and they stay informative in an installed copy.
-_NEEDS_TREE = ("play", "studio", "build")
+_NEEDS_TREE = ("play", "studio", "bridge", "build")
 
 
 def _describe(error: BaseException) -> str:
@@ -54,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status")
     sub.add_parser("stop")
     sub.add_parser("studio")
+    # The bridge alone: no Studio copy, no build, no official app. `studio` starts both and is what
+    # most hosts want; this exists so video playback does not depend on the app being installed, and
+    # so a headless/CI run can bring up the transport without a GUI.
+    sub.add_parser("bridge")
     sub.add_parser("build")
     sub.add_parser("gui")
     p_play = sub.add_parser("play")
@@ -84,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "studio":
             studio.launch()
+            return 0
+        if args.cmd == "bridge":
+            studio.bridge_up()
             return 0
         if args.cmd == "build":
             studio.ensure_copy()

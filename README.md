@@ -20,7 +20,7 @@ at runtime, never committed.
 - Python 3.11+
 - `adb`, `ffmpeg`, `ffprobe` on `PATH` (`yt-dlp` only for URLs)
 - `hidapi` and `pyusb` (the `device` extra)
-- Official `/Applications/Ulanzi Studio.app` if you want Studio keys
+- Official `/Applications/Ulanzi Studio.app` **only if you want Studio keys**. Without it, `ghostdeck bridge` (or `ghostdeck play`) brings up the same video transport; you lose the button surface, not playback. `studio` needs the app and fails without it.
 - `~/.ghostdeck/bin/d200-color-agent` (ARM Linux binary; see below)
 
 `detect`, `status`, and `play` exit `2` with an install hint if `hidapi` or
@@ -58,7 +58,8 @@ Studio app. It still fails at the agent step until that binary exists.
 ## Use
 
 ```bash
-ghostdeck studio          # hidshim copy + bridge; run this first
+ghostdeck studio          # hidshim copy + bridge; run this first (needs official Studio)
+ghostdeck bridge          # the bridge alone, no Studio needed
 ghostdeck play video.mp4  # JPEG play over ADB
 ghostdeck stop            # stop the player; Studio stays if it is up
 ghostdeck gui             # browser; play the open video on the deck
@@ -71,8 +72,9 @@ bridge that copy's shim sees no device.
 
 | Command | What it does |
 | --- | --- |
-| `ghostdeck studio` | Start the local hidshim copy and the bridge `play` talks to. Does not write official Studio. |
-| `ghostdeck play FILE\|URL` | Play through the running bridge. Refuses if the bridge is down. |
+| `ghostdeck studio` | Start the local hidshim copy and the bridge `play` talks to. Needs the official app; does not write it. |
+| `ghostdeck bridge` | Start the bridge alone. No Studio copy, no official app: the video transport is independent of it. |
+| `ghostdeck play FILE\|URL` | Play through the running bridge. Refuses if the bridge is down, unless the official app is absent -- then it starts the bridge itself. |
 | `ghostdeck stop` | Stop the player. If the bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is up, leave the deck in ADB so Studio keys keep working. |
 | `ghostdeck detect` | Serial, VID/PID, USB mode. Fails if no deck. |
 | `ghostdeck status` | USB mode, shim copy, playing. |

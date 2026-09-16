@@ -548,12 +548,19 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     # not travel to a child process that dies on its first read (A-103).
     _validate_source(source)
     # T19: the player's first device-side act is `connect_bridge(BRIDGE_SOCKET)` (before
-    # `videoOpen`), so with no bridge listening it dies inside the child with a raw
-    # `ConnectionRefusedError` and the user is told nothing actionable. Refuse here - after the two
-    # zero-cost checks on the user's own invocation, and before `ensure_dirs`/`devicebuild.ensure`/
-    # `usb.detect`, so a missing bridge costs nothing and no device is touched. `studio` owns this
-    # check because the bridge is studio's; `play` must not start one (see `studio.require_bridge`).
-    studio.require_bridge()
+    # `videoOpen`), so with nothing listening it dies inside the child with a raw
+    # `ConnectionRefusedError` and the user is told nothing actionable. The refusal therefore comes
+    # before anything that costs something: no state dir, no device-binary build, no USB probe, no
+    # player.
+    #
+    # What differs by host is only the *remedy*. `require_bridge` is right while Studio is installed,
+    # because `studio` is then the command that owns a bridge -- a tool that starts one owns exactly
+    # that process, and `play` returns before the session ends, so it has no lifecycle for one. The
+    # bridge itself is a byte-transparent transport started from `--adb`/`--serial` alone, and Studio
+    # is only the keys glued to it, so with no official app there is no `studio` command to run and
+    # requiring it blocked video playback outright. On that host `play` brings the bridge up and owns
+    # it, which is the same rule applied by the only command left that can.
+    studio.require_bridge_or_start_it()
     gdstate.ensure_dirs()
     devicebuild.ensure()
     found = usb.detect()
