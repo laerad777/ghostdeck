@@ -5,22 +5,21 @@ name: agent
 # https://github.com/laerad777/ghostdeck/releases/latest/download/d200-color-agent
 # as the file to put in `~/.ghostdeck/bin`.
 #
-# Tags `v*` attach that file to the GitHub release. `workflow_dispatch` and path-filtered
-# PRs only upload an Actions artifact -- they must not mint a release, because a PR is not
-# a version. The recipe itself is what the job runs, so a recipe change that would fail on
-# a laptop fails here too.
+# Tags `v*` attach that file to the GitHub release. A tag push always builds -- path filters
+# on tags would skip the one job that exists to mint the download URL. `workflow_dispatch` and
+# path-filtered PRs only upload an Actions artifact; they must not mint a release.
 
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
-    paths:
-      - "device/**"
-      - ".github/workflows/agent.yml"
   pull_request:
     paths:
       - "device/**"
       - ".github/workflows/agent.yml"
+
+permissions:
+  contents: write
 
 jobs:
   armv7:
