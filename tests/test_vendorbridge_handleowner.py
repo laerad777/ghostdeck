@@ -114,6 +114,47 @@ def test_reclaiming_a_dead_handle_leaves_the_registry_consistent(tmp_path):
         state.authorize(4, old)
 
 
+def test_a_handle_whose_owner_died_is_reclaimed_without_being_re_requested(tmp_path):
+    """`open` cannot reclaim a number nobody asks for again, so `event` must.
+
+    After the shim moved to per-process handle blocks, a dead client's number lives in that dead
+    pid's block and is never re-requested, so the `open`-time reclaim could never fire. The entry then
+    outlived every reason to keep it, and `len(self.handles)` stayed non-zero forever -- which blocks
+    connection rotation (`DeviceProxy._heartbeat_loop` refuses while `hid_handles` is non-empty).
+    Measured on this host: `openHandles` stayed at 9 after a client was killed without `close`.
+    """
+    state = make_state(tmp_path)
+    state.open(11, 0, owner=dead_pid())
+    state.open(12, 0, owner=os.getpid())
+
+    assert state.reclaim_dead_owners() == 1, "the dead owner's handle was not reclaimed"
+    assert 11 not in state.handles
+    assert 12 in state.handles, "a live owner's handle was taken"
+
+    # Idempotent: a second pass finds nothing and must not disturb the live entry.
+    assert state.reclaim_dead_owners() == 0
+    assert 12 in state.handles
+
+
+def test_reclaiming_leaves_an_unidentifiable_owner_alone(tmp_path):
+    """An owner whose pid could not be read must never be treated as dead here either."""
+    state = make_state(tmp_path)
+    state.open(13, 0, owner=None)
+    assert state.reclaim_dead_owners() == 0
+    assert 13 in state.handles
+
+
+def test_the_event_reply_reclaims_before_it_reports(tmp_path):
+    """The count `event` returns must already exclude the departed, or the guard stays stuck."""
+    state = make_state(tmp_path)
+    state.open(14, 0, owner=dead_pid())
+    server = bridge.BridgeServer.__new__(bridge.BridgeServer)
+    server.state = state
+    reply = server.dispatch({"schemaVersion": 1, "op": "event", "handle": 0, "interface": 0,
+                             "timeoutMs": -1})
+    assert reply["openHandles"] == 0, "event reported a handle whose owner is gone"
+
+
 def test_pid_alive_only_calls_a_reaped_process_dead():
     """`os.kill(pid, 0)` is the probe; anything unreadable must read as alive."""
     assert bridge._pid_alive(os.getpid()) is True

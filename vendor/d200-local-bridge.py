@@ -2547,16 +2547,6 @@ class BridgeState:
         capability = secrets.token_hex(32)
         with self.lock:
             if handle in self.handles:
-                # The shim numbers handles per PROCESS from 1 (hidshim.c: `next_handle = 1`), while
-                # this registry is global to the bridge. A client that exits without closing -- or
-                # is killed, or just loses its connection -- therefore leaves a handle its successor
-                # reuses by number, and `handle already open` refused the new client FOREVER: a
-                # restarted Studio could not attach at all, and only restarting the bridge cleared
-                # it. Reclaim the entry when the process that opened it is provably gone; a live
-                # owner keeps its claim, so a genuine double-open is still refused.
-                # Only PROVEN death reclaims. A live owner -- including one whose pid could not be
-                # read (`_pid_alive(None)` is True) -- keeps its claim, because stealing a live
-                # client's handle would break a working Studio, which is the worse failure.
                 record = self.handles[handle]
                 if not _pid_alive(record[2]):
                     self.handles.pop(handle, None)
@@ -2564,6 +2554,30 @@ class BridgeState:
                     raise ProtocolError('handle already open')
             self.handles[handle] = (capability, endpoint, owner)
         return capability
+
+    def reclaim_dead_owners(self):
+        """Drop every handle whose owning process is gone. Returns how many were reclaimed.
+
+        `open` can only reclaim a handle that is being re-requested, and after the shim moved to
+        per-process handle blocks that never happens again: a dead client's number is in that dead
+        pid's block, so no later client asks for it. The entry therefore outlived every reason to keep
+        it and `len(self.handles)` stayed non-zero forever -- which is not cosmetic, because
+        `DeviceProxy._heartbeat_loop` refuses to rotate a connection while `hid_handles` is non-empty.
+        Measured on this host after a client was killed without `close`: `openHandles` stayed at 9.
+
+        Driven from `event`, which every client polls: no timer thread is added, and a bridge with no
+        clients simply does not reclaim until one returns. Only PROVEN death is reclaimed, the same
+        rule `open` uses, so a live owner never loses its handle.
+        """
+        reclaimed = 0
+        with self.lock:
+            for handle in list(self.handles):
+                if not _pid_alive(self.handles[handle][2]):
+                    del self.handles[handle]
+                    reclaimed += 1
+            if reclaimed:
+                self.transport.condition.notify_all()
+        return reclaimed
 
     def authorize(self, handle, capability):
         with self.lock:
@@ -2721,6 +2735,10 @@ class BridgeServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         if operation == 'event':
             if self.state.transport.error:
                 raise RuntimeError(self.state.transport.error)
+            # Every client polls this, so it is where a departed one is noticed. Without it a handle
+            # whose owner died is never reclaimed (its number lives in that dead pid's block), and
+            # the non-empty registry blocks connection rotation in `_heartbeat_loop`.
+            self.state.reclaim_dead_owners()
             with self.state.lock:
                 open_handles = len(self.state.handles)
             with self.state.transport.condition:
