@@ -128,17 +128,16 @@ def status_dot_color(status_stdout: str):
         return NSColor.systemOrangeColor()
     return NSColor.secondaryLabelColor()
 
-
 def bridge_down(detail: str) -> bool:
-    """True when `play` refused because the bridge is not up, so `studio` is the remedy.
+    """True when `play` refused because the bridge is not up, so `bridge` is the remedy.
 
     `shim=up` only reports the copy process, and the copy outlives its bridge: `studio` starts both,
     but a bridge that dies (or a foreign listener on the endpoint) leaves the copy running. The
-    window gated its one recovery step on `shim`, so in that state it ran `play` directly, `play`
-    refused, and every later press failed the same way until a human ran `ghostdeck studio` by hand.
-    `status` cannot answer this instead: it must stay usable while the bridge is down (T19), so it
-    never consults the bridge. The refusal text is therefore the signal, matched on the phrase
-    `studio` exports so a reword cannot silently break recovery.
+    window used to recover with `studio`, which opened the copy and painted over the video
+    (measured: YouTube visible until the copy starts, then a black panel while frames still
+    consume). `status` cannot answer this instead: it must stay usable while the bridge is down
+    (T19), so it never consults the bridge. The refusal text is therefore the signal, matched on
+    the phrase `studio` exports so a reword cannot silently break recovery.
     """
     return studio.BRIDGE_DOWN in (detail or "")
 
@@ -338,7 +337,7 @@ def ensure_store_id(path: Path, mint) -> str:
 
 
 class DeckRemote:
-    """The play button's contract: studio first if the shim is down, then play."""
+    """The play button's contract: the bridge, then play. Studio is keys, not picture."""
 
     def __init__(self, run=run_cli):
         self._run = run
@@ -356,10 +355,6 @@ class DeckRemote:
         results: list[CommandResult] = []
         st = self._run(["status"])
         results.append(st)
-        if not shim_is_up(st.stdout):
-            results.append(self._run(["studio"]))
-            if results[-1].code != 0:
-                return results
         argv = ["play", source]
         start = play_offset(start)
         if start > 0:
@@ -368,11 +363,10 @@ class DeckRemote:
             argv.append("--no-loop")
         played = self._run(argv)
         results.append(played)
-        # `shim=up` said the copy was running, so `studio` was skipped -- but the bridge it needs was
-        # gone, and `play` refused. Start it now and retry once: this is the same recovery the
-        # shim-down branch already does, reached from the failure instead of from `status`.
+        # `play` refuses when the bridge is down (Studio installed). Start the
+        # transport, not the Studio copy: the copy paints over the video.
         if played.code != 0 and bridge_down(played.detail):
-            results.append(self._run(["studio"]))
+            results.append(self._run(["bridge"]))
             if results[-1].code == 0:
                 results.append(self._run(argv))
         return results
@@ -548,7 +542,7 @@ def main() -> int:
             if len(last.argv) > 1:
                 ctrl.seen_watch = last.argv[1]
             ctrl.note.setStringValue_("덱에서 재생 중입니다. 창이 멈추거나 끊겨도 덱은 계속 재생됩니다.")
-        elif last.argv[:1] == ["studio"]:
+        elif last.argv[:1] == ["bridge"]:
             ctrl.note.setStringValue_("브리지를 켰습니다. 이제 재생할 수 있습니다.")
         if pending and pending != getattr(ctrl, "seen_watch", ""):
             _gui_kick(ctrl, "play", pending, start=pending_start)

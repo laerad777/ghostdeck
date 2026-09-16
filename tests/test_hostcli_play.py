@@ -61,6 +61,8 @@ def deck_home(tmp_path, monkeypatch):
     official = tmp_path / "Ulanzi Studio.app"
     official.mkdir()
     monkeypatch.setattr(studio, "ORIGINAL", official)
+    monkeypatch.setattr(studio, "running", lambda: False)
+    monkeypatch.setattr(studio, "quit_copy", lambda: None)
     return home
 
 
@@ -130,6 +132,26 @@ def test_start_play_records_a_player_that_stays_up(tmp_path, monkeypatch, deck_h
     import signal
 
     os.kill(data["play_pid"], signal.SIGTERM)
+
+
+def test_start_play_quits_the_studio_copy_before_the_player(tmp_path, monkeypatch, deck_home):
+    """Studio paints the same panel the agent presents to; play must get it off first.
+
+    Measured: YouTube is visible until the hidshim copy starts, then the deck is black
+    while framesConsumed still climbs.
+    """
+    from ghostdeck import play, studio, state
+    import os
+    import signal
+
+    quit = []
+    monkeypatch.setattr(studio, "running", lambda: True)
+    monkeypatch.setattr(studio, "quit_copy", lambda: quit.append(1))
+    monkeypatch.setattr(play, "VENDOR_PLAY", _player(tmp_path, "import time\ntime.sleep(60)\n"))
+    play.start_play(str(_source(tmp_path)))
+    assert quit == [1]
+    os.kill(state.load()["play_pid"], signal.SIGTERM)
+
 
 
 def test_start_play_rejects_an_unusable_source_before_any_device_work(tmp_path, monkeypatch, deck_home):

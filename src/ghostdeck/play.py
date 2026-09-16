@@ -116,6 +116,11 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     # requiring it blocked video playback outright. On that host `play` brings the bridge up and owns
     # it, which is the same rule applied by the only command left that can.
     studio.require_bridge_or_start_it()
+    if studio.running():
+        # Studio paints key bitmaps onto the same panel the agent presents to.
+        # Measured: YouTube is visible until the hidshim copy starts, then the deck
+        # goes black while framesConsumed keeps climbing.
+        studio.quit_copy()
     gdstate.ensure_dirs()
     devicebuild.ensure()
     found = usb.detect()
