@@ -194,27 +194,41 @@ def test_play_uses_pasteboard_when_the_field_is_empty():
     assert calls == [["status"], ["play", "https://youtu.be/dQw4w9WgXcQ"]]
 
 
-def test_play_does_not_start_studio():
-    """Studio paints over video; the window must not launch it to play."""
+def test_play_starts_studio_when_the_shim_is_down():
     calls: list[list[str]] = []
 
     def run(argv):
         calls.append(list(argv))
         if argv == ["status"]:
-            return CommandResult(argv, 0, "usb=adb shim=down copy=no playing=no\n", "")
+            return CommandResult(argv, 0, "usb=adb shim=down copy=yes playing=no\n", "")
         return CommandResult(argv, 0, "", "")
 
     results = DeckRemote(run).play("/tmp/clip.mp4")
-    assert calls == [["status"], ["play", "/tmp/clip.mp4"]]
-    assert ["studio"] not in calls
+    assert calls == [["status"], ["studio"], ["play", "/tmp/clip.mp4"]]
+    assert [item.argv for item in results] == calls
     assert all(item.code == 0 for item in results)
 
 
-def test_play_recovers_with_bridge_not_studio_when_the_bridge_is_gone():
-    """The copy paints over the picture. Recovery is `bridge`, not `studio`.
+def test_play_skips_studio_when_the_shim_is_already_up():
+    calls: list[list[str]] = []
 
-    Measured: YouTube is visible until the hidshim copy starts, then the deck is black
-    while frames still consume.
+    def run(argv):
+        calls.append(list(argv))
+        if argv == ["status"]:
+            return CommandResult(argv, 0, "usb=hid shim=up copy=yes playing=no\n", "")
+        return CommandResult(argv, 0, "", "")
+
+    DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [["status"], ["play", "/tmp/clip.mp4"]]
+    assert ["studio"] not in calls
+
+
+def test_play_recovers_when_the_copy_is_up_but_its_bridge_is_gone():
+    """The reported stuck state: `shim=up` skipped `studio`, and `play` refused every time.
+
+    `studio` starts the copy and the bridge, but the copy outlives the bridge, so `shim=up` alone
+    does not mean `play` will work. The first `play` is expected to refuse; the window must then
+    start the bridge and retry rather than reporting the same failure until a human runs `studio`.
     """
     from ghostdeck import studio
 
@@ -227,7 +241,7 @@ def test_play_recovers_with_bridge_not_studio_when_the_bridge_is_gone():
         calls.append(list(argv))
         if argv[0] == "status":
             return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
-        if argv[0] == "bridge":
+        if argv[0] == "studio":
             return CommandResult(argv, 0, "", "")
         play_calls += 1
         return refused if play_calls == 1 else CommandResult(argv, 0, "", "")
@@ -236,15 +250,14 @@ def test_play_recovers_with_bridge_not_studio_when_the_bridge_is_gone():
     assert calls == [
         ["status"],
         ["play", "/tmp/clip.mp4"],
-        ["bridge"],
+        ["studio"],
         ["play", "/tmp/clip.mp4"],
     ]
-    assert ["studio"] not in calls
     assert results[-1].code == 0, "the retry after starting the bridge must be reported"
 
 
 def test_play_does_not_retry_a_failure_studio_cannot_fix():
-    """A refusal that is not about the bridge must not spend a `bridge` bring-up on it."""
+    """A refusal that is not about the bridge must not spend a `studio` bring-up on it."""
     calls: list[list[str]] = []
 
     def run(argv):
@@ -259,7 +272,7 @@ def test_play_does_not_retry_a_failure_studio_cannot_fix():
 
 
 def test_play_does_not_retry_when_starting_the_bridge_fails():
-    """One retry at most: a `bridge` that failed is reported, not looped on."""
+    """One retry at most: a `studio` that failed is reported, not looped on."""
     from ghostdeck import studio
 
     calls: list[list[str]] = []
@@ -268,13 +281,30 @@ def test_play_does_not_retry_when_starting_the_bridge_fails():
         calls.append(list(argv))
         if argv[0] == "status":
             return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
-        if argv[0] == "bridge":
-            return CommandResult(argv, 1, "", "cannot start the bridge")
+        if argv[0] == "studio":
+            return CommandResult(argv, 1, "", "official Studio.app is missing")
         return CommandResult(argv, 1, "", studio.BRIDGE_DOWN + " (none)")
 
     results = DeckRemote(run).play("/tmp/clip.mp4")
-    assert calls == [["status"], ["play", "/tmp/clip.mp4"], ["bridge"]]
+    assert calls == [["status"], ["play", "/tmp/clip.mp4"], ["studio"]]
     assert results[-1].code == 1
+
+
+def test_play_does_not_call_play_if_studio_fails():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv == ["status"]:
+            return CommandResult(argv, 0, "usb=adb shim=down copy=no playing=no\n", "")
+        if argv == ["studio"]:
+            return CommandResult(argv, 1, "", "official Studio.app is missing")
+        raise AssertionError(f"unexpected {argv}")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [["status"], ["studio"]]
+    assert results[-1].code == 1
+    assert "Studio.app" in results[-1].detail
 
 
 def test_play_refuses_an_empty_path_without_touching_the_cli():

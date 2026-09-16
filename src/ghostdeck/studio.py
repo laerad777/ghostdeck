@@ -149,17 +149,6 @@ def _quit_copy(*, timeout: float = 15.0) -> None:
     raise RuntimeError("hidshim Studio copy did not stop")
 
 
-def quit_copy(*, timeout: float = 15.0) -> None:
-    """Stop the hidshim copy so it cannot paint over video.
-
-    Measured: a YouTube session is visible on the deck until this copy starts, then the
-    panel goes black while frames still consume. Studio is the keys; the agent is the
-    picture. `play` quits the copy before the player starts; `stop` may reopen it.
-    """
-    _quit_copy(timeout=timeout)
-
-
-
 def bridge_up() -> None:
     """Bring up the bridge alone -- no Studio copy, no build, no official app.
 
