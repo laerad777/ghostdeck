@@ -136,7 +136,23 @@ typedef struct virtual_device {
 static void *real_hidapi;
 #endif
 static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t next_handle = 1;
+/* Handle numbers must be unique across PROCESSES, not just within one: the bridge's registry is
+ * global, while each process that loads this shim numbered its handles from 1. A second live
+ * process -- a restarted Studio, or any other client -- therefore asked for `handle 1` and got
+ * `handle already open` from the live owner, then burned the 10x100ms retry below on the SAME number
+ * and returned NULL with ETIMEDOUT (measured: `hid_open_path(...) -> NULL errno=60` on the first call,
+ * succeeding only on a later one).
+ *
+ * The range is per-process: the pid selects one of 32768 blocks of 2^32, so two live processes
+ * cannot collide, and a client that restarts with the same pid reuses its own block only after that
+ * pid is gone -- where the bridge's dead-owner reclaim already applies. */
+#define HANDLE_PID_BLOCKS 32768u
+static uint64_t next_handle;
+
+static uint64_t handle_block_base(void)
+{
+    return ((uint64_t)(unsigned)getpid() % HANDLE_PID_BLOCKS) << 32;
+}
 /* The deck's own serial, as the bridge reports it in its `event` reply. The shim used to invent
  * `GHOSTDECKVHID00000`, which is not the identity of any real deck: measured on the attached deck,
  * the shim enumerated that placeholder while Studio's own `CurrentDeviceType` held the deck's real
@@ -941,6 +957,8 @@ static hid_device *virtual_open(int interface_number)
     }
 #endif
     pthread_mutex_lock(&handle_lock);
+    if (!next_handle)
+        next_handle = handle_block_base() + 1;
     device->handle = next_handle++;
     pthread_mutex_unlock(&handle_lock);
     {
