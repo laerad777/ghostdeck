@@ -214,5 +214,8 @@ def test_agent_workflow_builds_the_release_artifact_the_failure_message_names():
     assert "libjpeg-turbo" in text
     assert "action-gh-release" in text
     assert "refs/tags/" in text
+    # CMAKE_SYSTEM_NAME=Linux with no processor left CMAKE_SYSTEM_PROCESSOR empty and
+    # libjpeg-turbo died at CMakeLists.txt:92 (measured on the v0.1.0 tag job).
+    assert "CMAKE_SYSTEM_PROCESSOR=arm" in text
     assert devicebuild.AGENT_RELEASE_URL.endswith("/d200-color-agent")
     assert "laerad777/ghostdeck" in devicebuild.AGENT_RELEASE_URL

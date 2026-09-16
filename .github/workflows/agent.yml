@@ -44,11 +44,13 @@ jobs:
           curl -fsSL https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.0.3/libjpeg-turbo-3.0.3.tar.gz | tar xz
           cmake -S libjpeg-turbo-3.0.3 -B tj-build \
             -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=arm \
             -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
             -DCMAKE_INSTALL_PREFIX="$PWD/tj-sysroot" \
             -DENABLE_SHARED=OFF \
             -DENABLE_STATIC=ON \
-            -DWITH_TURBOJPEG=ON
+            -DWITH_TURBOJPEG=ON \
+            -DWITH_SIMD=OFF
           cmake --build tj-build -j"$(nproc)"
           cmake --install tj-build
 
