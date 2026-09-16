@@ -53,11 +53,13 @@ jobs:
           # deck answers, restore to HID, nothing staged left -- which is the whole
           # bridge/ADB lifecycle. Set `GHOSTDECK_HW_MEDIA` on the runner to add playback:
           # this step stays correct on a bare checkout either way.
-          media=()
+          # An empty bash array expanded under `set -u` is an unbound variable
+          # (measured on the first d200 runner job: exit 1 in 17s).
           if [ -n "${GHOSTDECK_HW_MEDIA:-}" ]; then
-            media=(--media "$GHOSTDECK_HW_MEDIA")
+            PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py --media "$GHOSTDECK_HW_MEDIA"
+          else
+            PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py
           fi
-          PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py "${media[@]}"
 
       - name: Upload the verifier's output on failure
         if: failure()

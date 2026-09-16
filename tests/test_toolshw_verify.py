@@ -201,6 +201,8 @@ def test_hardware_workflow_is_self_hosted_opt_in_and_runs_the_existing_verifier(
     assert "tools/hardware_verify.py" in text
     # Push would race a single physical deck; the comment is the contract, the trigger is the proof.
     assert "push:" not in text.split("jobs:")[0]
+    # `set -u` plus `"${media[@]}"` on an empty array is unbound (first runner job, 17s).
+    assert "media[@]" not in text
 
 
 def test_agent_workflow_builds_the_release_artifact_the_failure_message_names():
