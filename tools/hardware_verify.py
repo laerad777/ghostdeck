@@ -51,7 +51,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ghostdeck import adb, play, studio, usb  # noqa: E402
+from ghostdeck import adb, devicebuild, play, studio, usb  # noqa: E402
 
 HOST_STATE = Path("/tmp/d200-color-host.json")
 ENV_GATE = "GHOSTDECK_HW_TEST"
@@ -340,6 +340,12 @@ def main() -> int:
     print("\n== bridge bring-up ==")
     began = time.monotonic()
     try:
+        # `_ensure_bridge` stages vendor/ ARM binaries that are not in git. `launch()` and
+        # `play` call `devicebuild.ensure()` first; this harness used to skip it, so a fresh
+        # checkout (the self-hosted runner) spawned a bridge that died with
+        # "build d200-zkgui-proxy, d200-color-agent and libd200-zkgui-preload.so first".
+        # A warm `~/.ghostdeck/bin` cache does not need the cross compiler (A-166).
+        devicebuild.ensure()
         studio._ensure_bridge()
     except Exception as error:
         check("bring-up", False, f"{type(error).__name__}: {error}")

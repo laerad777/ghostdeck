@@ -205,6 +205,18 @@ def test_hardware_workflow_is_self_hosted_opt_in_and_runs_the_existing_verifier(
     assert "media[@]" not in text
 
 
+def test_hardware_verifier_stages_device_binaries_before_the_bridge():
+    """A fresh checkout has no ARM binaries in vendor/; the bridge then exits 1.
+
+    Measured on the self-hosted runner: bring-up failed with StagingError
+    "build d200-zkgui-proxy, d200-color-agent and libd200-zkgui-preload.so first"
+    because the harness called `_ensure_bridge` the way `launch()` never does --
+    without `devicebuild.ensure()`.
+    """
+    text = HARNESS.read_text(encoding="utf-8")
+    assert "devicebuild.ensure()\n        studio._ensure_bridge()" in text
+
+
 def test_agent_workflow_builds_the_release_artifact_the_failure_message_names():
     """`ghostdeck build` points at this URL; the workflow must actually produce that filename."""
     from ghostdeck import devicebuild
