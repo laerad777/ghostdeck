@@ -68,8 +68,8 @@ Studio app. It still fails at the agent step until that binary exists.
 
 `tools/hardware_verify.py` is the deck-attached smoke test (`GHOSTDECK_HW_TEST=1`).
 Hosted CI never runs it. A self-hosted runner labelled `d200` runs it nightly and
-on demand (`.github/workflows/hardware.yml`). Set `GHOSTDECK_HW_MEDIA` on that
-runner to add a play/stop pass; a bare checkout has no sample clips.
+on demand (`.github/workflows/hardware.yml`). The job encodes a 2s 540×960
+testsrc and runs play→stop. Set `GHOSTDECK_HW_MEDIA` to use a real file instead.
 
 ## Use
 

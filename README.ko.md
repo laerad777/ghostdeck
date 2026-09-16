@@ -69,9 +69,9 @@ Mach-O라 거절됩니다).
 
 `tools/hardware_verify.py`가 덱이 붙은 스모크 테스트입니다 (`GHOSTDECK_HW_TEST=1`).
 호스티드 CI는 돌리지 않습니다. `d200` 라벨의 셀프호스티드 러너가 매일, 그리고
-수동으로 돌립니다 (`.github/workflows/hardware.yml`). 그 러너에
-`GHOSTDECK_HW_MEDIA`를 두면 재생/중지까지 검사합니다. 체크아웃에는 샘플 영상이
-없습니다.
+수동으로 돌립니다 (`.github/workflows/hardware.yml`). 잡은 2초 540×960
+testsrc를 만들어 play→stop까지 검사합니다. 실제 파일을 쓰려면
+`GHOSTDECK_HW_MEDIA`를 두십시오.
 
 ## 사용
 
