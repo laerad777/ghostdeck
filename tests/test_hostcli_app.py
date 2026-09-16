@@ -23,6 +23,7 @@ from ghostdeck.app import (
     status_text,
     read_pasteboard,
     resolve_source,
+    run_cli,
     shim_is_up,
     youtube_watch_url,
     playable_source,
@@ -30,6 +31,31 @@ from ghostdeck.app import (
     play_offset,
     parse_watch_payload,
 )
+
+
+def test_run_cli_is_a_child_process(monkeypatch):
+    """hid.enumerate on the GUI poll thread SIGTRAPs the window (macOS 27 PAC)."""
+    import subprocess as sp
+    from ghostdeck import app, cli
+
+    called: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        called.append(list(cmd))
+        return sp.CompletedProcess(cmd, 0, "usb=hid shim=up copy=yes playing=no\n", "")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("run_cli called cli.main in-process")
+
+    monkeypatch.setattr(cli, "main", forbidden)
+    result = run_cli(["status"])
+    assert called, "run_cli did not spawn"
+    assert called[0][:3] == [sys.executable, "-m", "ghostdeck"]
+    assert called[0][3:] == ["status"]
+    assert result.code == 0
+    assert "usb=hid" in result.stdout
 
 
 def test_shim_is_up_reads_the_status_line():

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from ghostdeck import cli, studio
+from ghostdeck import studio
 
 _SHIM_UP = re.compile(r"(?:^|\s)shim=up(?:\s|$)")
 # The fields `status` prints. Parsed by name so a new field cannot be mistaken for a value.
@@ -50,19 +50,31 @@ class CommandResult:
 
 
 def run_cli(argv: list[str]) -> CommandResult:
-    """Run `ghostdeck` in-process and capture the same stdout/stderr a terminal would show."""
-    out = io.StringIO()
-    err = io.StringIO()
-    stdout, stderr = sys.stdout, sys.stderr
+    """Run `ghostdeck` as a child. HID enumerate in this process crashes the window.
+
+    Measured: macOS 27 EXC_BREAKPOINT (`__CFCheckCFInfoPACSignature` /
+    `IOHIDDeviceScheduleWithRunLoop`) when the 2s status poll called
+    `hid.enumerate()` on a worker thread inside the WKWebView process
+    (python3.13-2026-09-16-163849.ips). A child has its own runloop.
+    """
+    root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    previous = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(root / "src") if not previous else str(root / "src") + os.pathsep + previous
+    timeout = {"studio": 180.0, "play": 30.0, "bridge": 90.0, "stop": 60.0}.get(argv[0] if argv else "", 20.0)
     try:
-        sys.stdout, sys.stderr = out, err
-        code = cli.main(list(argv))
-    except SystemExit as error:
-        raw = error.code
-        code = 0 if raw is None else (raw if isinstance(raw, int) else 1)
-    finally:
-        sys.stdout, sys.stderr = stdout, stderr
-    return CommandResult(list(argv), int(code), out.getvalue(), err.getvalue())
+        proc = subprocess.run(
+            [sys.executable, "-m", "ghostdeck", *argv],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return CommandResult(list(argv), 1, "", "timed out")
+    except OSError as error:
+        return CommandResult(list(argv), 1, "", f"{type(error).__name__}: {error}")
+    return CommandResult(list(argv), int(proc.returncode), proc.stdout or "", proc.stderr or "")
 
 
 def shim_is_up(status_stdout: str) -> bool:
