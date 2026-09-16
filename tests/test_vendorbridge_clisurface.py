@@ -78,8 +78,25 @@ def bridge_option_strings():
 
 
 def test_the_bridge_option_surface_is_exactly_what_is_used():
-    """C-014: `--receipt` was accepted and never referenced."""
-    assert bridge_option_strings() == {"--socket", "--serial", "--adb", "--state-file"}
+    """C-014: `--receipt` was accepted and never referenced.
+
+    `--hid-vid`/`--hid-pid` were added so the D200's USB identity has one definition
+    (`ghostdeck.__init__`) instead of one per process: the bridge runs with only `vendor/` on
+    `PYTHONPATH`, so it cannot import the package that owns them, and a second literal there was a
+    second thing to update when the ids move. The assert below is what keeps them live.
+    """
+    assert bridge_option_strings() == {
+        "--socket", "--serial", "--adb", "--state-file", "--hid-vid", "--hid-pid",
+    }
+
+
+def test_the_hid_identity_options_reach_the_device_proxy():
+    """The added options must be *used*, not merely accepted -- the failure C-014 pinned."""
+    assert "arguments.hid_vid" in BRIDGE_SOURCE
+    assert "arguments.hid_pid" in BRIDGE_SOURCE
+    assert "hid.enumerate(self.hid_vid, self.hid_pid)" in BRIDGE_SOURCE
+    # The literal pair must be gone from the enumeration call, or the option is a no-op.
+    assert "hid.enumerate(0x2207, 0x0019)" not in BRIDGE_SOURCE
 
 
 def test_no_dead_environment_switch_remains_in_the_bridge():

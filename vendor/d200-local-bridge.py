@@ -339,9 +339,16 @@ def parse_message(data):
 
 
 class DeviceProxy:
-    def __init__(self, adb, serial, proxy_binary, preload_library):
+    # The D200's HID identity, used only to watch for the deck re-enumerating. `main()` overrides
+    # them from `--hid-vid`/`--hid-pid`, which the host passes from the one place it defines them.
+    HID_VID = 0x2207
+    HID_PID = 0x0019
+
+    def __init__(self, adb, serial, proxy_binary, preload_library, hid_vid=None, hid_pid=None):
         self.adb = str(adb)
         self.serial = serial
+        self.hid_vid = self.HID_VID if hid_vid is None else hid_vid
+        self.hid_pid = self.HID_PID if hid_pid is None else hid_pid
         self.proxy_binary = Path(proxy_binary)
         self.preload_library = Path(preload_library)
         self.session_token = secrets.token_hex(16)
@@ -1041,7 +1048,7 @@ class DeviceProxy:
         while time.monotonic() < deadline:
             if self._adb_ready():
                 return
-            matches = [entry for entry in hid.enumerate(0x2207, 0x0019)
+            matches = [entry for entry in hid.enumerate(self.hid_vid, self.hid_pid)
                        if entry.get('serial_number') == self.serial
                        and entry.get('interface_number') == 0]
             if len(matches) == 1:
@@ -2800,12 +2807,31 @@ class BridgeServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.endpoint = None
 
 
+def _hex16(text: str) -> int:
+    """A 16-bit id from `0x2207`, `2207` or `8711`, for the `--hid-vid`/`--hid-pid` options."""
+    try:
+        value = int(text, 16)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a hex USB id: {text!r}") from None
+    if not 0 < value <= 0xFFFF:
+        raise argparse.ArgumentTypeError(f"USB id out of range: {text!r}")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--socket', type=Path, default=DEFAULT_SOCKET)
     parser.add_argument('--serial', default=os.environ.get('D200_ADB_SERIAL', ADB_SERIAL))
     parser.add_argument('--adb', default=os.environ.get('ADB', 'adb'))
     parser.add_argument('--state-file', type=Path)
+    # The D200's HID identity. Passed in rather than restated here: the host package owns it
+    # (`ghostdeck.__init__`, where `GHOSTDECK_HID_VID`/`_PID` override it), and this process is
+    # deliberately started with only `vendor/` on PYTHONPATH so it cannot import that package. A
+    # second literal here was a second thing to update when a deck revision moved the ids, and the
+    # two would have drifted silently -- the host would look for one device while this waited for
+    # another on the same bus. Defaults match the D200 so a hand-run bridge still works.
+    parser.add_argument('--hid-vid', type=_hex16, default=0x2207)
+    parser.add_argument('--hid-pid', type=_hex16, default=0x0019)
     arguments = parser.parse_args()
     # Refuse before any device effect: a live bridge keeps its endpoint.
     if socket_listener_live(arguments.socket):
@@ -2815,6 +2841,7 @@ def main():
     transport = DeviceProxy(
         arguments.adb, arguments.serial,
         root / 'd200-zkgui-proxy', root / 'libd200-zkgui-preload.so',
+        hid_vid=arguments.hid_vid, hid_pid=arguments.hid_pid,
     )
     server = None
     stopping = threading.Event()

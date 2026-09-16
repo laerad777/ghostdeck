@@ -215,13 +215,30 @@ def _hid_serial() -> str | None:
 
 
 def _hid_iface0(*, timeout: float):
+    """The deck's HID interface 0, or None. A backend that fails to enumerate raises.
+
+    Swallowing an `enumerate` exception into an empty list made a *broken* hidapi
+    indistinguishable from an unused bus, and `enable_adb` then reported the deck as absent -- the
+    one answer that blames the hardware for the environment (A-102/T13). The module already refuses
+    to make that confusion for pyusb (`_usb_find` raises on a `usb.core` that will not import); this
+    is the same boundary, reached through the hidapi call instead of the import. Measured on this
+    host with an installed hidapi whose `enumerate` raises `OSError`: `_hid_iface0` returned None and
+    `enable_adb` failed with "D200 HID interface 0 not found".
+
+    `hid.enumerate` raising once is still retried until the deadline, because the retry loop exists
+    for a bus that is settling; what changes is that the *last* error is kept and reported instead of
+    being discarded, so a genuinely broken backend cannot masquerade as an empty bus.
+    """
     hid = _hid_module()
     deadline = time.monotonic() + max(timeout, 0)
+    last_error = None
     while True:
         try:
             entries = hid.enumerate(HID_VID, HID_PID)
-        except Exception:
+            last_error = None
+        except Exception as error:
             entries = []
+            last_error = error
         for entry in entries:
             if entry.get("interface_number") != 0:
                 continue
@@ -234,6 +251,12 @@ def _hid_iface0(*, timeout: float):
             result["path"] = path
             return result
         if time.monotonic() >= deadline:
+            if last_error is not None:
+                raise MissingDependency(
+                    f"hidapi is installed but could not enumerate the bus "
+                    f"({type(last_error).__name__}: {last_error}); the deck cannot be reported "
+                    f"absent while the backend is failing"
+                ) from last_error
             return None
         time.sleep(0.25)
 

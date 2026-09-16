@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from ghostdeck import adb, devicebuild, tree, usb
+from ghostdeck import HID_PID, HID_VID, adb, devicebuild, tree, usb
 
 ORIGINAL = Path("/Applications/Ulanzi Studio.app")
 COPY = Path.home() / "Applications" / "Ulanzi Studio ADB.app"
@@ -461,6 +461,13 @@ def _spawn_bridge(serial: str, log) -> subprocess.Popen:
             serial,
             "--state-file",
             str(BRIDGE_STATE),
+            # The bridge runs with only `vendor/` on PYTHONPATH, so it cannot import the host
+            # package that owns these ids; passing them is what keeps one source of truth without
+            # coupling the two processes.
+            "--hid-vid",
+            f"{HID_VID:04x}",
+            "--hid-pid",
+            f"{HID_PID:04x}",
         ],
         stdout=log,
         stderr=subprocess.STDOUT,

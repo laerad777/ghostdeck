@@ -37,11 +37,33 @@ class DeviceAdmissionError(RuntimeError):
 
 
 def emit_diagnostic(stream, receipt):
+    """Write one diagnostic record. True when it landed, False when it could not be written.
+
+    Never raises: a diagnostic that fails must not take down the operation it was describing, which
+    is why this returns a bool instead. Callers used to ignore that bool, so a record that could not
+    be written -- a closed stream, an encoding surprise, a receipt holding a value `json` rejects --
+    vanished with no trace at all, and a *missing* log line is silent evidence: the operator reading
+    the log cannot tell "this never happened" from "this happened and could not be recorded".
+
+    The loss is therefore reported on the same stream, in the same one-line JSON shape, with only the
+    event name and the error class -- never the receipt, whose fields are the thing that failed to
+    serialize. A failure to write *that* line is the end of it: there is nowhere left to report it,
+    and looping on a broken stream would be worse than losing the record.
+    """
     try:
         encoded = json.dumps(receipt, separators=(",", ":"), allow_nan=False) + "\n"
         stream.write(encoded)
         return True
-    except Exception:
+    except Exception as error:
+        try:
+            event = receipt.get("event") if isinstance(receipt, dict) else None
+            stream.write(json.dumps(
+                {"event": "diagnosticDropped", "droppedEvent": event if type(event) is str else None,
+                 "errorClass": type(error).__name__},
+                separators=(",", ":"),
+            ) + "\n")
+        except Exception:
+            pass
         return False
 
 

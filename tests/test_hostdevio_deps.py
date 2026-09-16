@@ -120,6 +120,55 @@ def test_hid_iface0_raises_missing_dependency_not_none(monkeypatch):
     assert isinstance(excinfo.value, RuntimeError)
 
 
+def test_hid_iface0_raises_when_an_installed_backend_cannot_enumerate(monkeypatch):
+    """A *broken* hidapi must not be reported as an absent deck (T13, the same class as A-102).
+
+    `enumerate` raising was swallowed into an empty list, so `enable_adb` blamed the hardware. The
+    module already refuses that confusion for pyusb (`_usb_find` raises on a `usb.core` that will not
+    import); this is the same boundary through the hidapi call. Measured before the fix with an
+    installed hidapi whose `enumerate` raises `OSError`: `_hid_iface0 -> None`, then `enable_adb`
+    reported "D200 HID interface 0 not found".
+    """
+    class Exploding:
+        def enumerate(self, vid, pid):
+            raise OSError("hidapi internal failure")
+
+    monkeypatch.setattr(usb, "_hid_module", lambda: Exploding())
+    with pytest.raises(usb.MissingDependency) as excinfo:
+        usb._hid_iface0(timeout=0)
+    message = str(excinfo.value)
+    assert "hidapi is installed" in message
+    assert "OSError" in message, message
+
+
+def test_hid_iface0_returns_none_for_a_genuinely_empty_bus(monkeypatch):
+    """The other half: an empty bus is not an error, and `enable_adb` still reports the deck absence."""
+    class Empty:
+        def enumerate(self, vid, pid):
+            return []
+
+    monkeypatch.setattr(usb, "_hid_module", lambda: Empty())
+    assert usb._hid_iface0(timeout=0) is None
+
+
+def test_hid_iface0_retries_a_transient_enumerate_failure(monkeypatch):
+    """The retry loop exists for a settling bus, so a later success must still win."""
+    calls = []
+
+    class Flaky:
+        def enumerate(self, vid, pid):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("not ready yet")
+            return [{"interface_number": 0, "path": b"/dev/deck"}]
+
+    monkeypatch.setattr(usb, "_hid_module", lambda: Flaky())
+    assert usb._hid_iface0(timeout=2.0) == {
+        "interface_number": 0,
+        "path": b"/dev/deck",
+    }, "a transient failure was treated as final"
+
+
 def test_enable_adb_does_not_blame_the_deck_for_a_missing_package(monkeypatch):
     _hid_unavailable(monkeypatch)
     monkeypatch.setattr(usb, "_importable", lambda name: name != "hid")
