@@ -19,6 +19,12 @@ AGENT_RECIPE = DEVICE / "build-color-agent.sh"
 AGENT_C = DEVICE / "d200-color-agent.c"
 # The only way to adopt a prebuilt agent that the recipe did not just produce in BIN_DIR.
 AGENT_SOURCE_ENV = "GHOSTDECK_AGENT_SOURCE"
+# GitHub Actions builds this file on `v*` tags (`.github/workflows/agent.yml`). Named here so a
+# missing-agent failure can point at a real URL instead of "install a prebuilt" with nowhere to get
+# one. ARM binaries stay out of git; the release is the distribution path.
+AGENT_RELEASE_URL = (
+    "https://github.com/laerad777/ghostdeck/releases/latest/download/d200-color-agent"
+)
 TURBOJPEG_HINT = (
     "an ARM Linux static libturbojpeg is also required (Debian/Ubuntu: "
     "libturbojpeg0-dev); a macOS/Homebrew libturbojpeg is not usable"
@@ -159,8 +165,11 @@ def _ensure_agent() -> None:
     )
     raise RuntimeError(
         "d200-color-agent is not built.\n"
-        f"  Run: {AGENT_RECIPE}\n"
-        f"  {gcc_hint}; {TURBOJPEG_HINT}.\n"
-        f"  Or install a prebuilt agent at {dest}, or set {AGENT_SOURCE_ENV}=/path/to/d200-color-agent\n"
-        f"  to adopt a prebuilt binary from outside this tree."
+        f"  Download the ARMv7 Linux build:\n"
+        f"    {AGENT_RELEASE_URL}\n"
+        f"  Install it:\n"
+        f"    mkdir -p {dest.parent} && install -m 755 d200-color-agent {dest}\n"
+        f"  Or set {AGENT_SOURCE_ENV}=/path/to/d200-color-agent to adopt a local file.\n"
+        f"  Or build it here: {AGENT_RECIPE}\n"
+        f"  {gcc_hint}; {TURBOJPEG_HINT}."
     )

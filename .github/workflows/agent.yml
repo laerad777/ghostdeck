@@ -1,0 +1,85 @@
+name: agent
+
+# ARMv7 Linux `d200-color-agent`. Not in git (it is a device binary). Built here so a host
+# without a cross compiler can still install one: the failure from `ghostdeck build` names
+# https://github.com/laerad777/ghostdeck/releases/latest/download/d200-color-agent
+# as the file to put in `~/.ghostdeck/bin`.
+#
+# Tags `v*` attach that file to the GitHub release. `workflow_dispatch` and path-filtered
+# PRs only upload an Actions artifact -- they must not mint a release, because a PR is not
+# a version. The recipe itself is what the job runs, so a recipe change that would fail on
+# a laptop fails here too.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+    paths:
+      - "device/**"
+      - ".github/workflows/agent.yml"
+  pull_request:
+    paths:
+      - "device/**"
+      - ".github/workflows/agent.yml"
+
+jobs:
+  armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf cmake make
+
+      - name: Static ARM libturbojpeg
+        run: |
+          set -euo pipefail
+          # Built from source so the tj3* API and the ELF ABI are the ones the agent links,
+          # not whatever Ubuntu's armhf package happens to be. Homebrew jpeg-turbo is Mach-O
+          # and the recipe already refuses it; this is the Linux counterpart that must pass
+          # `--check-abi`.
+          curl -fsSL https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.0.3/libjpeg-turbo-3.0.3.tar.gz | tar xz
+          cmake -S libjpeg-turbo-3.0.3 -B tj-build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
+            -DCMAKE_INSTALL_PREFIX="$PWD/tj-sysroot" \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_STATIC=ON \
+            -DWITH_TURBOJPEG=ON
+          cmake --build tj-build -j"$(nproc)"
+          cmake --install tj-build
+
+      - name: Build d200-color-agent
+        env:
+          CC: arm-linux-gnueabihf-gcc
+        run: |
+          set -euo pipefail
+          libdir=
+          for candidate in "$PWD/tj-sysroot/lib" "$PWD/tj-sysroot/lib64"; do
+            if [ -f "$candidate/libturbojpeg.a" ]; then
+              libdir=$candidate
+              break
+            fi
+          done
+          [ -n "$libdir" ] || { echo "libturbojpeg.a missing under tj-sysroot"; find tj-sysroot -type f | head; exit 1; }
+          mkdir -p dist
+          TURBOJPEG_LIB=$libdir TURBOJPEG_INC="$PWD/tj-sysroot/include" \
+            device/build-color-agent.sh "$PWD/dist/d200-color-agent"
+          device/build-color-agent.sh --check-abi "$PWD/dist/d200-color-agent"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d200-color-agent
+          path: dist/d200-color-agent
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/d200-color-agent

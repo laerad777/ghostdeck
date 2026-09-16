@@ -295,6 +295,11 @@ def test_ensure_agent_error_names_the_recipe_and_the_prerequisite(monkeypatch, t
     assert str(tmp_path / "bin" / "d200-color-agent") in message
     assert devicebuild.AGENT_SOURCE_ENV in message
     assert "sibling" not in message
+    # The prebuilt is a GitHub release, not a file next to the checkout. A message that says
+    # "install a prebuilt" without a URL is how this used to strand a host without a cross compiler.
+    assert devicebuild.AGENT_RELEASE_URL in message
+    assert "releases/latest/download/d200-color-agent" in message
+    assert "github.com/laerad777/ghostdeck" in message
 
 
 def test_ensure_agent_prefers_an_existing_binary(monkeypatch, tmp_path):

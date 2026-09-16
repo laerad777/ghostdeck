@@ -46,15 +46,32 @@ export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 
 ### 디바이스 에이전트
 
-`d200-color-agent`는 git에 없고, macOS에서 한 방에 빌드되지도 않습니다.
-미리 만든 ARM Linux 바이너리를 `~/.ghostdeck/bin/d200-color-agent`에 두거나
-`GHOSTDECK_AGENT_SOURCE`로 가리키십시오. `device/build-color-agent.sh`는
-ARMv7 Linux 크로스 gcc와 ARM Linux `libturbojpeg.a`가 필요합니다
-(Homebrew jpeg-turbo는 Mach-O라 거절됩니다).
+`d200-color-agent`는 git에 없습니다. 태그 릴리스에서 GitHub Actions가 ARMv7
+Linux 바이너리를 만들어 `d200-color-agent`로 붙입니다. 설치:
+
+```bash
+mkdir -p ~/.ghostdeck/bin
+curl -L -o ~/.ghostdeck/bin/d200-color-agent \
+  https://github.com/laerad777/ghostdeck/releases/latest/download/d200-color-agent
+chmod +x ~/.ghostdeck/bin/d200-color-agent
+```
+
+또는 `GHOSTDECK_AGENT_SOURCE`로 로컬 파일을 가리키십시오. `ghostdeck build`는
+바이너리가 없으면 그 URL을 출력합니다. `device/build-color-agent.sh`는 ARMv7
+Linux 크로스 gcc와 ARM Linux `libturbojpeg.a`가 필요합니다 (Homebrew jpeg-turbo는
+Mach-O라 거절됩니다).
 
 `ghostdeck build`는 zkgui 프록시/프리로드와 hidshim Studio 복사본을
 컴파일합니다. Xcode CLT와 공식 Studio가 필요합니다. 에이전트 바이너리가
 없으면 그 단계에서 실패합니다.
+
+### 하드웨어 검사
+
+`tools/hardware_verify.py`가 덱이 붙은 스모크 테스트입니다 (`GHOSTDECK_HW_TEST=1`).
+호스티드 CI는 돌리지 않습니다. `d200` 라벨의 셀프호스티드 러너가 매일, 그리고
+수동으로 돌립니다 (`.github/workflows/hardware.yml`). 그 러너에
+`GHOSTDECK_HW_MEDIA`를 두면 재생/중지까지 검사합니다. 체크아웃에는 샘플 영상이
+없습니다.
 
 ## 사용
 

@@ -172,3 +172,47 @@ def test_wait_for_mode_returns_the_settled_mode(harness, monkeypatch):
 def test_wait_for_mode_gives_up_and_reports_what_it_saw(harness, monkeypatch):
     monkeypatch.setattr(harness, "device_mode", lambda: "adb")
     assert harness.wait_for_mode("hid", timeout=0.6) == "adb"
+
+
+# ------------------------------------------------------------------ CI wiring (items 5 and 6)
+
+
+def test_hosted_ci_never_opts_into_the_hardware_harness():
+    """`ci.yml` is the GitHub-hosted matrix. It must not set GHOSTDECK_HW_TEST=1.
+
+    The harness's own gate exists so a device-free runner cannot pretend to have a deck. Putting
+    the smoke test in that workflow would either skip (exit 2, looking like a pass if not checked)
+    or wait forever for hardware that is not there.
+    """
+    text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "GHOSTDECK_HW_TEST: \"1\"" not in text
+    assert "hardware_verify.py" not in text
+    assert "self-hosted" not in text
+
+
+def test_hardware_workflow_is_self_hosted_opt_in_and_runs_the_existing_verifier():
+    """The deck smoke test is its own workflow so it cannot block a PR on a hosted runner."""
+    text = (ROOT / ".github" / "workflows" / "hardware.yml").read_text(encoding="utf-8")
+    assert "self-hosted" in text
+    assert "d200" in text
+    assert "workflow_dispatch" in text
+    assert "cron:" in text
+    assert "GHOSTDECK_HW_TEST" in text
+    assert "tools/hardware_verify.py" in text
+    # Push would race a single physical deck; the comment is the contract, the trigger is the proof.
+    assert "push:" not in text.split("jobs:")[0]
+
+
+def test_agent_workflow_builds_the_release_artifact_the_failure_message_names():
+    """`ghostdeck build` points at this URL; the workflow must actually produce that filename."""
+    from ghostdeck import devicebuild
+
+    text = (ROOT / ".github" / "workflows" / "agent.yml").read_text(encoding="utf-8")
+    assert "d200-color-agent" in text
+    assert "build-color-agent.sh" in text
+    assert "arm-linux-gnueabihf-gcc" in text
+    assert "libjpeg-turbo" in text
+    assert "action-gh-release" in text
+    assert "refs/tags/" in text
+    assert devicebuild.AGENT_RELEASE_URL.endswith("/d200-color-agent")
+    assert "laerad777/ghostdeck" in devicebuild.AGENT_RELEASE_URL

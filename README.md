@@ -45,15 +45,31 @@ export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 
 ### Device agent
 
-`d200-color-agent` is not in git and is not a one-command macOS build. Put a
-prebuilt ARM Linux binary at `~/.ghostdeck/bin/d200-color-agent`, or point
-`GHOSTDECK_AGENT_SOURCE` at one. `device/build-color-agent.sh` needs an ARMv7
-Linux cross gcc **and** an ARM Linux `libturbojpeg.a` (Homebrew jpeg-turbo is
-Mach-O and will be refused).
+`d200-color-agent` is not in git. On a tagged release GitHub Actions builds the ARMv7
+Linux binary and attaches it as `d200-color-agent`. Install that:
+
+```bash
+mkdir -p ~/.ghostdeck/bin
+curl -L -o ~/.ghostdeck/bin/d200-color-agent \
+  https://github.com/laerad777/ghostdeck/releases/latest/download/d200-color-agent
+chmod +x ~/.ghostdeck/bin/d200-color-agent
+```
+
+Or point `GHOSTDECK_AGENT_SOURCE` at a local copy. `ghostdeck build` names that URL
+when the binary is missing. `device/build-color-agent.sh` still needs an ARMv7 Linux
+cross gcc **and** an ARM Linux `libturbojpeg.a` (Homebrew jpeg-turbo is Mach-O and
+will be refused).
 
 `ghostdeck build` compiles the zkgui proxy/preload and the hidshim Studio
 copy. It needs Xcode CLT (`clang`, `codesign`, `ditto`, …) and the official
 Studio app. It still fails at the agent step until that binary exists.
+
+### Hardware check
+
+`tools/hardware_verify.py` is the deck-attached smoke test (`GHOSTDECK_HW_TEST=1`).
+Hosted CI never runs it. A self-hosted runner labelled `d200` runs it nightly and
+on demand (`.github/workflows/hardware.yml`). Set `GHOSTDECK_HW_MEDIA` on that
+runner to add a play/stop pass; a bare checkout has no sample clips.
 
 ## Use
 

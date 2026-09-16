@@ -1,0 +1,71 @@
+name: hardware
+
+# The deck-attached smoke test, in its own workflow rather than as a job in `ci`.
+#
+# `ci` is device-free by construction: it runs on GitHub's hosted runners, where no
+# D200 can exist, and `tools/hardware_verify.py` refuses to run without
+# `GHOSTDECK_HW_TEST=1` precisely so it can never fire there by accident. The gap
+# that leaves is real and was hit on this project: a test that reads the physical
+# bus passes only on a host *without* the deck, so it is green in CI and red on the
+# only machine that can actually run the product. Nothing in the hosted matrix can
+# catch that, because nothing in it has a deck.
+#
+# This job therefore runs only on a runner that has one -- a self-hosted runner
+# labelled `d200` with the deck attached -- and it is opt-in in the same sense the
+# script is: `workflow_dispatch` for an on-demand run, plus a nightly schedule so a
+# firmware or Studio change is noticed without anyone remembering to look. It is
+# NOT triggered by push, because a deck is a single physical device: two pushes in
+# a row would race for it.
+#
+# If no runner with that label is registered, the job simply waits for one; that is
+# the correct failure mode for "this needs hardware", and it never blocks a PR.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 17:00 UTC = 02:00 KST, outside working hours on the host this is registered on.
+    - cron: "0 17 * * *"
+
+jobs:
+  deck-smoke:
+    runs-on: [self-hosted, macOS, d200]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the device extras
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv-hw
+          .venv-hw/bin/python -m pip install --quiet --upgrade pip
+          .venv-hw/bin/python -m pip install --quiet -e ".[device]" pytest
+
+      - name: Deck-attached smoke test
+        env:
+          # The script's own opt-in. It is set here because this runner is the one
+          # place the guard is satisfied by construction.
+          GHOSTDECK_HW_TEST: "1"
+        run: |
+          set -euo pipefail
+          # `--media` is deliberately not passed: the sample clips are not in git (they
+          # are generated locally and are tens of MB), so a checkout has none. Without it
+          # the verifier still covers the part that regressed in practice -- bring-up,
+          # deck answers, restore to HID, nothing staged left -- which is the whole
+          # bridge/ADB lifecycle. Set `GHOSTDECK_HW_MEDIA` on the runner to add playback:
+          # this step stays correct on a bare checkout either way.
+          media=()
+          if [ -n "${GHOSTDECK_HW_MEDIA:-}" ]; then
+            media=(--media "$GHOSTDECK_HW_MEDIA")
+          fi
+          PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py "${media[@]}"
+
+      - name: Upload the verifier's output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardware-verify-log
+          path: |
+            /tmp/d200-local-bridge.log
+            /tmp/d200-hidshim.log
+          if-no-files-found: ignore
+          retention-days: 7
