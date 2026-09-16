@@ -364,3 +364,28 @@ def test_stop_detect_and_status_stay_usable_without_the_bridge(tmp_path, monkeyp
         ),
     )
     play.stop()
+
+
+def test_play_lifecycle_is_not_the_identity_or_wait_modules():
+    """play.py was one 950-line file. Lifecycle, identity, and waits are now separate modules.
+
+    The public names stay on `ghostdeck.play` so callers and tests keep patching one place; the
+    bodies live in the modules named here. A revert that pastes the waits back into play.py fails
+    because play.py must not define `_session_released`.
+    """
+    from ghostdeck import play, playident, playwait
+
+    assert play.start_play is not None
+    assert play.stop.__module__ == "ghostdeck.play"
+    assert play.start_play.__module__ == "ghostdeck.play"
+    assert play._session_released.__module__ == "ghostdeck.playwait"
+    assert play._await_hid_return.__module__ == "ghostdeck.playwait"
+    assert play._kill_play.__module__ == "ghostdeck.playident"
+    assert play.deck_transport.__module__ == "ghostdeck.playident"
+    assert playident._kill_play is play._kill_play
+    assert playwait._session_released is play._session_released
+    text = (ROOT / "src" / "ghostdeck" / "play.py").read_text(encoding="utf-8")
+    assert "def _session_released" not in text
+    assert "def _kill_play" not in text
+    assert "def start_play" in text
+    assert "def stop" in text
