@@ -53,3 +53,20 @@ def test_letterbox_then_cover_fills_the_native_plane():
     assert "force_original_aspect_ratio=increase" in graph
     assert "crop=960:540" in graph
     assert "pad=" not in graph
+
+
+def test_unproven_open_is_retried_once():
+    """A YouTube session that dies messy leaves cleanup unproven; the next OPEN was refused.
+
+    Measured from the GUI: first watch consumed ~1080 frames then DISCONNECTED, the next
+    play (and a local clip after it) both died with resultCode 1 and 0 frames. The player
+    waits the same 5s settle as stop, then retries OPEN once.
+    """
+    play = _play()
+    text = PLAY.read_text(encoding="utf-8")
+    assert "OPEN_RETRY_WAIT" in text
+    assert play.should_retry_unproven_open(
+        {"accepted": False, "error": "the previous video session has not proven it released the deck (cleanup: unproven)"}
+    )
+    assert not play.should_retry_unproven_open({"accepted": True, "error": ""})
+    assert not play.should_retry_unproven_open({"accepted": False, "error": "another video session is already opening"})

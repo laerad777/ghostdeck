@@ -33,6 +33,9 @@ HOST_STATE = Path("/tmp/d200-color-host.json")
 BRIDGE_SOCKET = Path("/tmp/d200-adb-bridge.sock")
 # Keep FRAME records under 12KiB; 14387-byte records stalled at upHave=12288.
 FRAME_JPEG_CHUNK = 12288 - wire.HEADER_SIZE - 16
+UNPROVEN_OPEN = "has not proven it released the deck"
+# Measured: 0s between sessions -> CLEANUP_FAILED; 5s -> healthy (playwait.py).
+OPEN_RETRY_WAIT = 5.0
 
 
 def align_jpeg_payload(frame):
@@ -82,6 +85,13 @@ def validated_session(value):
     if not re.fullmatch(r"[0-9a-f]{32}", value):
         raise argparse.ArgumentTypeError("session must be 32 lowercase hexadecimal characters")
     return value
+
+
+def should_retry_unproven_open(answer) -> bool:
+    """True when OPEN was refused because the previous session has not released the deck."""
+    if not isinstance(answer, dict) or answer.get("accepted"):
+        return False
+    return UNPROVEN_OPEN in (answer.get("error") or "")
 
 
 def ensure_runtime_modules():
@@ -658,8 +668,15 @@ def main():
         ensure_runtime_modules()
         deadline = time.monotonic() + 10
         client = connect_bridge(BRIDGE_SOCKET, deadline, cancel)
-        answer = json_exchange(client, dict(schemaVersion=1, op="videoOpen", session=session,
-                               fpsNumerator=fps.numerator, fpsDenominator=fps.denominator), deadline, cancel)
+        open_request = dict(schemaVersion=1, op="videoOpen", session=session,
+                            fpsNumerator=fps.numerator, fpsDenominator=fps.denominator)
+        answer = json_exchange(client, open_request, deadline, cancel)
+        if should_retry_unproven_open(answer):
+            # The previous native session is still draining. One wait, one retry; a second
+            # refusal is a real stuck boundary and is reported.
+            time.sleep(OPEN_RETRY_WAIT)
+            deadline = time.monotonic() + 10
+            answer = json_exchange(client, open_request, deadline, cancel)
         if not answer["accepted"]:
             open_rejected = True
             # FIX-5-T16: the bridge's own `error` text is why it refused, and it used to be
