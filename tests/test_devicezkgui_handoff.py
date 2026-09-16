@@ -671,6 +671,23 @@ def test_every_name_the_preload_reads_is_a_name_the_proxy_sets():
     )
 
 
+def test_video_session_punches_through_the_studio_overlay():
+    """Studio HID images paint fb0 opaque; video is DIVP underneath.
+
+    Measured: YouTube is visible until the copy starts, then the panel is black
+    while frames still consume. During a video session the proxy zeros the
+    overlay and ACKs OUTPUT without forwarding it, so the picture shows and the
+    copy keeps HID input.
+    """
+    if not PROXY.is_file():
+        pytest.skip(f"missing {PROXY}")
+    text = PROXY.read_text(encoding="utf-8")
+    assert "punch_video_through_overlay" in text
+    assert 'open("/dev/fb0"' in text
+    assert "send_output_ack" in text
+    assert "s.video.exists && !s.video.checked" in text
+
+
 def test_model_is_device_free_and_contains_the_shipped_text(tmp_path):
     """The model must be a verbatim splice of both files, and must stay off the real device."""
     if not PRELOAD.is_file() or not PROXY.is_file():

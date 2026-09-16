@@ -119,6 +119,23 @@ static int send_packet(struct state *s, uint8_t kind, const void *payload,
 static uint64_t monotonic_ms(void);
 static int video_open(struct video *v, const struct packet *packet);
 static void video_socket_buffers(int fd);
+static void punch_video_through_overlay(struct state *s)
+{
+    /* Color-key is black. Studio HID images paint fb0 opaque, so DIVP is
+     * underneath and invisible. Zero the overlay and stop forwarding later
+     * OUTPUT; INPUT still reaches the host so the copy's keys keep working. */
+    unsigned char zeros[4096];
+    int fd;
+    int i;
+    s->pending[0].used = s->pending[1].used = false;
+    memset(zeros, 0, sizeof(zeros));
+    fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return;
+    for (i = 0; i < 640; i++) {
+        if (write(fd, zeros, sizeof(zeros)) <= 0) break;
+    }
+    (void)close(fd);
+}
 
 /* LIFECYCLE_BEGIN: actual production diagnostic helpers, host-effect tested.
  * Callers supply only fixed literals, never command/capability/error text.
@@ -1429,6 +1446,7 @@ int main(int argc, char **argv)
                 } else if (packet.kind == D200_VS_VIDEO_OPEN_REQUEST ||
                            packet.kind == D200_VS_VIDEO_CANCEL_REQUEST ||
                            packet.kind == D200_VS_VIDEO_STATUS_REQUEST) {
+                    int had_video = s.video.exists;
                     if (video_control(&s, &packet)) {
                         lifecycle_control_loss(&s, "video-control");
                         host_connected = false; connection_boundary(&s);
@@ -1436,7 +1454,22 @@ int main(int argc, char **argv)
                         reconnect_deadline = monotonic_ms() + 30000;
                         break;
                     }
-                } else if ((packet.kind == OUTPUT0 || packet.kind == OUTPUT1) && send_to_peer(&s, packet.kind == OUTPUT0 ? 0 : 1, &packet)) { lifecycle_exit(&s, "hid-output"); send_error(&s, "hid output failure"); stop_requested = 1; break;
+                    if (!had_video && s.video.exists)
+                        punch_video_through_overlay(&s);
+                } else if (packet.kind == OUTPUT0 || packet.kind == OUTPUT1) {
+                    if (s.video.exists && !s.video.checked) {
+                        if (send_output_ack(&s, packet.sequence)) {
+                            lifecycle_exit(&s, "hid-output");
+                            send_error(&s, "hid output failure");
+                            stop_requested = 1;
+                            break;
+                        }
+                    } else if (send_to_peer(&s, packet.kind == OUTPUT0 ? 0 : 1, &packet)) {
+                        lifecycle_exit(&s, "hid-output");
+                        send_error(&s, "hid output failure");
+                        stop_requested = 1;
+                        break;
+                    }
                 } else if (packet.kind != OUTPUT0 && packet.kind != OUTPUT1 &&
                            packet.kind != PING) { lifecycle_exit(&s, "packet-kind"); send_error(&s, "unexpected packet"); stop_requested = 1; break; }
             } else if (map[i] >= 10) {
