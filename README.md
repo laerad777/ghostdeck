@@ -78,7 +78,7 @@ ghostdeck studio          # hidshim copy + bridge; run this first (needs officia
 ghostdeck bridge          # the bridge alone, no Studio needed
 ghostdeck play video.mp4  # JPEG play over ADB
 ghostdeck stop            # stop the player; Studio stays if it is up
-ghostdeck gui             # browser; play the open video on the deck
+ghostdeck gui             # browser; play the open video or a dropped file on the deck
 ```
 
 Do not open `~/Applications/Ulanzi Studio ADB.app` by hand. Without the
@@ -94,7 +94,7 @@ bridge that copy's shim sees no device.
 | `ghostdeck stop` | Stop the player. If the bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is up, leave the deck in ADB so Studio keys keep working. |
 | `ghostdeck detect` | Serial, VID/PID, USB mode. Fails if no deck. |
 | `ghostdeck status` | USB mode, shim copy, playing. |
-| `ghostdeck gui` | A small browser. Play the open video on the deck. Ads on the same YouTube id do not restart. Not a host player. |
+| `ghostdeck gui` | A small browser. Play the open video or a local file (파일 / drop / Cmd-O) on the deck. Ads on the same YouTube id do not restart. Not a host player. |
 
 `play` is a launcher: it returns after the player has survived a short grace
 window. The player keeps looping until `stop`.

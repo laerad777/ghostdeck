@@ -11,7 +11,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ghostdeck import cli, studio
 
@@ -31,6 +31,7 @@ _YT_HOSTS = {
     "music.youtube.com",
     "youtube-nocookie.com",
 }
+_MEDIA_SUFFIXES = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,67 @@ def looks_like_source(text: str) -> bool:
     return "://" in text or text.startswith("/")
 
 
+def media_path_candidate(text: str) -> str:
+    """A local file path that play can take, or empty. Existence is the CLI's job."""
+    text = (text or "").strip().strip('"')
+    if not text:
+        return ""
+    if text.startswith("file:"):
+        text = unquote(urlparse(text).path)
+    if not text.startswith("/"):
+        return ""
+    path = text.split("?")[0]
+    if Path(path).suffix.lower() in _MEDIA_SUFFIXES:
+        return path
+    return ""
+
+
+def play_should_loop(source: str) -> bool:
+    """A file on disk loops (the CLI default). A URL is one watch."""
+    return bool(media_path_candidate(source))
+
+
+def dropped_play_source(filenames) -> str:
+    """The first dropped path that looks like media."""
+    for name in filenames or []:
+        candidate = media_path_candidate(str(name))
+        if candidate:
+            return candidate
+    return ""
+
+
+def play_request(
+    field: str,
+    page_href: str,
+    page_media: str = "",
+    pasteboard: str = "",
+    start: float = 0.0,
+) -> tuple[str, float]:
+    """What 재생 sends.
+
+    The URL field is not navigation-only: a local file typed or opened there wins, otherwise
+    the page's video, otherwise a copied path/URL. YouTube's homepage is not a video.
+    """
+    field = (field or "").strip()
+    local = media_path_candidate(field)
+    if local:
+        return local, 0.0
+    page = youtube_watch_url(page_href) or playable_source(page_href, page_media)
+    if page:
+        return page, play_offset(start)
+    local = media_path_candidate(pasteboard)
+    if local:
+        return local, 0.0
+    watch = youtube_watch_url(field) or playable_source(field)
+    if watch:
+        return watch, 0.0
+    watch = youtube_watch_url(pasteboard) or playable_source(pasteboard)
+    if watch:
+        return watch, 0.0
+    return "", 0.0
+
+
+
 def resolve_source(field: str, pasteboard: str = "") -> str:
     """The field wins. An empty field plays a copied file path or URL."""
     field = field.strip()
@@ -200,7 +262,7 @@ def playable_source(href: str, media_src: str = "") -> str:
         src = ""
     if src.startswith("http://") or src.startswith("https://"):
         path = urlparse(src).path.lower()
-        if path.endswith((".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")):
+        if path.endswith(_MEDIA_SUFFIXES):
             return src
     host = urlparse(href).netloc.lower()
     if host.startswith("www."):
@@ -249,15 +311,19 @@ def is_google_login_host(host: str) -> bool:
     return host == "accounts.youtube.com" or host == "accounts.google.com" or host.startswith("accounts.google.")
 
 def page_follow_action(seen_watch: str, href: str) -> tuple[str, str]:
-    """When the page changes: (new_seen, play_url | 'stop' | ''). Same YouTube id is a no-op."""
+    """When the page changes: (new_seen, play_url | 'stop' | ''). Same YouTube id is a no-op.
+
+    Stop only if the current source is a YouTube watch. A local file playing while the
+    window sits on youtube.com would otherwise look like "left the video" and halt the deck.
+    """
     watch = youtube_watch_url(href)
     if watch == seen_watch:
         return seen_watch, ""
     if watch:
         return watch, watch
-    if seen_watch:
+    if youtube_watch_url(seen_watch):
         return "", "stop"
-    return "", ""
+    return seen_watch, ""
 
 def ensure_store_id(path: Path, mint) -> str:
     """One UUID for WKWebsiteDataStore so YouTube login and cache survive relaunch."""
@@ -286,7 +352,7 @@ class DeckRemote:
     def play(self, source: str, pasteboard: str = "", start: float = 0.0, loop: bool = True) -> list[CommandResult]:
         source = resolve_source(source, pasteboard)
         if not source:
-            return [CommandResult(["play"], 2, "", "유튜브에서 영상을 연 다음 재생을 누르십시오")]
+            return [CommandResult(["play"], 2, "", "유튜브에서 영상을 열거나 파일을 연 다음 재생을 누르십시오")]
         results: list[CommandResult] = []
         st = self._run(["status"])
         results.append(st)
@@ -335,10 +401,15 @@ def main() -> int:
             NSBezelStyleRounded,
             NSButton,
             NSColor,
+            NSDragOperationCopy,
+            NSEventModifierFlagCommand,
+            NSFilenamesPboardType,
             NSFont,
             NSMakeRect,
             NSObject,
+            NSOpenPanel,
             NSTextField,
+            NSView,
             NSViewHeightSizable,
             NSViewMaxYMargin,
             NSViewMinXMargin,
@@ -438,7 +509,7 @@ def main() -> int:
         # The window is a remote for a CLI that takes seconds per press (a `play` waits for the player
         # to survive its grace window). Without this the buttons looked inert and were re-pressable
         # while a command was still in flight, which the log showed as stacked players.
-        for name in ("play_btn", "stop_btn"):
+        for name in ("play_btn", "stop_btn", "file_btn"):
             button = getattr(ctrl, name, None)
             if button is not None:
                 button.setEnabled_(not on)
@@ -504,7 +575,7 @@ def main() -> int:
                 pasteboard,
                 lambda r, e: AppHelper.callAfter(lambda: _gui_apply(ctrl, r, e)),
                 play_offset(start),
-                False if op == "play" else loop,
+                play_should_loop(source) if op == "play" else loop,
             ),
             daemon=True,
         )
@@ -518,6 +589,28 @@ def main() -> int:
             _gui_kick(ctrl, "stop", "")
             return
         _gui_kick(ctrl, "play", action, start=start)
+
+    class DropBar(NSView):
+        """Toolbar/status strip accepts a dropped media file. Clicks go to the controls on top."""
+
+        def draggingEntered_(self, _info):
+            return NSDragOperationCopy
+
+        def draggingUpdated_(self, _info):
+            return NSDragOperationCopy
+
+        def prepareForDragOperation_(self, _info):
+            return True
+
+        def performDragOperation_(self, info):
+            names = info.draggingPasteboard().propertyListForType_(NSFilenamesPboardType) or []
+            source = dropped_play_source(list(names))
+            if not source:
+                return False
+            ctrl = self.ctrl
+            ctrl.url_field.setStringValue_(source)
+            _gui_kick(ctrl, "play", source)
+            return True
 
     class Controller(NSObject):
         def init(self):
@@ -534,6 +627,8 @@ def main() -> int:
             WEB_Y = BAR_Y + BAR_H + 10
             RIGHT = 104          # width of each of the two action buttons
             GAP = 8
+            FILE_W = 48
+            URL_X = 134          # after ‹ › 파일
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, W, H),
                 NSWindowStyleMaskTitled
@@ -552,6 +647,11 @@ def main() -> int:
             self.window.setContentSize_((W, H))
             self.window.center()
             view = self.window.contentView()
+            drop = DropBar.alloc().initWithFrame_(NSMakeRect(0, 0, W, WEB_Y))
+            drop.ctrl = self
+            drop.registerForDraggedTypes_([NSFilenamesPboardType])
+            drop.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            view.addSubview_(drop)
 
             config = WKWebViewConfiguration.alloc().init()
             from Foundation import NSUUID
@@ -606,10 +706,20 @@ def main() -> int:
             fwd.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(fwd)
 
+            self.file_btn = NSButton.alloc().initWithFrame_(NSMakeRect(82, BAR_Y, FILE_W, BAR_H))
+            self.file_btn.setTitle_("파일")
+            self.file_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.file_btn.setTarget_(self)
+            self.file_btn.setAction_("openFile:")
+            self.file_btn.setKeyEquivalent_("o")
+            self.file_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            self.file_btn.setAutoresizingMask_(NSViewMaxYMargin)
+            view.addSubview_(self.file_btn)
+
             # The field takes whatever is left over; the two action buttons keep their width and ride
             # the right edge, so resizing moves the URL field and nothing overlaps.
-            url_w = W - 86 - (2 * RIGHT + GAP + 10)
-            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(86, BAR_Y, url_w, BAR_H))
+            url_w = W - URL_X - (2 * RIGHT + GAP + 10)
+            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(URL_X, BAR_Y, url_w, BAR_H))
             self.url_field.setStringValue_("https://www.youtube.com")
             self.url_field.setTarget_(self)
             self.url_field.setAction_("go:")
@@ -628,6 +738,7 @@ def main() -> int:
             self.play_btn.setFont_(NSFont.boldSystemFontOfSize_(13))
             self.play_btn.setTarget_(self)
             self.play_btn.setAction_("play:")
+            self.play_btn.setKeyEquivalent_("\r")
             self.play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
             view.addSubview_(self.play_btn)
 
@@ -639,8 +750,21 @@ def main() -> int:
             self.stop_btn.setFont_(NSFont.systemFontOfSize_(13))
             self.stop_btn.setTarget_(self)
             self.stop_btn.setAction_("stop:")
+            self.stop_btn.setKeyEquivalent_("\x1b")
             self.stop_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
             view.addSubview_(self.stop_btn)
+            reload_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
+            reload_btn.setKeyEquivalent_("r")
+            reload_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            reload_btn.setTarget_(self)
+            reload_btn.setAction_("reload:")
+            view.addSubview_(reload_btn)
+            focus_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
+            focus_btn.setKeyEquivalent_("l")
+            focus_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            focus_btn.setTarget_(self)
+            focus_btn.setAction_("focusUrl:")
+            view.addSubview_(focus_btn)
 
             # A status dot plus the summary. The dot is the only thing that has to be read at a
             # glance; the text says which deck state it is.
@@ -669,7 +793,7 @@ def main() -> int:
             self.note.setDrawsBackground_(False)
             self.note.setFont_(NSFont.labelFontOfSize_(11))
             self.note.setTextColor_(NSColor.secondaryLabelColor())
-            self.note.setStringValue_("아무 사이트나 열고 재생을 누르면 덱에서 재생됩니다. 광고는 무시합니다.")
+            self.note.setStringValue_("파일 또는 유튜브를 열고 재생을 누르십시오. 광고는 무시합니다.")
             self.note.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
             view.addSubview_(self.note)
 
@@ -688,6 +812,10 @@ def main() -> int:
 
         def go_(self, _sender):
             raw = str(self.url_field.stringValue() or "").strip()
+            local = media_path_candidate(raw)
+            if local:
+                _gui_kick(self, "play", local)
+                return
             if not raw:
                 return
             if "://" not in raw:
@@ -697,22 +825,49 @@ def main() -> int:
                 return
             self.web.loadRequest_(NSURLRequest.requestWithURL_(url))
 
-        def play_(self, _sender):
-            """Play the video on this page on the deck, and start it in the window too.
+        def openFile_(self, _sender):
+            panel = NSOpenPanel.openPanel()
+            panel.setCanChooseFiles_(True)
+            panel.setCanChooseDirectories_(False)
+            panel.setAllowsMultipleSelection_(False)
+            panel.setAllowedFileTypes_([suffix[1:] for suffix in _MEDIA_SUFFIXES])
+            if panel.runModal() != 1:
+                return
+            chosen = panel.URL()
+            if chosen is None:
+                return
+            source = media_path_candidate(str(chosen.path()))
+            if not source:
+                self.note.setStringValue_("재생할 수 있는 영상이 아닙니다.")
+                return
+            self.url_field.setStringValue_(source)
+            _gui_kick(self, "play", source)
 
-            Reading the URL is not enough on its own: `stop_` pauses the page's video so it can stop
-            cleanly, and a paused page never fires the `play` event this window listens for -- so after
-            one 정지 a later 재생 found the right URL and nothing happened. Resuming the page here makes
-            재생 work on its own terms instead of depending on a listener elsewhere.
+        def reload_(self, _sender):
+            self.web.reload_(None)
+
+        def focusUrl_(self, _sender):
+            self.window.makeFirstResponder_(self.url_field)
+
+        def play_(self, _sender):
+            """Play the field's file, or the video on this page, on the deck.
+
+            A local path in the URL field wins so 파일 / a drop / a typed path actually play.
+            Otherwise resume the page (정지 leaves it paused) and read the watch URL.
             """
             ctrl = self
+            field = str(self.url_field.stringValue() or "")
+            local = media_path_candidate(field)
+            if local:
+                _gui_kick(ctrl, "play", local)
+                return
 
             def after(raw, _err):
                 page, start = parse_watch_payload(raw)
                 page = page or _gui_href(ctrl)
-                watch = youtube_watch_url(page) or playable_source(page)
-                if watch:
-                    _gui_kick(ctrl, "play", watch, start=start)
+                source, off = play_request(field, page, "", read_pasteboard(), start)
+                if source:
+                    _gui_kick(ctrl, "play", source, start=off)
                     return
                 ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
 
@@ -769,6 +924,8 @@ def main() -> int:
 
         def webView_didCommitNavigation_(self, webView, _nav):
             if webView is not self.web:
+                return
+            if media_path_candidate(str(self.url_field.stringValue() or "")):
                 return
             url = webView.URL()
             if url is not None:

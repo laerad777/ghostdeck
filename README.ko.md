@@ -80,7 +80,7 @@ ghostdeck studio          # hidshim 복사본 + 브리지. 먼저 실행 (공식
 ghostdeck bridge          # 브리지만. Studio 없이
 ghostdeck play video.mp4  # ADB JPEG 재생
 ghostdeck stop            # 플레이어만 중지. Studio가 켜져 있으면 유지
-ghostdeck gui             # 브라우저. 열린 영상을 덱에서 재생
+ghostdeck gui             # 브라우저. 열린 영상 또는 파일을 덱에서 재생
 ```
 
 `~/Applications/Ulanzi Studio ADB.app`을 직접 열지 마십시오. 브리지 없이
@@ -96,7 +96,7 @@ ghostdeck gui             # 브라우저. 열린 영상을 덱에서 재생
 | `ghostdeck stop` | 플레이어를 중지합니다. 브리지가 꺼져 있으면 스톡 UI를 복원하고 `/tmp/ghostdeck-*`를 지웁니다. 브리지가 살아 있으면 덱은 ADB로 남겨 Studio 키를 유지합니다. |
 | `ghostdeck detect` | 시리얼, VID/PID, USB 모드. 덱이 없으면 실패. |
 | `ghostdeck status` | USB 모드, 심 복사본, 재생 여부. |
-| `ghostdeck gui` | 작은 브라우저. 열린 영상을 덱에서 재생. 같은 유튜브 영상의 광고는 처음부터 다시 돌리지 않습니다. 호스트 플레이어가 아닙니다. |
+| `ghostdeck gui` | 작은 브라우저. 열린 영상 또는 로컬 파일(파일 / 드롭 / Cmd-O)을 덱에서 재생. 같은 유튜브 영상의 광고는 처음부터 다시 돌리지 않습니다. 호스트 플레이어가 아닙니다. |
 
 `play`는 런처입니다. 플레이어가 짧은 유예 시간을 넘기면 바로 돌아옵니다.
 루프는 `stop`까지 계속됩니다.

@@ -12,9 +12,14 @@ from ghostdeck.app import (
     CommandResult,
     DeckRemote,
     bridge_down,
+    dropped_play_source,
     ensure_store_id,
     is_google_login_host,
+    media_path_candidate,
+    page_follow_action,
     parse_status_fields,
+    play_request,
+    play_should_loop,
     status_text,
     read_pasteboard,
     resolve_source,
@@ -333,3 +338,60 @@ def test_stop_is_only_stop():
     result = DeckRemote(run).stop()
     assert calls == [["stop"]]
     assert result.argv == ["stop"]
+
+
+def test_media_path_candidate_accepts_local_files_and_file_urls():
+    assert media_path_candidate("/tmp/clip.mp4") == "/tmp/clip.mp4"
+    assert media_path_candidate('"/tmp/clip.mkv"') == "/tmp/clip.mkv"
+    assert media_path_candidate("file:///tmp/clip.webm") == "/tmp/clip.webm"
+    assert media_path_candidate("https://youtu.be/x") == ""
+    assert media_path_candidate("/tmp/notes.txt") == ""
+
+
+def test_play_should_loop_only_for_local_files():
+    assert play_should_loop("/tmp/clip.mp4") is True
+    assert play_should_loop("https://www.youtube.com/watch?v=dQw4w9WgXcQ") is False
+
+
+def test_dropped_play_source_picks_the_first_media_file():
+    assert dropped_play_source(["/tmp/readme.txt", "/tmp/clip.mp4"]) == "/tmp/clip.mp4"
+    assert dropped_play_source(["/tmp/readme.txt"]) == ""
+
+
+def test_play_request_prefers_a_file_in_the_field_over_the_page():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    source, start = play_request("/tmp/clip.mp4", watch, start=9)
+    assert source == "/tmp/clip.mp4"
+    assert start == 0.0
+
+
+def test_play_request_uses_the_page_video_when_the_field_is_the_site():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    source, start = play_request("https://www.youtube.com/", watch, start=4.5)
+    assert source == watch
+    assert start == 4.5
+
+
+def test_play_request_does_not_treat_the_youtube_homepage_as_a_video():
+    assert play_request("https://www.youtube.com/", "https://www.youtube.com/") == ("", 0.0)
+
+
+def test_play_request_falls_back_to_a_copied_file():
+    assert play_request("", "https://www.youtube.com/", pasteboard="/tmp/clip.mp4") == (
+        "/tmp/clip.mp4",
+        0.0,
+    )
+
+
+def test_leaving_a_youtube_video_stops_the_deck():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert page_follow_action(watch, "https://www.youtube.com/") == ("", "stop")
+    assert page_follow_action(watch, watch) == (watch, "")
+
+
+def test_a_local_file_is_not_stopped_by_sitting_on_youtube():
+    """The window stays on youtube.com while a dropped file plays; that is not 'left the video'."""
+    path = "/tmp/clip.mp4"
+    assert page_follow_action(path, "https://www.youtube.com/") == (path, "")
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert page_follow_action(path, watch) == (watch, watch)
