@@ -26,6 +26,14 @@ from ghostdeck.app import (
     run_cli,
     shim_is_up,
     youtube_watch_url,
+    playlist_add,
+    playlist_advance,
+    playlist_label,
+    playlist_load,
+    playlist_remove,
+    playlist_save,
+    playlist_should_loop,
+    deck_now_playing,
     playable_source,
     should_start_play,
     play_offset,
@@ -421,3 +429,44 @@ def test_a_local_file_is_not_stopped_by_sitting_on_youtube():
     assert page_follow_action(path, "https://www.youtube.com/") == (path, "")
     watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert page_follow_action(path, watch) == (watch, watch)
+
+
+def test_playlist_label_is_a_name_not_a_path():
+    assert playlist_label("/tmp/clips/iris.mp4") == "iris.mp4"
+    assert playlist_label("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "YouTube · dQw4w9WgXcQ"
+    assert playlist_label("") == ""
+
+
+def test_playlist_add_skips_a_consecutive_duplicate():
+    first = playlist_add([], "/tmp/a.mp4")
+    assert first == ["/tmp/a.mp4"]
+    assert playlist_add(first, "/tmp/a.mp4") == first
+    assert playlist_add(first, "/tmp/b.mp4") == ["/tmp/a.mp4", "/tmp/b.mp4"]
+
+
+def test_playlist_advance_plays_through_then_stops():
+    items = ["/tmp/a.mp4", "/tmp/b.mp4"]
+    assert playlist_advance(items, "/tmp/a.mp4") == "/tmp/b.mp4"
+    assert playlist_advance(items, "/tmp/b.mp4") == ""
+    assert playlist_advance(items, "") == "/tmp/a.mp4"
+    assert playlist_remove(items, 0) == ["/tmp/b.mp4"]
+
+
+def test_a_queue_does_not_loop_a_file():
+    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4"]) is True
+    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4", "/tmp/b.mp4"]) is False
+    assert playlist_should_loop("https://www.youtube.com/watch?v=x", []) is False
+
+
+def test_playlist_roundtrip(tmp_path):
+    path = tmp_path / "playlist.json"
+    playlist_save(path, ["/tmp/a.mp4", "https://www.youtube.com/watch?v=x"])
+    assert playlist_load(path) == ["/tmp/a.mp4", "https://www.youtube.com/watch?v=x"]
+    assert playlist_load(tmp_path / "missing.json") == []
+
+
+def test_deck_now_playing_reads_the_player_receipt(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text('{"source":"/tmp/iris.mp4","phase":"active"}\n', encoding="utf-8")
+    assert deck_now_playing(path) == "/tmp/iris.mp4"
+    assert deck_now_playing(tmp_path / "gone.json") == ""

@@ -32,6 +32,12 @@ _YT_HOSTS = {
     "youtube-nocookie.com",
 }
 _MEDIA_SUFFIXES = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")
+HOST_STATE = Path("/tmp/d200-color-host.json")
+PLAYLIST_PATH = Path.home() / ".ghostdeck" / "playlist.json"
+_IPHONE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
 
 
 @dataclass(frozen=True)
@@ -197,6 +203,89 @@ def dropped_play_source(filenames) -> str:
         if candidate:
             return candidate
     return ""
+
+
+def playlist_label(source: str) -> str:
+    """A short name for a playlist row. Not a URL dump."""
+    source = (source or "").strip()
+    if not source:
+        return ""
+    local = media_path_candidate(source)
+    if local:
+        return Path(local).name
+    watch = youtube_watch_url(source)
+    if watch:
+        vid = parse_qs(urlparse(watch).query).get("v", [""])[0]
+        return f"YouTube · {vid}" if vid else watch
+    return source if len(source) <= 48 else source[:45] + "..."
+
+
+def playlist_add(items, source: str) -> list[str]:
+    """Append a playable source. Consecutive duplicates are ignored."""
+    source = (source or "").strip()
+    out = [str(item) for item in (items or []) if str(item).strip()]
+    if not source:
+        return out
+    if out and out[-1] == source:
+        return out
+    return out + [source]
+
+
+def playlist_remove(items, index: int) -> list[str]:
+    out = [str(item) for item in (items or [])]
+    if index < 0 or index >= len(out):
+        return out
+    del out[index]
+    return out
+
+
+def playlist_advance(items, current: str) -> str:
+    """The next queued source after `current`, or empty at the end."""
+    items = [str(item) for item in (items or []) if str(item).strip()]
+    current = (current or "").strip()
+    if not items:
+        return ""
+    if current in items:
+        nxt = items.index(current) + 1
+        return items[nxt] if nxt < len(items) else ""
+    return items[0]
+
+
+def playlist_should_loop(source: str, items) -> bool:
+    """A queue plays through. A single file still loops (CLI default)."""
+    items = [str(item) for item in (items or []) if str(item).strip()]
+    if len(items) > 1:
+        return False
+    return play_should_loop(source)
+
+
+def playlist_load(path: Path) -> list[str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def playlist_save(path: Path, items) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps([str(item) for item in items], indent=2, ensure_ascii=False) + "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def deck_now_playing(path: Path = HOST_STATE) -> str:
+    """The source the player last published, or empty. No HID, no subprocess."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    src = data.get("source")
+    return str(src).strip() if src else ""
+
 
 
 def play_request(
@@ -423,10 +512,15 @@ def main() -> int:
             NSMakeRect,
             NSObject,
             NSOpenPanel,
+            NSScrollView,
+            NSTableColumn,
+            NSTableView,
+            NSBezelBorder,
             NSTextField,
             NSView,
             NSViewHeightSizable,
             NSViewMaxYMargin,
+            NSViewMinYMargin,
             NSViewMinXMargin,
             NSViewWidthSizable,
             NSWindow,
@@ -548,6 +642,7 @@ def main() -> int:
                 colour = status_dot_color(item.stdout)
                 if dot is not None and colour is not None:
                     dot.setTextColor_(colour)
+                _gui_sync_deck(ctrl, parse_status_fields(item.stdout).get("playing") == "yes")
         last = results[-1] if results else None
         if last is None:
             if pending and pending != getattr(ctrl, "seen_watch", ""):
@@ -562,6 +657,7 @@ def main() -> int:
         elif last.argv[:1] == ["play"]:
             if len(last.argv) > 1:
                 ctrl.seen_watch = last.argv[1]
+                _gui_playlist_put(ctrl, last.argv[1])
             ctrl.note.setStringValue_("덱에서 재생 중입니다. 창이 멈추거나 끊겨도 덱은 계속 재생됩니다.")
         elif last.argv[:1] == ["studio"]:
             ctrl.note.setStringValue_("브리지를 켰습니다. 이제 재생할 수 있습니다.")
@@ -590,7 +686,7 @@ def main() -> int:
                 pasteboard,
                 lambda r, e: AppHelper.callAfter(lambda: _gui_apply(ctrl, r, e)),
                 play_offset(start),
-                play_should_loop(source) if op == "play" else loop,
+                playlist_should_loop(source, getattr(ctrl, "playlist", [])) if op == "play" else loop,
             ),
             daemon=True,
         )
@@ -604,6 +700,45 @@ def main() -> int:
             _gui_kick(ctrl, "stop", "")
             return
         _gui_kick(ctrl, "play", action, start=start)
+
+    def _gui_playlist_put(ctrl, source: str) -> None:
+        source = (source or "").strip()
+        if not source:
+            return
+        ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source)
+        playlist_save(PLAYLIST_PATH, ctrl.playlist)
+        _gui_playlist_draw(ctrl)
+
+    def _gui_playlist_draw(ctrl) -> None:
+        table = getattr(ctrl, "playlist_table", None)
+        if table is not None:
+            table.reloadData()
+        now = deck_now_playing()
+        field = getattr(ctrl, "now_field", None)
+        if field is not None:
+            field.setStringValue_(playlist_label(now) if now else "없음")
+
+    def _gui_sync_deck(ctrl, playing: bool) -> None:
+        now = deck_now_playing()
+        if now and now not in getattr(ctrl, "playlist", []):
+            _gui_playlist_put(ctrl, now)
+        else:
+            _gui_playlist_draw(ctrl)
+        was = getattr(ctrl, "was_playing", False)
+        if playing:
+            ctrl.was_playing = True
+            return
+        if was and not getattr(ctrl, "user_stopped", False) and not ctrl.busy:
+            nxt = playlist_advance(
+                getattr(ctrl, "playlist", []),
+                getattr(ctrl, "seen_watch", "") or now,
+            )
+            ctrl.was_playing = False
+            if nxt:
+                _gui_kick(ctrl, "play", nxt)
+                return
+        ctrl.was_playing = False
+
 
     class DropBar(NSView):
         """Toolbar/status strip accepts a dropped media file. Clicks go to the controls on top."""
@@ -634,16 +769,22 @@ def main() -> int:
             self.pending_source = ""
             self.pending_start = 0.0
             self.seen_watch = ""
-            # One place for the layout numbers. A browser-shaped window rather than a phone-shaped
-            # one: the page IS the content, so the web view takes the space and the controls sit in
-            # a single toolbar row that stays legible at the minimum size.
-            W, H = 980, 780
+            self.playlist = playlist_load(PLAYLIST_PATH)
+            self.was_playing = False
+            self.user_stopped = False
+            # Phone-width browser on the left; the deck queue on the right.
+            PAD = 10
+            PHONE_W = 390
+            SIDE_W = 340
+            SIDE_GAP = 12
+            W = PAD + PHONE_W + SIDE_GAP + SIDE_W + PAD
+            H = 780
             BAR_H, BAR_Y = 34, 46
             WEB_Y = BAR_Y + BAR_H + 10
-            RIGHT = 104          # width of each of the two action buttons
+            RIGHT = 104
             GAP = 8
             FILE_W = 48
-            URL_X = 134          # after ‹ › 파일
+            URL_X = 134
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, W, H),
                 NSWindowStyleMaskTitled
@@ -655,7 +796,7 @@ def main() -> int:
             )
             self.window.setTitle_("ghostdeck — 덱 플레이어")
             self.window.setReleasedWhenClosed_(False)
-            self.window.setMinSize_((460, 420))
+            self.window.setMinSize_((PAD + PHONE_W + SIDE_GAP + 220 + PAD, 520))
             # `initWithContentRect` is a request, and the toolbar's autolayout can leave the window at
             # its minimum instead of the requested size (observed: 460x808 for a 980x780 request).
             # Setting the frame after the content view exists makes the requested size authoritative.
@@ -692,18 +833,87 @@ def main() -> int:
             self.popups = []
             prefs = config.defaultWebpagePreferences()
             if prefs is not None:
-                prefs.setPreferredContentMode_(0)
+                prefs.setPreferredContentMode_(1)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(0, WEB_Y, W, H - WEB_Y),
+                NSMakeRect(PAD, WEB_Y, PHONE_W, H - WEB_Y),
                 config,
             )
-            self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            self.web.setAutoresizingMask_(NSViewHeightSizable)
+            self.web.setCustomUserAgent_(_IPHONE_UA)
             self.web.setUIDelegate_(self)
             self.web.setNavigationDelegate_(self)
             view.addSubview_(self.web)
             self.web.loadRequest_(
-                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
+                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://m.youtube.com"))
             )
+            SIDE_X = PAD + PHONE_W + SIDE_GAP
+            heading = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 22, SIDE_W, 18))
+            heading.setEditable_(False)
+            heading.setBezeled_(False)
+            heading.setDrawsBackground_(False)
+            heading.setFont_(NSFont.boldSystemFontOfSize_(12))
+            heading.setStringValue_("덱에서 재생 중")
+            heading.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            view.addSubview_(heading)
+            self.now_field = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 46, SIDE_W, 22))
+            self.now_field.setEditable_(False)
+            self.now_field.setBezeled_(True)
+            self.now_field.setFont_(NSFont.systemFontOfSize_(12))
+            self.now_field.setStringValue_(playlist_label(deck_now_playing()) or "없음")
+            self.now_field.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            view.addSubview_(self.now_field)
+            queue_head = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 68, SIDE_W, 18))
+            queue_head.setEditable_(False)
+            queue_head.setBezeled_(False)
+            queue_head.setDrawsBackground_(False)
+            queue_head.setFont_(NSFont.boldSystemFontOfSize_(12))
+            queue_head.setStringValue_("플레이리스트")
+            queue_head.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            view.addSubview_(queue_head)
+            BTN_H = 28
+            table_y = WEB_Y + BTN_H + 8
+            table_h = max(80, (H - 74) - table_y)
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(SIDE_X, table_y, SIDE_W, table_h))
+            scroll.setHasVerticalScroller_(True)
+            scroll.setBorderType_(NSBezelBorder)
+            scroll.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
+            self.playlist_table = NSTableView.alloc().initWithFrame_(scroll.contentView().bounds())
+            col = NSTableColumn.alloc().initWithIdentifier_("source")
+            col.setWidth_(SIDE_W - 24)
+            col.setEditable_(False)
+            self.playlist_table.addTableColumn_(col)
+            self.playlist_table.setHeaderView_(None)
+            self.playlist_table.setDataSource_(self)
+            self.playlist_table.setDelegate_(self)
+            self.playlist_table.setAllowsEmptySelection_(True)
+            scroll.setDocumentView_(self.playlist_table)
+            view.addSubview_(scroll)
+            add_w, play_w, del_w, bgap = 88, 88, 72, 8
+            self.add_btn = NSButton.alloc().initWithFrame_(NSMakeRect(SIDE_X, WEB_Y, add_w, BTN_H))
+            self.add_btn.setTitle_("＋ 추가")
+            self.add_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.add_btn.setTarget_(self)
+            self.add_btn.setAction_("addToPlaylist:")
+            self.add_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.add_btn)
+            self.row_play_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + add_w + bgap, WEB_Y, play_w, BTN_H)
+            )
+            self.row_play_btn.setTitle_("▶ 이 항목")
+            self.row_play_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.row_play_btn.setTarget_(self)
+            self.row_play_btn.setAction_("playSelected:")
+            self.row_play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.row_play_btn)
+            self.del_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + add_w + bgap + play_w + bgap, WEB_Y, del_w, BTN_H)
+            )
+            self.del_btn.setTitle_("삭제")
+            self.del_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.del_btn.setTarget_(self)
+            self.del_btn.setAction_("removeSelected:")
+            self.del_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.del_btn)
 
             back = NSButton.alloc().initWithFrame_(NSMakeRect(10, BAR_Y, 32, BAR_H))
             back.setTitle_("‹")
@@ -735,7 +945,7 @@ def main() -> int:
             # the right edge, so resizing moves the URL field and nothing overlaps.
             url_w = W - URL_X - (2 * RIGHT + GAP + 10)
             self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(URL_X, BAR_Y, url_w, BAR_H))
-            self.url_field.setStringValue_("https://www.youtube.com")
+            self.url_field.setStringValue_("https://m.youtube.com")
             self.url_field.setTarget_(self)
             self.url_field.setAction_("go:")
             self.url_field.setFont_(NSFont.systemFontOfSize_(12))
@@ -844,19 +1054,22 @@ def main() -> int:
             panel = NSOpenPanel.openPanel()
             panel.setCanChooseFiles_(True)
             panel.setCanChooseDirectories_(False)
-            panel.setAllowsMultipleSelection_(False)
+            panel.setAllowsMultipleSelection_(True)
             panel.setAllowedFileTypes_([suffix[1:] for suffix in _MEDIA_SUFFIXES])
             if panel.runModal() != 1:
                 return
-            chosen = panel.URL()
-            if chosen is None:
-                return
-            source = media_path_candidate(str(chosen.path()))
-            if not source:
+            sources = []
+            for item in list(panel.URLs() or []):
+                source = media_path_candidate(str(item.path()))
+                if source:
+                    sources.append(source)
+            if not sources:
                 self.note.setStringValue_("재생할 수 있는 영상이 아닙니다.")
                 return
-            self.url_field.setStringValue_(source)
-            _gui_kick(self, "play", source)
+            for source in sources:
+                _gui_playlist_put(self, source)
+            self.url_field.setStringValue_(sources[0])
+            _gui_kick(self, "play", sources[0])
 
         def reload_(self, _sender):
             self.web.reload_(None)
@@ -902,6 +1115,7 @@ def main() -> int:
             moment, then `playing=yes` again with the page's own YouTube id). Pausing the page first
             is what makes the stop hold; the deck stop runs after it, so no `play` can slip between.
             """
+            self.user_stopped = True
             self.seen_watch = ""
             self.web.evaluateJavaScript_completionHandler_(
                 "document.querySelectorAll('video').forEach(function(v){v.pause()}); null",
@@ -911,6 +1125,53 @@ def main() -> int:
         def poll_(self, _timer):
             if not self.busy:
                 _gui_kick(self, "status", "")
+
+        def numberOfRowsInTableView_(self, _table):
+            return len(getattr(self, "playlist", []))
+
+        def tableView_objectValueForTableColumn_row_(self, _table, _col, row):
+            items = getattr(self, "playlist", [])
+            if row < 0 or row >= len(items):
+                return ""
+            name = playlist_label(items[row])
+            return ("▶ " + name) if items[row] == deck_now_playing() else name
+
+        def tableView_shouldEditTableColumn_row_(self, _table, _col, _row):
+            return False
+
+        def addToPlaylist_(self, _sender):
+            ctrl = self
+            field = str(self.url_field.stringValue() or "")
+
+            def after(raw, _err):
+                page, start = parse_watch_payload(raw)
+                page = page or _gui_href(ctrl)
+                source, _off = play_request(field, page, "", read_pasteboard(), start)
+                if not source:
+                    ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
+                    return
+                _gui_playlist_put(ctrl, source)
+                ctrl.note.setStringValue_("플레이리스트에 넣었습니다.")
+
+            self.web.evaluateJavaScript_completionHandler_(
+                "(window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href)",
+                after,
+            )
+
+        def playSelected_(self, _sender):
+            row = int(self.playlist_table.selectedRow())
+            items = getattr(self, "playlist", [])
+            if row < 0 or row >= len(items):
+                self.note.setStringValue_("재생할 항목을 고르십시오.")
+                return
+            self.user_stopped = False
+            _gui_kick(self, "play", items[row])
+
+        def removeSelected_(self, _sender):
+            row = int(self.playlist_table.selectedRow())
+            self.playlist = playlist_remove(getattr(self, "playlist", []), row)
+            playlist_save(PLAYLIST_PATH, self.playlist)
+            _gui_playlist_draw(self)
 
         def userContentController_didReceiveScriptMessage_(self, _ucc, message):
             body = message.body()
