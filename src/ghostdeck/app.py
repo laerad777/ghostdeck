@@ -515,12 +515,14 @@ def _file_identity(path: str, probe=None) -> tuple[str, str]:
 
 
 def deck_now_playing(path: Path = HOST_STATE) -> str:
-    """The source the player last published, or empty. No HID, no subprocess."""
+    """The source of an active session, or empty. No HID, no subprocess."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         return ""
     if not isinstance(data, dict):
+        return ""
+    if str(data.get("phase") or "") != "active":
         return ""
     src = data.get("source")
     return str(src).strip() if src else ""
@@ -1296,25 +1298,42 @@ def main() -> int:
         if table is not None:
             table.reloadData()
         items = getattr(ctrl, "playlist", [])
-        now = deck_now_playing()
-        found = playlist_find(items, now) if now else playlist_entry("")
-        title = getattr(ctrl, "now_title", None)
-        channel = getattr(ctrl, "now_channel", None)
-        if title is not None:
-            title.setStringValue_(playlist_title(found) if now else "재생 중인 영상이 없습니다")
-        if channel is not None:
-            channel.setStringValue_(playlist_subtitle(found) if now else "페이지에서 추가하거나 파일을 놓으십시오")
         heading = getattr(ctrl, "queue_head", None)
         if heading is not None:
             n = len(items)
             heading.setStringValue_(
                 f"대기열 · {n}곡" if n else "대기열 · 영상을 끌어다 놓으십시오"
             )
-        field = getattr(ctrl, "now_field", None)
-        if field is not None:
-            field.setStringValue_(playlist_label(found) if now else "없음")
+        _gui_now_draw(ctrl)
         _gui_playhead_draw(ctrl)
         _gui_mode_draw(ctrl)
+
+    def _gui_now_draw(ctrl) -> None:
+        source, _pos, active = deck_playhead()
+        if not active:
+            source = getattr(ctrl, "seen_watch", "") if getattr(ctrl, "busy", False) else ""
+        source = playlist_identity(source)
+        items = getattr(ctrl, "playlist", [])
+        found = playlist_find(items, source) if source else playlist_entry("")
+        now_head = getattr(ctrl, "now_head", None)
+        if now_head is not None:
+            now_head.setStringValue_("NOW · 재생 중" if source else "NOW")
+        title = getattr(ctrl, "now_title", None)
+        if title is not None:
+            title.setStringValue_(playlist_title(found) if source else "재생 중인 영상이 없습니다")
+        channel = getattr(ctrl, "now_channel", None)
+        if channel is not None:
+            channel.setStringValue_(
+                playlist_subtitle(found) if source else "페이지에서 추가하거나 파일을 놓으십시오"
+            )
+        field = getattr(ctrl, "now_field", None)
+        if field is not None:
+            field.setStringValue_(playlist_label(found) if source else "없음")
+        if getattr(ctrl, "shown_now", None) != source:
+            ctrl.shown_now = source
+            table = getattr(ctrl, "playlist_table", None)
+            if table is not None:
+                table.reloadData()
 
     def _gui_mode_draw(ctrl) -> None:
         shuffle_btn = getattr(ctrl, "shuffle_btn", None)
@@ -1336,6 +1355,7 @@ def main() -> int:
             if elapsed is not None and bar is not None:
                 elapsed.setStringValue_(format_clock(bar.doubleValue()))
             return
+        _gui_now_draw(ctrl)
         source, pos, _active = deck_playhead()
         host_len = deck_duration()
         if host_len > 0 and source:
@@ -1670,6 +1690,7 @@ def main() -> int:
                 NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 36, SIDE_W - 36, 14),
                 "NOW", 10, True, LIME, stick_top,
             )
+            self.now_head = heading
             view.addSubview_(heading)
             self.now_title = _label(
                 NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 62, SIDE_W - 36, 22),

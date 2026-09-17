@@ -101,27 +101,18 @@ def test_probe_duration_uses_yt_dlp_for_http():
     assert calls[0][0] == "yt-dlp"
 
 
-def test_encoder_plays_host_audio_from_a_second_input():
+def test_host_audio_is_a_separate_realtime_ffmpeg():
     play = _play()
     args = type("Args", (), {"loop": False, "start": 12.5, "duration": 0, "quality": 12})()
-    command = play.build_encoder_command(
+    video = play.build_encoder_command(
         args, "https://v.example/video", "https://v.example/audio", "fps=30,scale=960:540",
     )
-    assert command[:3] == ["ffmpeg", "-v", "error"]
-    assert command.count("-i") == 2
-    assert "-ss" in command
-    assert "12.5" in command
-    assert "-f" in command and "image2pipe" in command
-    assert "audiotoolbox" in command
-    assert "aresample=async=1:first_pts=0" in command
-    assert "-map" in command and "1:a:0" in command
-
-
-def test_encoder_skips_host_audio_without_an_audio_stream():
-    play = _play()
-    args = type("Args", (), {"loop": True, "start": 0, "duration": 0, "quality": 5})()
-    command = play.build_encoder_command(args, "/tmp/clip.mp4", None, "fps=30")
-    assert command.count("-i") == 1
-    assert "-stream_loop" in command
-    assert "audiotoolbox" not in command
-    assert "-an" in command
+    audio = play.build_audio_command(args, "https://v.example/audio")
+    assert video.count("-i") == 1
+    assert "audiotoolbox" not in video
+    assert "-an" in video
+    assert audio[0] == "ffmpeg"
+    assert "-re" in audio
+    assert "audiotoolbox" in audio
+    assert "12.5" in audio
+    assert play.build_audio_command(args, None) is None

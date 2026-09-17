@@ -619,21 +619,13 @@ def source_has_audio(source):
 
 
 def build_encoder_command(args, video, audio, filters):
-    """JPEG pipe on stdout; optional AudioToolbox on the host, same ffmpeg clock."""
+    """JPEG pipe on stdout. Host audio is `build_audio_command` in another process."""
     command = ["ffmpeg", "-v", "error"]
-
-    def add_input(url):
-        if args.loop:
-            command.extend(["-stream_loop", "-1"])
-        if args.start:
-            command.extend(["-ss", str(args.start)])
-        command.extend(["-i", url])
-
-    add_input(video)
-    audio_index = 0
-    if audio and audio != video:
-        add_input(audio)
-        audio_index = 1
+    if args.loop:
+        command.extend(["-stream_loop", "-1"])
+    if args.start:
+        command.extend(["-ss", str(args.start)])
+    command.extend(["-i", video])
     if args.duration:
         command.extend(["-t", str(args.duration)])
     command.extend([
@@ -644,14 +636,35 @@ def build_encoder_command(args, video, audio, filters):
         "-pix_fmt", "yuvj420p",
         "-f", "image2pipe", "-",
     ])
-    if audio:
+    return command
+
+
+def build_audio_command(args, audio):
+    """Realtime AudioToolbox. Independent of the JPEG credit stall."""
+    if not audio:
+        return None
+    command = ["ffmpeg", "-v", "error", "-nostdin"]
+    if str(audio).startswith(("http://", "https://")):
         command.extend([
-            "-map", f"{audio_index}:a:0",
-            "-vn",
-            "-filter:a", "aresample=async=1:first_pts=0",
-            "-c:a", "pcm_s16le",
-            "-f", "audiotoolbox", "dummy",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_on_network_error", "1",
+            "-reconnect_delay_max", "2",
         ])
+    command.append("-re")
+    if args.loop:
+        command.extend(["-stream_loop", "-1"])
+    if args.start:
+        command.extend(["-ss", str(args.start)])
+    command.extend(["-i", audio])
+    if args.duration:
+        command.extend(["-t", str(args.duration)])
+    command.extend([
+        "-vn",
+        "-filter:a", "aresample=async=1:first_pts=0",
+        "-c:a", "pcm_s16le",
+        "-f", "audiotoolbox", "dummy",
+    ])
     return command
 
 
@@ -719,7 +732,7 @@ def main():
                             ownerControl=owner, requestSession=requester, status=initial_status(),
                             startupResultObserved=requester is None, terminalRetainUntilMonotonicNs=None))
     claimed = False
-    client = encoder = stderr_thread = None
+    client = encoder = speaker = stderr_thread = None
     credentials = None
     open_rejected = False
     success = False
@@ -752,7 +765,8 @@ def main():
         fps = parse_fps(args.fps, source)
         crop = detect_crop(source) if args.crop == "auto" else args.crop
         filters = build_video_filters(args, fps, crop)
-        command = build_encoder_command(args, source, audio, filters)
+        command = build_encoder_command(args, source, None, filters)
+        audio_cmd = build_audio_command(args, audio)
         ensure_runtime_modules()
         deadline = time.monotonic() + 10
         client = connect_bridge(BRIDGE_SOCKET, deadline, cancel)
@@ -789,6 +803,14 @@ def main():
         stderr_tail = bytearray()
         stderr_thread = threading.Thread(target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True)
         stderr_thread.start()
+        speaker = None
+        if audio_cmd is not None:
+            speaker = subprocess.Popen(
+                audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
+            )
+            threading.Thread(
+                target=drain_bounded, args=(speaker.stderr, bytearray()), daemon=True,
+            ).start()
         total = stream.produce(encoder.stdout, encoder)
         check_cancel(cancel)
         answer = video_bridge_request(dict(schemaVersion=1, op="videoStatus", **credentials), 5,
@@ -808,6 +830,10 @@ def main():
         def cleanup_encoder():
             try:
                 stop_encoder(encoder)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                encoder_errors.append(error)
+            try:
+                stop_encoder(speaker)
             except (OSError, subprocess.TimeoutExpired) as error:
                 encoder_errors.append(error)
 

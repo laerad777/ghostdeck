@@ -509,6 +509,8 @@ def test_deck_now_playing_reads_the_player_receipt(tmp_path):
     path = tmp_path / "host.json"
     path.write_text('{"source":"/tmp/iris.mp4","phase":"active"}\n', encoding="utf-8")
     assert deck_now_playing(path) == "/tmp/iris.mp4"
+    path.write_text('{"source":"/tmp/iris.mp4","phase":"terminal"}\n', encoding="utf-8")
+    assert deck_now_playing(path) == ""
     assert deck_now_playing(tmp_path / "gone.json") == ""
 
 
