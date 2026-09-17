@@ -260,12 +260,29 @@ def drain_bounded(stream, storage, limit=64 * 1024):
         if len(storage) > limit:
             del storage[:-limit]
 class FramePump:
-    """Always drain ffmpeg JPEG stdout. Queue complete frames; never drop, never block encode."""
+    """Drain JPEG stdout. Keep only the newest complete frames so video cannot lag."""
 
-    def __init__(self, raw):
-        self._q = queue.Queue()
+    def __init__(self, raw, max_frames=3):
+        self._q = queue.Queue(maxsize=max_frames)
         self._raw = raw
         threading.Thread(target=self._run, daemon=True).start()
+
+    def _offer(self, item):
+        if item is None:
+            self._q.put(item)
+            return
+        while True:
+            try:
+                self._q.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    dropped = self._q.get_nowait()
+                except queue.Empty:
+                    continue
+                if dropped is None:
+                    self._q.put(None)
+                    return
 
     def _run(self):
         framer = JpegFramer(max_frame_bytes=MAX_JPEG_BYTES)
@@ -285,15 +302,18 @@ class FramePump:
                         framer.finish()
                     except Exception:
                         pass
-                    self._q.put(None)
+                    self._offer(None)
                     return
                 for frame in framer.feed(block):
-                    self._q.put(bytes(frame))
+                    self._offer(bytes(frame))
         except Exception:
-            self._q.put(None)
+            self._offer(None)
 
     def get(self, timeout=0.05):
         return self._q.get(timeout=timeout)
+
+    def get_nowait(self):
+        return self._q.get_nowait()
 
 
 
@@ -555,6 +575,11 @@ class VideoStream:
                     item = None
                 else:
                     continue
+            while item is not None:
+                try:
+                    item = pump.get_nowait()
+                except queue.Empty:
+                    break
             if item is None:
                 exit_deadline = time.monotonic() + 3
                 while encoder.poll() is None:
@@ -659,7 +684,7 @@ def resolve_media_urls(source):
     if source.startswith(("http://", "https://")):
         probe = run(
             "yt-dlp", "--no-warnings", "-f",
-            "bv*[vcodec^=avc][height<=1080]+ba/b[vcodec^=avc][height<=1080]/bv*[height<=720]+ba/b[height<=1080]",
+            "bv*[vcodec^=avc][height<=720]+ba/b[vcodec^=avc][height<=720]/bv*[height<=540]+ba/b[height<=720]",
             "-g", source, capture=True,
         )
         urls = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
@@ -851,6 +876,8 @@ def main():
         if args.no_audio:
             audio = None
         fps = parse_fps(args.fps, source)
+        if fps > Fraction(24, 1):
+            fps = Fraction(24, 1)
         crop_box = [args.crop]
 
         def fill_crop():
