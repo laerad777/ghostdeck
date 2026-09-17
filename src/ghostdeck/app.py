@@ -270,6 +270,45 @@ def playlist_add(items, source: str, title: str = "", channel: str = "") -> list
     return out + [playlist_entry(source, title, channel)]
 
 
+def playlist_title(item) -> str:
+    """The primary line: the video title, never a URL."""
+    if not isinstance(item, dict):
+        item = playlist_entry(str(item or ""))
+    title = str(item.get("title") or "").strip()
+    if title:
+        return title
+    source = playlist_source(item)
+    local = media_path_candidate(source)
+    if local:
+        return Path(local).stem
+    watch = youtube_watch_url(source)
+    if watch:
+        vid = parse_qs(urlparse(watch).query).get("v", [""])[0]
+        return vid or "YouTube"
+    return playlist_label(item)
+
+
+def playlist_subtitle(item) -> str:
+    """The secondary line: channel, or empty."""
+    if not isinstance(item, dict):
+        item = playlist_entry(str(item or ""))
+    return str(item.get("channel") or "").strip()
+
+
+def playlist_move(items, src: int, dst: int) -> list[dict[str, str]]:
+    """Move the row at `src` so it lands at `dst`. Out of range is a no-op."""
+    out = playlist_normalize(items)
+    if not (0 <= src < len(out)):
+        return out
+    dst = max(0, min(len(out) - 1, dst))
+    if src == dst:
+        return out
+    item = out.pop(src)
+    out.insert(dst, item)
+    return out
+
+
+
 def playlist_remove(items, index: int) -> list[dict[str, str]]:
     out = playlist_normalize(items)
     if index < 0 or index >= len(out):
@@ -602,6 +641,7 @@ def main() -> int:
             NSButton,
             NSColor,
             NSDragOperationCopy,
+            NSDragOperationMove,
             NSEventModifierFlagCommand,
             NSFilenamesPboardType,
             NSFont,
@@ -625,7 +665,7 @@ def main() -> int:
             NSWindowStyleMaskResizable,
             NSWindowStyleMaskTitled,
         )
-        from Foundation import NSURL, NSURLRequest, NSTimer
+        from Foundation import NSIndexSet, NSURL, NSURLRequest, NSTimer
         from PyObjCTools import AppHelper
         from WebKit import (
             WKUserContentController,
@@ -823,12 +863,24 @@ def main() -> int:
         table = getattr(ctrl, "playlist_table", None)
         if table is not None:
             table.reloadData()
+        items = getattr(ctrl, "playlist", [])
         now = deck_now_playing()
+        found = playlist_find(items, now) if now else playlist_entry("")
+        title = getattr(ctrl, "now_title", None)
+        channel = getattr(ctrl, "now_channel", None)
+        if title is not None:
+            title.setStringValue_(playlist_title(found) if now else "재생 중인 영상이 없습니다")
+        if channel is not None:
+            channel.setStringValue_(playlist_subtitle(found) if now else "페이지에서 추가하거나 파일을 놓으십시오")
+        heading = getattr(ctrl, "queue_head", None)
+        if heading is not None:
+            n = len(items)
+            heading.setStringValue_(
+                f"대기열 · {n}곡" if n else "대기열 · 영상을 끌어다 놓으십시오"
+            )
         field = getattr(ctrl, "now_field", None)
         if field is not None:
-            field.setStringValue_(
-                playlist_label(playlist_find(getattr(ctrl, "playlist", []), now)) if now else "없음"
-            )
+            field.setStringValue_(playlist_label(found) if now else "없음")
 
     def _gui_sync_deck(ctrl, playing: bool) -> None:
         now = deck_now_playing()
@@ -875,6 +927,30 @@ def main() -> int:
             _gui_kick(ctrl, "play", source)
             return True
 
+    class QueueDrop(NSView):
+        """The queue pane enqueues a drop. It does not start playback."""
+
+        def draggingEntered_(self, _info):
+            return NSDragOperationCopy
+
+        def draggingUpdated_(self, _info):
+            return NSDragOperationCopy
+
+        def prepareForDragOperation_(self, _info):
+            return True
+
+        def performDragOperation_(self, info):
+            names = info.draggingPasteboard().propertyListForType_(NSFilenamesPboardType) or []
+            added = False
+            for name in names:
+                source = media_path_candidate(str(name))
+                if source:
+                    _gui_playlist_put(self.ctrl, source)
+                    added = True
+            if added:
+                self.ctrl.note.setStringValue_("대기열에 넣었습니다.")
+            return added
+
     class Controller(NSObject):
         def init(self):
             self = objc.super(Controller, self).init()
@@ -888,7 +964,7 @@ def main() -> int:
             # Phone-width browser on the left; the deck queue on the right.
             PAD = 10
             PHONE_W = 390
-            SIDE_W = 340
+            SIDE_W = 360
             SIDE_GAP = 12
             W = PAD + PHONE_W + SIDE_GAP + SIDE_W + PAD
             H = 780
@@ -959,66 +1035,112 @@ def main() -> int:
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
             SIDE_X = PAD + PHONE_W + SIDE_GAP
-            heading = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 22, SIDE_W, 18))
+            pane = QueueDrop.alloc().initWithFrame_(NSMakeRect(SIDE_X, WEB_Y, SIDE_W, H - WEB_Y))
+            pane.ctrl = self
+            pane.registerForDraggedTypes_([NSFilenamesPboardType])
+            pane.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
+            view.addSubview_(pane)
+            heading = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 20, SIDE_W, 16))
             heading.setEditable_(False)
             heading.setBezeled_(False)
             heading.setDrawsBackground_(False)
-            heading.setFont_(NSFont.boldSystemFontOfSize_(12))
-            heading.setStringValue_("덱에서 재생 중")
+            heading.setFont_(NSFont.boldSystemFontOfSize_(11))
+            heading.setTextColor_(NSColor.secondaryLabelColor())
+            heading.setStringValue_("지금 재생")
             heading.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
             view.addSubview_(heading)
-            self.now_field = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 46, SIDE_W, 22))
-            self.now_field.setEditable_(False)
-            self.now_field.setBezeled_(True)
-            self.now_field.setFont_(NSFont.systemFontOfSize_(12))
-            self.now_field.setStringValue_(playlist_label(deck_now_playing()) or "없음")
-            self.now_field.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
-            view.addSubview_(self.now_field)
-            queue_head = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 68, SIDE_W, 18))
-            queue_head.setEditable_(False)
-            queue_head.setBezeled_(False)
-            queue_head.setDrawsBackground_(False)
-            queue_head.setFont_(NSFont.boldSystemFontOfSize_(12))
-            queue_head.setStringValue_("플레이리스트")
-            queue_head.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
-            view.addSubview_(queue_head)
+            self.now_title = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 42, SIDE_W, 20))
+            self.now_title.setEditable_(False)
+            self.now_title.setBezeled_(False)
+            self.now_title.setDrawsBackground_(False)
+            self.now_title.setFont_(NSFont.boldSystemFontOfSize_(13))
+            self.now_title.setStringValue_("재생 중인 영상이 없습니다")
+            self.now_title.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            view.addSubview_(self.now_title)
+            self.now_channel = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 58, SIDE_W, 16))
+            self.now_channel.setEditable_(False)
+            self.now_channel.setBezeled_(False)
+            self.now_channel.setDrawsBackground_(False)
+            self.now_channel.setFont_(NSFont.labelFontOfSize_(11))
+            self.now_channel.setTextColor_(NSColor.secondaryLabelColor())
+            self.now_channel.setStringValue_("페이지에서 추가하거나 파일을 놓으십시오")
+            self.now_channel.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            view.addSubview_(self.now_channel)
+            self.queue_head = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 80, SIDE_W, 16))
+            self.queue_head.setEditable_(False)
+            self.queue_head.setBezeled_(False)
+            self.queue_head.setDrawsBackground_(False)
+            self.queue_head.setFont_(NSFont.boldSystemFontOfSize_(11))
+            self.queue_head.setTextColor_(NSColor.secondaryLabelColor())
+            self.queue_head.setStringValue_("대기열")
+            self.queue_head.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            view.addSubview_(self.queue_head)
             BTN_H = 28
             table_y = WEB_Y + BTN_H + 8
-            table_h = max(80, (H - 74) - table_y)
+            table_h = max(80, (H - 86) - table_y)
             scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(SIDE_X, table_y, SIDE_W, table_h))
             scroll.setHasVerticalScroller_(True)
             scroll.setBorderType_(NSBezelBorder)
             scroll.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
             self.playlist_table = NSTableView.alloc().initWithFrame_(scroll.contentView().bounds())
-            col = NSTableColumn.alloc().initWithIdentifier_("source")
-            col.setWidth_(SIDE_W - 24)
-            col.setEditable_(False)
-            self.playlist_table.addTableColumn_(col)
+            title_col = NSTableColumn.alloc().initWithIdentifier_("title")
+            title_col.setWidth_(SIDE_W - 120)
+            title_col.setEditable_(False)
+            chan_col = NSTableColumn.alloc().initWithIdentifier_("channel")
+            chan_col.setWidth_(96)
+            chan_col.setEditable_(False)
+            self.playlist_table.addTableColumn_(title_col)
+            self.playlist_table.addTableColumn_(chan_col)
             self.playlist_table.setHeaderView_(None)
+            self.playlist_table.setRowHeight_(36)
+            self.playlist_table.setUsesAlternatingRowBackgroundColors_(True)
             self.playlist_table.setDataSource_(self)
             self.playlist_table.setDelegate_(self)
             self.playlist_table.setAllowsEmptySelection_(True)
+            self.playlist_table.setAllowsMultipleSelection_(False)
+            self.playlist_table.setTarget_(self)
+            self.playlist_table.setDoubleAction_("playSelected:")
+            self.playlist_table.registerForDraggedTypes_(["ghostdeck.playlist.row", NSFilenamesPboardType])
+            self.playlist_table.setDraggingSourceOperationMask_forLocal_(NSDragOperationMove, True)
             scroll.setDocumentView_(self.playlist_table)
             view.addSubview_(scroll)
-            add_w, play_w, del_w, bgap = 88, 88, 72, 8
-            self.add_btn = NSButton.alloc().initWithFrame_(NSMakeRect(SIDE_X, WEB_Y, add_w, BTN_H))
-            self.add_btn.setTitle_("＋ 추가")
+            bgap = 6
+            self.add_btn = NSButton.alloc().initWithFrame_(NSMakeRect(SIDE_X, WEB_Y, 72, BTN_H))
+            self.add_btn.setTitle_("＋ 넣기")
             self.add_btn.setBezelStyle_(NSBezelStyleRounded)
             self.add_btn.setTarget_(self)
             self.add_btn.setAction_("addToPlaylist:")
             self.add_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
             view.addSubview_(self.add_btn)
             self.row_play_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + add_w + bgap, WEB_Y, play_w, BTN_H)
+                NSMakeRect(SIDE_X + 72 + bgap, WEB_Y, 56, BTN_H)
             )
-            self.row_play_btn.setTitle_("▶ 이 항목")
+            self.row_play_btn.setTitle_("재생")
             self.row_play_btn.setBezelStyle_(NSBezelStyleRounded)
             self.row_play_btn.setTarget_(self)
             self.row_play_btn.setAction_("playSelected:")
             self.row_play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
             view.addSubview_(self.row_play_btn)
+            self.up_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + 134, WEB_Y, 32, BTN_H)
+            )
+            self.up_btn.setTitle_("↑")
+            self.up_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.up_btn.setTarget_(self)
+            self.up_btn.setAction_("moveUp:")
+            self.up_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.up_btn)
+            self.down_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + 172, WEB_Y, 32, BTN_H)
+            )
+            self.down_btn.setTitle_("↓")
+            self.down_btn.setBezelStyle_(NSBezelStyleRounded)
+            self.down_btn.setTarget_(self)
+            self.down_btn.setAction_("moveDown:")
+            self.down_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.down_btn)
             self.del_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + add_w + bgap + play_w + bgap, WEB_Y, del_w, BTN_H)
+                NSMakeRect(SIDE_X + SIDE_W - 52, WEB_Y, 52, BTN_H)
             )
             self.del_btn.setTitle_("삭제")
             self.del_btn.setBezelStyle_(NSBezelStyleRounded)
@@ -1026,6 +1148,7 @@ def main() -> int:
             self.del_btn.setAction_("removeSelected:")
             self.del_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
             view.addSubview_(self.del_btn)
+            _gui_playlist_draw(self)
 
             back = NSButton.alloc().initWithFrame_(NSMakeRect(10, BAR_Y, 32, BAR_H))
             back.setTitle_("‹")
@@ -1212,7 +1335,6 @@ def main() -> int:
                     return
                 ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
 
-            # Resume first, then read the current URL: a paused video is the normal state after 정지.
             self.web.evaluateJavaScript_completionHandler_(
                 "document.querySelectorAll('video').forEach(function(v){ if (v.paused) v.play().catch(function(){}); });"
                 " (window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href)",
@@ -1242,15 +1364,76 @@ def main() -> int:
         def numberOfRowsInTableView_(self, _table):
             return len(getattr(self, "playlist", []))
 
-        def tableView_objectValueForTableColumn_row_(self, _table, _col, row):
+        def tableView_objectValueForTableColumn_row_(self, _table, col, row):
             items = getattr(self, "playlist", [])
             if row < 0 or row >= len(items):
                 return ""
-            name = playlist_label(items[row])
-            return ("▶ " + name) if playlist_source(items[row]) == deck_now_playing() else name
+            item = items[row]
+            ident = str(col.identifier()) if col is not None else "title"
+            if ident == "channel":
+                return playlist_subtitle(item)
+            title = playlist_title(item)
+            return ("▶ " + title) if playlist_source(item) == deck_now_playing() else title
 
         def tableView_shouldEditTableColumn_row_(self, _table, _col, _row):
             return False
+
+        def tableView_writeRowsWithIndexes_toPasteboard_(self, _table, indexes, pboard):
+            row = int(indexes.firstIndex())
+            pboard.declareTypes_owner_(["ghostdeck.playlist.row"], None)
+            pboard.setString_forType_(str(row), "ghostdeck.playlist.row")
+            return True
+
+        def tableView_validateDrop_proposedRow_proposedDropOperation_(self, table, info, row, _op):
+            types = list(info.draggingPasteboard().types() or [])
+            if "ghostdeck.playlist.row" in types or NSFilenamesPboardType in types:
+                table.setDropRow_dropOperation_(row, 1)
+                return NSDragOperationMove if "ghostdeck.playlist.row" in types else NSDragOperationCopy
+            return 0
+
+        def tableView_acceptDrop_row_dropOperation_(self, _table, info, row, _op):
+            pboard = info.draggingPasteboard()
+            names = pboard.propertyListForType_(NSFilenamesPboardType) or []
+            if names:
+                for name in names:
+                    source = media_path_candidate(str(name))
+                    if source:
+                        _gui_playlist_put(self, source)
+                return True
+            raw = pboard.stringForType_("ghostdeck.playlist.row")
+            if raw is None or str(raw).strip() == "":
+                return False
+            src = int(str(raw).strip())
+            dst = row
+            if src < dst:
+                dst -= 1
+            self.playlist = playlist_move(getattr(self, "playlist", []), src, dst)
+            playlist_save(PLAYLIST_PATH, self.playlist)
+            _gui_playlist_draw(self)
+            return True
+
+        def moveUp_(self, _sender):
+            row = int(self.playlist_table.selectedRow())
+            if row <= 0:
+                return
+            self.playlist = playlist_move(getattr(self, "playlist", []), row, row - 1)
+            playlist_save(PLAYLIST_PATH, self.playlist)
+            _gui_playlist_draw(self)
+            self.playlist_table.selectRowIndexes_byExtendingSelection_(
+                NSIndexSet.indexSetWithIndex_(row - 1), False
+            )
+
+        def moveDown_(self, _sender):
+            row = int(self.playlist_table.selectedRow())
+            items = getattr(self, "playlist", [])
+            if row < 0 or row >= len(items) - 1:
+                return
+            self.playlist = playlist_move(items, row, row + 1)
+            playlist_save(PLAYLIST_PATH, self.playlist)
+            _gui_playlist_draw(self)
+            self.playlist_table.selectRowIndexes_byExtendingSelection_(
+                NSIndexSet.indexSetWithIndex_(row + 1), False
+            )
 
         def addToPlaylist_(self, _sender):
             ctrl = self

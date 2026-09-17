@@ -36,6 +36,9 @@ from ghostdeck.app import (
     deck_now_playing,
     playlist_entry,
     playlist_source,
+    playlist_move,
+    playlist_title,
+    playlist_subtitle,
     source_identity,
     playable_source,
     should_start_play,
@@ -508,3 +511,19 @@ def test_file_identity_falls_back_to_the_stem():
 
     title, channel = source_identity("/tmp/clips/iris.mp4", probe=probe)
     assert (title, channel) == ("iris", "")
+
+
+def test_playlist_title_and_channel_are_separate_lines():
+    item = {"source": "https://www.youtube.com/watch?v=x",
+            "title": "Never Gonna Give You Up", "channel": "Rick Astley"}
+    assert playlist_title(item) == "Never Gonna Give You Up"
+    assert playlist_subtitle(item) == "Rick Astley"
+    assert playlist_title("/tmp/clips/iris.mp4") == "iris"
+
+
+def test_playlist_move_reorders_rows():
+    items = playlist_add(playlist_add([], "/tmp/a.mp4"), "/tmp/b.mp4")
+    items = playlist_add(items, "/tmp/c.mp4")
+    moved = playlist_move(items, 0, 2)
+    assert [playlist_source(item) for item in moved] == ["/tmp/b.mp4", "/tmp/c.mp4", "/tmp/a.mp4"]
+    assert playlist_move(items, 9, 0) == items
