@@ -543,7 +543,7 @@ class VideoStream:
         while not self.state.ready:
             self.wait(deadline)
 
-    def produce(self, source, encoder):
+    def produce(self, source, encoder, loop=False):
         """Never request a fill-sized buffered read; pause the framer at each JPEG."""
         pump = source
         while True:
@@ -574,6 +574,8 @@ class VideoStream:
                         self.receive_available()
                 if encoder.returncode:
                     raise RuntimeError("ffmpeg encoder failed")
+                if loop:
+                    raise SeekRequested(0.0)
                 self.send(wire.EOS, struct.pack('>Q', self.state.received), self.progress_deadline)
                 deadline = time.monotonic() + self.drain_timeout
                 while not self.state.terminal:
@@ -713,6 +715,8 @@ def build_encoder_command(args, video, audio, filters):
             "-c:a", "pcm_s16le",
             "-f", "audiotoolbox", "dummy",
         ])
+        if separate:
+            command.append("-shortest")
     else:
         command.append("-an")
     return command
@@ -746,7 +750,7 @@ def _input_flags(command, url, args, realtime=False):
         ])
     if realtime:
         command.append("-re")
-    if args.loop:
+    if args.loop and not str(url).startswith(("http://", "https://")):
         command.extend(["-stream_loop", "-1"])
     if args.start:
         command.extend(["-ss", str(args.start)])
@@ -912,7 +916,7 @@ def main():
         threading.Thread(target=playhead_loop, daemon=True).start()
         while True:
             try:
-                total = stream.produce(pump, encoder)
+                total = stream.produce(pump, encoder, loop=args.loop)
                 break
             except SeekRequested as seek:
                 args.start = seek.start
@@ -921,6 +925,11 @@ def main():
                 diagnostics.milestones["firstConsumedReceipt"] = None
                 state["playheadAt"] = time.time()
                 stop_encoder(encoder, harsh=True)
+                if args.input.startswith(("http://", "https://")):
+                    video, audio = resolve_media_urls(args.input)
+                    source = video
+                    if args.no_audio:
+                        audio = None
                 command = build_encoder_command(args, source, audio, filters)
                 encoder = subprocess.Popen(
                     command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,

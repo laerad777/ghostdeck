@@ -131,3 +131,14 @@ def test_host_audio_is_in_the_same_realtime_ffmpeg():
     assert "-an" in silent
     assert "audiotoolbox" not in silent
     assert "-re" in silent
+def test_http_loop_restarts_instead_of_stream_loop():
+    play = _play()
+    args = type("Args", (), {"loop": True, "start": 0, "duration": 0, "quality": 12})()
+    command = play.build_encoder_command(
+        args, "https://v.example/video", "https://v.example/audio", "fps=30,scale=960:540",
+    )
+    assert "-stream_loop" not in command
+    assert "-shortest" in command
+    local = play.build_encoder_command(args, "/tmp/clip.mp4", "/tmp/clip.mp4", "fps=30,scale=960:540")
+    assert local.count("-stream_loop") == 1
+    assert "-shortest" not in local
