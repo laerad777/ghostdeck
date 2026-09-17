@@ -32,6 +32,11 @@ from ghostdeck.app import (
     youtube_playlist_page,
     youtube_playlist_entries,
     playlist_advance,
+    playlist_next,
+    playlist_prev,
+    repeat_label,
+    player_prefs_load,
+    player_prefs_save,
     playlist_label,
     playlist_load,
     playlist_remove,
@@ -473,8 +478,10 @@ def test_playlist_advance_plays_through_then_stops():
 
 
 def test_a_queue_does_not_loop_a_file():
-    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4"]) is True
-    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4", "/tmp/b.mp4"]) is False
+    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4"]) is False
+    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4"], repeat="one") is True
+    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4"], repeat="all") is True
+    assert playlist_should_loop("/tmp/a.mp4", ["/tmp/a.mp4", "/tmp/b.mp4"], repeat="all") is False
     assert playlist_should_loop("https://www.youtube.com/watch?v=x", []) is False
 
 
@@ -657,3 +664,27 @@ def test_youtube_duration_is_not_probed_with_yt_dlp():
         raise AssertionError("yt-dlp must not run for a watch URL")
 
     assert source_duration("https://www.youtube.com/watch?v=x", probe=probe) == 0.0
+def test_playlist_next_respects_repeat_and_shuffle():
+    items = playlist_add(playlist_add([], "/tmp/a.mp4"), "/tmp/b.mp4")
+    items = playlist_add(items, "/tmp/c.mp4")
+    assert playlist_next(items, "/tmp/b.mp4") == "/tmp/c.mp4"
+    assert playlist_next(items, "/tmp/c.mp4") == ""
+    assert playlist_next(items, "/tmp/c.mp4", repeat="all") == "/tmp/a.mp4"
+    assert playlist_next(items, "/tmp/b.mp4", repeat="one") == "/tmp/b.mp4"
+    class Rng:
+        def choice(self, pool):
+            assert "/tmp/b.mp4" not in pool
+            return pool[0]
+    assert playlist_next(items, "/tmp/b.mp4", shuffle=True, rng=Rng()) == "/tmp/a.mp4"
+    assert playlist_prev(items, "/tmp/b.mp4") == "/tmp/a.mp4"
+    assert playlist_prev(items, "/tmp/a.mp4", repeat="all") == "/tmp/c.mp4"
+    assert repeat_label("all") == "전체"
+    assert repeat_label("one") == "한곡"
+    assert repeat_label("off") == "반복"
+
+
+def test_player_prefs_roundtrip(tmp_path):
+    path = tmp_path / "player.json"
+    player_prefs_save(path, {"repeat": "one", "shuffle": True})
+    assert player_prefs_load(path) == {"repeat": "one", "shuffle": True}
+    assert player_prefs_load(tmp_path / "gone.json") == {"repeat": "off", "shuffle": False}

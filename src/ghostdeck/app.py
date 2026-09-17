@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -35,6 +36,8 @@ _YT_HOSTS = {
 _MEDIA_SUFFIXES = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")
 HOST_STATE = Path("/tmp/d200-color-host.json")
 PLAYLIST_PATH = Path.home() / ".ghostdeck" / "playlist.json"
+PLAYER_PATH = Path.home() / ".ghostdeck" / "player.json"
+_REPEAT_MODES = ("off", "all", "one")
 
 
 @dataclass(frozen=True)
@@ -331,25 +334,89 @@ def playlist_remove(items, index: int) -> list[dict[str, str]]:
     return out
 
 
-def playlist_advance(items, current: str) -> str:
-    """The next queued source after `current`, or empty at the end."""
-    items = playlist_normalize(items)
+def playlist_next(items, current: str, *, repeat: str = "off", shuffle: bool = False, rng=None) -> str:
+    """The next source to play. Empty means stop."""
+    sources = [playlist_source(item) for item in playlist_normalize(items)]
     current = (current or "").strip()
-    sources = [playlist_source(item) for item in items]
     if not sources:
         return ""
-    if current in sources:
-        nxt = sources.index(current) + 1
-        return sources[nxt] if nxt < len(sources) else ""
+    if repeat == "one" and current in sources:
+        return current
+    if shuffle:
+        pick = rng.choice if rng is not None else random.choice
+        pool = [src for src in sources if src != current]
+        if pool:
+            return pick(pool)
+        return sources[0] if repeat == "all" else ""
+    if current not in sources:
+        return sources[0]
+    nxt = sources.index(current) + 1
+    if nxt < len(sources):
+        return sources[nxt]
+    if repeat == "all":
+        return sources[0]
+    return ""
+
+
+def playlist_prev(items, current: str, *, repeat: str = "off", shuffle: bool = False, rng=None) -> str:
+    """The previous source. Shuffle picks another track."""
+    sources = [playlist_source(item) for item in playlist_normalize(items)]
+    current = (current or "").strip()
+    if not sources:
+        return ""
+    if shuffle:
+        return playlist_next(
+            items, current, repeat="all" if repeat != "off" else "off", shuffle=True, rng=rng
+        )
+    if current not in sources:
+        return sources[-1]
+    idx = sources.index(current)
+    if idx > 0:
+        return sources[idx - 1]
+    if repeat == "all":
+        return sources[-1]
     return sources[0]
 
 
-def playlist_should_loop(source: str, items) -> bool:
-    """A queue plays through. A single file still loops (CLI default)."""
-    items = playlist_normalize(items)
-    if len(items) > 1:
-        return False
-    return play_should_loop(source)
+def playlist_advance(items, current: str) -> str:
+    """The next queued source after `current`, or empty at the end."""
+    return playlist_next(items, current, repeat="off", shuffle=False)
+
+
+def playlist_should_loop(source: str, items, repeat: str = "off") -> bool:
+    """Whether the player process itself loops. Queue wrap is `playlist_next`."""
+    if repeat == "one":
+        return True
+    n = len(playlist_normalize(items))
+    if repeat == "all" and n <= 1:
+        return True
+    return False
+
+
+def repeat_label(repeat: str) -> str:
+    return {"all": "전체", "one": "한곡"}.get(repeat, "반복")
+
+
+def player_prefs_load(path: Path = PLAYER_PATH) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    repeat = str(data.get("repeat") or "off")
+    if repeat not in _REPEAT_MODES:
+        repeat = "off"
+    return {"repeat": repeat, "shuffle": bool(data.get("shuffle"))}
+
+
+def player_prefs_save(path: Path, prefs) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    repeat = str((prefs or {}).get("repeat") or "off")
+    if repeat not in _REPEAT_MODES:
+        repeat = "off"
+    payload = {"repeat": repeat, "shuffle": bool((prefs or {}).get("shuffle"))}
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
 def playlist_find(items, source: str) -> dict[str, str]:
@@ -1105,7 +1172,11 @@ def main() -> int:
                 pasteboard,
                 lambda r, e: AppHelper.callAfter(lambda: _gui_apply(ctrl, r, e)),
                 play_offset(start),
-                playlist_should_loop(source, getattr(ctrl, "playlist", [])) if op == "play" else loop,
+                playlist_should_loop(
+                    source,
+                    getattr(ctrl, "playlist", []),
+                    getattr(ctrl, "repeat", "off"),
+                ) if op == "play" else loop,
             ),
             daemon=True,
         )
@@ -1197,6 +1268,19 @@ def main() -> int:
         if field is not None:
             field.setStringValue_(playlist_label(found) if now else "없음")
         _gui_playhead_draw(ctrl)
+        _gui_mode_draw(ctrl)
+
+    def _gui_mode_draw(ctrl) -> None:
+        shuffle_btn = getattr(ctrl, "shuffle_btn", None)
+        if shuffle_btn is not None:
+            on = bool(getattr(ctrl, "shuffle", False))
+            shuffle_btn.setTitle_("셔플")
+            _pill(shuffle_btn, LIME if on else CARD, INK if on else SNOW)
+        repeat_btn = getattr(ctrl, "repeat_btn", None)
+        if repeat_btn is not None:
+            mode = getattr(ctrl, "repeat", "off")
+            repeat_btn.setTitle_(repeat_label(mode))
+            _pill(repeat_btn, LIME if mode != "off" else CARD, INK if mode != "off" else SNOW)
 
     def _gui_playhead_draw(ctrl) -> None:
         bar = getattr(ctrl, "seek_bar", None)
@@ -1271,9 +1355,11 @@ def main() -> int:
             ctrl.was_playing = True
             return
         if was and not getattr(ctrl, "user_stopped", False) and not ctrl.busy:
-            nxt = playlist_advance(
+            nxt = playlist_next(
                 getattr(ctrl, "playlist", []),
                 getattr(ctrl, "seen_watch", "") or now,
+                repeat=getattr(ctrl, "repeat", "off"),
+                shuffle=getattr(ctrl, "shuffle", False),
             )
             ctrl.was_playing = False
             if nxt:
@@ -1360,6 +1446,9 @@ def main() -> int:
             self.pending_start = 0.0
             self.seen_watch = ""
             self.playlist = playlist_load(PLAYLIST_PATH)
+            prefs = player_prefs_load()
+            self.repeat = prefs["repeat"]
+            self.shuffle = prefs["shuffle"]
             self.was_playing = False
             self.user_stopped = False
             self.media_duration = 0.0
@@ -1559,28 +1648,27 @@ def main() -> int:
             )
             view.addSubview_(self.now_channel)
 
-            self.play_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 120, 150, 32)
-            )
-            self.play_btn.setTitle_("▶   덱 재생")
-            self.play_btn.setFont_(NSFont.boldSystemFontOfSize_(12))
-            _pill(self.play_btn, LIME, INK)
-            self.play_btn.setTarget_(self)
-            self.play_btn.setAction_("play:")
+            def tbtn(x, w, title, action, fill=CARD, ink=SNOW):
+                btn = NSButton.alloc().initWithFrame_(
+                    NSMakeRect(x, PHONE_Y + QUEUE_H - 120, w, 32)
+                )
+                btn.setTitle_(title)
+                btn.setFont_(NSFont.boldSystemFontOfSize_(12))
+                _pill(btn, fill, ink)
+                btn.setTarget_(self)
+                btn.setAction_(action)
+                btn.setAutoresizingMask_(stick_top)
+                view.addSubview_(btn)
+                return btn
+
+            self.prev_btn = tbtn(SIDE_X + 18, 32, "⏮", "prevTrack:")
+            self.play_btn = tbtn(SIDE_X + 54, 100, "▶  재생", "play:", LIME, INK)
             self.play_btn.setKeyEquivalent_("\r")
-            self.play_btn.setAutoresizingMask_(stick_top)
-            view.addSubview_(self.play_btn)
-            self.stop_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + 176, PHONE_Y + QUEUE_H - 120, 72, 32)
-            )
-            self.stop_btn.setTitle_("■  정지")
-            self.stop_btn.setFont_(NSFont.boldSystemFontOfSize_(12))
-            _pill(self.stop_btn, CARD, SNOW)
-            self.stop_btn.setTarget_(self)
-            self.stop_btn.setAction_("stop:")
+            self.stop_btn = tbtn(SIDE_X + 158, 52, "■", "stop:")
             self.stop_btn.setKeyEquivalent_("\x1b")
-            self.stop_btn.setAutoresizingMask_(stick_top)
-            view.addSubview_(self.stop_btn)
+            self.next_btn = tbtn(SIDE_X + 214, 32, "⏭", "nextTrack:")
+            self.shuffle_btn = tbtn(SIDE_X + 250, 44, "셔플", "toggleShuffle:")
+            self.repeat_btn = tbtn(SIDE_X + 298, 52, "반복", "cycleRepeat:")
             self.elapsed_lab = _label(
                 NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 146, 64, 14),
                 "0:00", 10, False, GHOST, stick_top,
@@ -1837,6 +1925,49 @@ def main() -> int:
             self.web.evaluateJavaScript_completionHandler_(js, lambda *_a: None)
             _gui_kick(self, "play", source, start=at)
             self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
+        def prevTrack_(self, _sender):
+            now = deck_now_playing() or getattr(self, "seen_watch", "")
+            nxt = playlist_prev(
+                getattr(self, "playlist", []),
+                now,
+                repeat=getattr(self, "repeat", "off"),
+                shuffle=getattr(self, "shuffle", False),
+            )
+            if not nxt:
+                self.note.setStringValue_("이전 곡이 없습니다.")
+                return
+            self.user_stopped = False
+            _gui_kick(self, "play", nxt)
+
+        def nextTrack_(self, _sender):
+            now = deck_now_playing() or getattr(self, "seen_watch", "")
+            nxt = playlist_next(
+                getattr(self, "playlist", []),
+                now,
+                repeat="all" if getattr(self, "repeat", "off") == "off" else getattr(self, "repeat", "off"),
+                shuffle=getattr(self, "shuffle", False),
+            )
+            if not nxt:
+                self.note.setStringValue_("다음 곡이 없습니다.")
+                return
+            self.user_stopped = False
+            _gui_kick(self, "play", nxt)
+
+        def toggleShuffle_(self, _sender):
+            self.shuffle = not bool(getattr(self, "shuffle", False))
+            player_prefs_save(
+                PLAYER_PATH, {"repeat": getattr(self, "repeat", "off"), "shuffle": self.shuffle}
+            )
+            _gui_mode_draw(self)
+
+        def cycleRepeat_(self, _sender):
+            modes = list(_REPEAT_MODES)
+            cur = getattr(self, "repeat", "off")
+            self.repeat = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else "off"
+            player_prefs_save(
+                PLAYER_PATH, {"repeat": self.repeat, "shuffle": getattr(self, "shuffle", False)}
+            )
+            _gui_mode_draw(self)
 
         def numberOfRowsInTableView_(self, _table):
             return len(getattr(self, "playlist", []))
