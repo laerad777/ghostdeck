@@ -233,6 +233,15 @@ def test_gui_play_passes_start_and_does_not_loop():
         "15.200",
         "--no-loop",
     ]
+def test_a_resume_skips_the_status_probe():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        return CommandResult(argv, 0, "", "")
+
+    DeckRemote(run).play("/tmp/clip.mp4", start=12.0, crop="none")
+    assert calls == [["play", "/tmp/clip.mp4", "--start", "12.000", "--crop", "none"]]
 
 
 def test_empty_field_plays_a_copied_url():

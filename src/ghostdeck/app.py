@@ -963,12 +963,14 @@ class DeckRemote:
         if not source:
             return [CommandResult(["play"], 2, "", "유튜브에서 영상을 열거나 파일을 연 다음 재생을 누르십시오")]
         results: list[CommandResult] = []
-        st = self._run(["status"])
-        results.append(st)
-        if not shim_is_up(st.stdout):
-            results.append(self._run(["studio"]))
-            if results[-1].code != 0:
-                return results
+        resume = start > 0 or (crop and crop != "auto")
+        if not resume:
+            st = self._run(["status"])
+            results.append(st)
+            if not shim_is_up(st.stdout):
+                results.append(self._run(["studio"]))
+                if results[-1].code != 0:
+                    return results
         argv = ["play", source]
         start = play_offset(start)
         if start > 0:
@@ -2059,11 +2061,13 @@ def main() -> int:
             )
             if source:
                 start = 0.0
+                crop = "auto"
                 if playlist_identity(source) == playlist_identity(getattr(self, "resume_source", "")):
                     start = play_offset(getattr(self, "resume_pos", 0.0))
+                    crop = "none"
                 self.resume_pos = 0.0
                 self.user_stopped = False
-                _gui_kick(self, "play", source, start=start)
+                _gui_kick(self, "play", source, start=start, crop=crop)
                 return
             ctrl = self
             field = str(self.url_field.stringValue() or "")

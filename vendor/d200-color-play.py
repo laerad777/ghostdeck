@@ -34,8 +34,8 @@ BRIDGE_SOCKET = Path("/tmp/d200-adb-bridge.sock")
 # Keep FRAME records under 12KiB; 14387-byte records stalled at upHave=12288.
 FRAME_JPEG_CHUNK = 12288 - wire.HEADER_SIZE - 16
 UNPROVEN_OPEN = "has not proven it released the deck"
-# Measured: 0s between sessions -> CLEANUP_FAILED; 5s -> healthy (playwait.py).
-OPEN_RETRY_WAIT = 5.0
+# Measured: 0s between sessions -> CLEANUP_FAILED. Stop already waited for release.
+OPEN_RETRY_WAIT = 1.0
 
 
 def align_jpeg_payload(frame):

@@ -167,7 +167,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         print(f"warning: {error}", file=sys.stderr)
     _signal_speakers()
     if predecessor:
-        _session_released(timeout=1.5 if start > 0 else 4.0)
+        _session_released(timeout=1.5)
     abandon_host_session()
     if not VENDOR_PLAY.is_file():
         raise RuntimeError(f"vendor player missing: {VENDOR_PLAY}")
@@ -244,17 +244,19 @@ def stop() -> None:
     # The stock-UI restart in `_cleanup_device()` tears down a live media session, so wait for the
     # player to release first (see `_session_released`). Only a session that was actually playing can
     # be holding the transport, so a stop with nothing playing skips the wait entirely.
-    if session_was_playing and not _session_released():
-        if identity_error is not None:
+    if session_was_playing:
+        wait = 1.5 if keep_gadget else _SESSION_RELEASE_TIMEOUT
+        if not _session_released(timeout=wait):
+            if identity_error is not None:
+                raise RuntimeError(
+                    f"the media session did not release within {wait:.0f}s, so the "
+                    f"stock UI was left alone rather than cut the transport mid-stream; "
+                    f"re-run `ghostdeck stop` (as well as: {identity_error})"
+                )
             raise RuntimeError(
-                f"the media session did not release within {_SESSION_RELEASE_TIMEOUT:.0f}s, so the "
-                f"stock UI was left alone rather than cut the transport mid-stream; "
-                f"re-run `ghostdeck stop` (as well as: {identity_error})"
+                f"the media session did not release within {wait:.0f}s, so the stock "
+                f"UI was left alone rather than cut the transport mid-stream; re-run `ghostdeck stop`"
             )
-        raise RuntimeError(
-            f"the media session did not release within {_SESSION_RELEASE_TIMEOUT:.0f}s, so the stock "
-            f"UI was left alone rather than cut the transport mid-stream; re-run `ghostdeck stop`"
-        )
     if keep_gadget:
         try:
             if not studio.running():
