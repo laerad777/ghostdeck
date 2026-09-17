@@ -445,6 +445,105 @@ def deck_session_active(path: Path = HOST_STATE) -> bool:
     return isinstance(data, dict) and str(data.get("phase") or "") == "active"
 
 
+def format_clock(seconds: float) -> str:
+    """m:ss or h:mm:ss. Junk is 0:00."""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        value = 0.0
+    if not math.isfinite(value) or value < 0:
+        value = 0.0
+    total = int(value)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
+    """(source, seconds, active). Seconds is --start plus time since the first consumed frame."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return "", 0.0, False
+    if not isinstance(data, dict):
+        return "", 0.0, False
+    source = str(data.get("source") or "").strip()
+    start = play_offset(data.get("start"))
+    try:
+        rate = float(data.get("playbackRate") or 1.0)
+    except (TypeError, ValueError):
+        rate = 1.0
+    if not math.isfinite(rate) or rate <= 0:
+        rate = 1.0
+    active = str(data.get("phase") or "") == "active"
+    diag = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
+    started = diag.get("startedMonotonicNs")
+    elapsed = diag.get("hostElapsedNs")
+    first = None
+    milestones = diag.get("milestones")
+    if isinstance(milestones, dict):
+        rec = milestones.get("firstConsumedReceipt")
+        if isinstance(rec, dict):
+            first = rec.get("monotonicNs")
+    pos = start
+    try:
+        if (
+            isinstance(started, (int, float))
+            and isinstance(elapsed, (int, float))
+            and isinstance(first, (int, float))
+        ):
+            now = float(started) + float(elapsed)
+            if now >= float(first):
+                pos = start + (now - float(first)) / 1e9 * rate
+    except (TypeError, ValueError):
+        pos = start
+    if not math.isfinite(pos) or pos < 0:
+        pos = 0.0
+    return source, pos, active
+
+
+def source_duration(source: str, probe=None) -> float:
+    """Length in seconds. 0 if unknown. Never HID."""
+    source = (source or "").strip()
+    if not source:
+        return 0.0
+    runner = subprocess.run if probe is None else probe
+    watch = youtube_watch_url(source)
+    local = media_path_candidate(source)
+    try:
+        if watch:
+            result = runner(
+                ["yt-dlp", "--no-warnings", "--no-playlist", "-O", "duration", watch],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            lines = (result.stdout or "").strip().splitlines()
+            raw = lines[-1] if lines else ""
+        elif local:
+            result = runner(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0", local,
+                ],
+                capture_output=True, text=True, timeout=8, check=False,
+            )
+            raw = (result.stdout or "").strip()
+        else:
+            return 0.0
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    return value
+
+
+
 
 
 def play_request(
@@ -745,6 +844,7 @@ def main() -> int:
             NSObject,
             NSOpenPanel,
             NSScrollView,
+            NSSlider,
             NSTableColumn,
             NSTableView,
             NSBezelBorder,
@@ -926,6 +1026,11 @@ def main() -> int:
             button = getattr(ctrl, name, None)
             if button is not None:
                 button.setEnabled_(not on)
+        bar = getattr(ctrl, "seek_bar", None)
+        if bar is not None:
+            bar.setEnabled_(
+                (not on) and float(getattr(ctrl, "media_duration", 0) or 0) > 0
+            )
 
     def _gui_apply(ctrl, results, error) -> None:
         _gui_set_busy(ctrl, False)
@@ -1081,6 +1186,47 @@ def main() -> int:
         field = getattr(ctrl, "now_field", None)
         if field is not None:
             field.setStringValue_(playlist_label(found) if now else "없음")
+        _gui_playhead_draw(ctrl)
+
+    def _gui_playhead_draw(ctrl) -> None:
+        bar = getattr(ctrl, "seek_bar", None)
+        elapsed = getattr(ctrl, "elapsed_lab", None)
+        remain = getattr(ctrl, "remain_lab", None)
+        source, pos, _active = deck_playhead()
+        if source and source != getattr(ctrl, "duration_for", ""):
+            ctrl.duration_for = source
+            ctrl.media_duration = 0.0
+            if not getattr(ctrl, "duration_busy", False):
+                ctrl.duration_busy = True
+
+                def fill():
+                    value = source_duration(source)
+
+                    def apply():
+                        ctrl.duration_busy = False
+                        if getattr(ctrl, "duration_for", "") == source:
+                            ctrl.media_duration = value
+                        _gui_playhead_draw(ctrl)
+
+                    AppHelper.callAfter(apply)
+
+                threading.Thread(target=fill, daemon=True).start()
+        duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
+        if duration > 0 and pos > duration:
+            pos = duration
+        if elapsed is not None:
+            elapsed.setStringValue_(format_clock(pos) if source else "0:00")
+        if remain is not None:
+            remain.setStringValue_(format_clock(duration) if duration else "--:--")
+        if bar is None:
+            return
+        if duration <= 0:
+            bar.setEnabled_(False)
+            bar.setDoubleValue_(0.0)
+            return
+        bar.setMaxValue_(duration)
+        bar.setDoubleValue_(pos)
+        bar.setEnabled_(not getattr(ctrl, "busy", False))
 
     def _gui_sync_deck(ctrl, playing: bool) -> None:
         now = deck_now_playing()
@@ -1161,6 +1307,9 @@ def main() -> int:
             self.playlist = playlist_load(PLAYLIST_PATH)
             self.was_playing = False
             self.user_stopped = False
+            self.media_duration = 0.0
+            self.duration_for = ""
+            self.duration_busy = False
             # Dark shell: phone column + frosted queue.
             PAD = 20
             PHONE_W = 392
@@ -1376,16 +1525,39 @@ def main() -> int:
             self.stop_btn.setKeyEquivalent_("\x1b")
             self.stop_btn.setAutoresizingMask_(stick_top)
             view.addSubview_(self.stop_btn)
+            self.elapsed_lab = _label(
+                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 146, 64, 14),
+                "0:00", 10, False, GHOST, stick_top,
+            )
+            view.addSubview_(self.elapsed_lab)
+            self.remain_lab = _label(
+                NSMakeRect(SIDE_X + SIDE_W - 82, PHONE_Y + QUEUE_H - 146, 64, 14),
+                "--:--", 10, False, GHOST, stick_top,
+            )
+            self.remain_lab.setAlignment_(2)
+            view.addSubview_(self.remain_lab)
+            self.seek_bar = NSSlider.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 168, SIDE_W - 36, 18)
+            )
+            self.seek_bar.setMinValue_(0.0)
+            self.seek_bar.setMaxValue_(1.0)
+            self.seek_bar.setDoubleValue_(0.0)
+            self.seek_bar.setContinuous_(False)
+            self.seek_bar.setEnabled_(False)
+            self.seek_bar.setTarget_(self)
+            self.seek_bar.setAction_("seek:")
+            self.seek_bar.setAutoresizingMask_(stick_top)
+            view.addSubview_(self.seek_bar)
 
             self.queue_head = _label(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 150, SIDE_W - 36, 14),
+                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 188, SIDE_W - 36, 14),
                 "대기열", 10, True, GHOST, stick_top,
             )
             view.addSubview_(self.queue_head)
 
             BTN_H = 28
             table_y = PHONE_Y + 46
-            table_h = max(80, (PHONE_Y + QUEUE_H - 162) - table_y)
+            table_h = max(80, (PHONE_Y + QUEUE_H - 200) - table_y)
             scroll = NSScrollView.alloc().initWithFrame_(
                 NSMakeRect(SIDE_X + 10, table_y, SIDE_W - 20, table_h)
             )
@@ -1483,6 +1655,9 @@ def main() -> int:
             self.window.makeKeyAndOrderFront_(None)
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 2.0, self, "poll:", None, True
+            )
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.4, self, "tickPlayhead:", None, True
             )
             AppHelper.callAfter(lambda: _gui_kick(self, "status", ""))
             return self
@@ -1582,6 +1757,24 @@ def main() -> int:
         def poll_(self, _timer):
             if not self.busy:
                 _gui_kick(self, "status", "")
+
+        def tickPlayhead_(self, _timer):
+            _gui_playhead_draw(self)
+
+        def seek_(self, sender):
+            duration = float(getattr(self, "media_duration", 0.0) or 0.0)
+            if duration <= 0:
+                return
+            at = play_offset(sender.doubleValue())
+            if at > duration:
+                at = duration
+            source = deck_now_playing() or getattr(self, "seen_watch", "")
+            if not source:
+                self.note.setStringValue_("재생 중인 영상이 없습니다.")
+                return
+            self.user_stopped = False
+            _gui_kick(self, "play", source, start=at)
+            self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
 
         def numberOfRowsInTableView_(self, _table):
             return len(getattr(self, "playlist", []))

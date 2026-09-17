@@ -39,6 +39,9 @@ from ghostdeck.app import (
     playlist_should_loop,
     deck_now_playing,
     deck_session_active,
+    deck_playhead,
+    format_clock,
+    source_duration,
     playlist_entry,
     playlist_source,
     playlist_move,
@@ -596,3 +599,47 @@ def test_opening_a_playlist_page_does_not_stop_the_deck():
     watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     page = "https://www.youtube.com/playlist?list=PLabc"
     assert page_follow_action(watch, page) == (watch, "")
+
+
+def test_format_clock_is_compact():
+    assert format_clock(0) == "0:00"
+    assert format_clock(65) == "1:05"
+    assert format_clock(3661) == "1:01:01"
+    assert format_clock(-3) == "0:00"
+
+
+def test_deck_playhead_adds_elapsed_since_first_frame(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text(
+        json.dumps(
+            {
+                "phase": "active",
+                "source": "/tmp/a.mp4",
+                "start": 12,
+                "playbackRate": 1,
+                "diagnostics": {
+                    "startedMonotonicNs": 1_000_000_000,
+                    "hostElapsedNs": 8_000_000_000,
+                    "milestones": {
+                        "firstConsumedReceipt": {"monotonicNs": 3_000_000_000},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    source, pos, active = deck_playhead(path)
+    assert source == "/tmp/a.mp4"
+    assert active is True
+    assert abs(pos - 18.0) < 0.01
+
+
+def test_source_duration_reads_ffprobe():
+    def probe(argv, **_k):
+        assert argv[0] == "ffprobe"
+        class Result:
+            stdout = "183.4\n"
+        return Result()
+
+    assert source_duration("/tmp/clip.mp4", probe=probe) == 183.4
+    assert source_duration("", probe=probe) == 0.0
