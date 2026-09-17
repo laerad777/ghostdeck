@@ -259,39 +259,38 @@ def drain_bounded(stream, storage, limit=64 * 1024):
         storage.extend(block)
         if len(storage) > limit:
             del storage[:-limit]
-class ChunkPump:
-    """Drain JPEG stdout. Never block ffmpeg: drop oldest if the deck is slow."""
+class FramePump:
+    """Always drain ffmpeg JPEG stdout. Queue complete frames; never drop, never block encode."""
 
-    def __init__(self, raw, max_chunks=64):
-        self._q = queue.Queue(maxsize=max_chunks)
+    def __init__(self, raw):
+        self._q = queue.Queue()
         self._raw = raw
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
+        framer = JpegFramer(max_frame_bytes=MAX_JPEG_BYTES)
         fd = self._raw.fileno()
         try:
             os.set_blocking(fd, True)
         except OSError:
             pass
-        while True:
-            try:
-                block = os.read(fd, 65536)
-            except OSError:
-                block = b""
-            if not block:
-                self._q.put(b"")
-                return
-            try:
-                self._q.put_nowait(block)
-            except queue.Full:
+        try:
+            while True:
                 try:
-                    self._q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._q.put_nowait(block)
-                except queue.Full:
-                    pass
+                    block = os.read(fd, 65536)
+                except OSError:
+                    block = b""
+                if not block:
+                    try:
+                        framer.finish()
+                    except Exception:
+                        pass
+                    self._q.put(None)
+                    return
+                for frame in framer.feed(block):
+                    self._q.put(bytes(frame))
+        except Exception:
+            self._q.put(None)
 
     def get(self, timeout=0.05):
         return self._q.get(timeout=timeout)
@@ -538,8 +537,6 @@ class VideoStream:
 
     def produce(self, source, encoder):
         """Never request a fill-sized buffered read; pause the framer at each JPEG."""
-        framer = JpegFramer(max_frame_bytes=MAX_JPEG_BYTES)
-        pending = iter(())
         pump = source
         while True:
             check_cancel(self.cancel)
@@ -552,37 +549,29 @@ class VideoStream:
                     raise SeekRequested(wanted)
                 self.measured_wait("credit")
             try:
-                frame = next(pending)
-            except StopIteration:
-                self.diagnostics.queue_highwater = max(self.diagnostics.queue_highwater,
-                                                       sum(self.reservations.values()) + len(framer.data))
-                try:
-                    block = pump.get(timeout=0.05)
-                except queue.Empty:
-                    if encoder.poll() is not None:
-                        block = b""
-                    else:
-                        continue
-                if not block:
-                    framer.finish()
-                    # EOF alone is not successful encoder completion.
-                    exit_deadline = time.monotonic() + 3
-                    while encoder.poll() is None:
-                        check_cancel(self.cancel)
-                        if time.monotonic() >= min(exit_deadline, self.progress_deadline):
-                            raise TimeoutError("encoder exit deadline expired")
-                        readable, _, _ = select.select([self.client], [], [], .05)
-                        if readable:
-                            self.receive_available()
-                    if encoder.returncode:
-                        raise RuntimeError("ffmpeg encoder failed")
-                    self.send(wire.EOS, struct.pack('>Q', self.state.received), self.progress_deadline)
-                    deadline = time.monotonic() + self.drain_timeout
-                    while not self.state.terminal:
-                        self.wait(deadline)
-                    return self.state.received
-                pending = framer.feed(block)
-                continue
+                item = pump.get(timeout=0.05)
+            except queue.Empty:
+                if encoder.poll() is not None:
+                    item = None
+                else:
+                    continue
+            if item is None:
+                exit_deadline = time.monotonic() + 3
+                while encoder.poll() is None:
+                    check_cancel(self.cancel)
+                    if time.monotonic() >= min(exit_deadline, self.progress_deadline):
+                        raise TimeoutError("encoder exit deadline expired")
+                    readable, _, _ = select.select([self.client], [], [], .05)
+                    if readable:
+                        self.receive_available()
+                if encoder.returncode:
+                    raise RuntimeError("ffmpeg encoder failed")
+                self.send(wire.EOS, struct.pack('>Q', self.state.received), self.progress_deadline)
+                deadline = time.monotonic() + self.drain_timeout
+                while not self.state.terminal:
+                    self.wait(deadline)
+                return self.state.received
+            frame = item
             self.diagnostics.mark("firstSourceJpegReady")
             self.diagnostics.parsed += 1
             frame = align_jpeg_payload(frame)
@@ -694,19 +683,30 @@ def source_has_audio(source):
 
 
 def build_encoder_command(args, video, audio, filters):
-    """JPEG on stdout. Audio is a second ffmpeg so a credit wait cannot mute it."""
+    """One realtime ffmpeg: JPEG on stdout, AudioToolbox as a second output."""
     command = ["ffmpeg", "-v", "error", "-nostdin"]
-    _input_flags(command, video, args, realtime=False)
+    _input_flags(command, video, args, realtime=True)
+    separate = bool(audio) and audio != video
+    if separate:
+        _input_flags(command, audio, args, realtime=True)
     if args.duration:
         command.extend(["-t", str(args.duration)])
     command.extend([
         "-map", "0:v:0",
-        "-an",
         "-vf", filters,
         "-q:v", str(args.quality),
         "-pix_fmt", "yuvj420p",
         "-f", "image2pipe", "pipe:1",
     ])
+    if audio:
+        command.extend([
+            "-map", "1:a:0" if separate else "0:a:0",
+            "-filter:a", "aresample=async=1:first_pts=0",
+            "-c:a", "pcm_s16le",
+            "-f", "audiotoolbox", "dummy",
+        ])
+    else:
+        command.append("-an")
     return command
 
 
@@ -881,8 +881,7 @@ def main():
         state["duration"] = duration_box[0]
         state["crop"] = crop
         filters = build_video_filters(args, fps, crop)
-        command = build_encoder_command(args, source, None, filters)
-        audio_cmd = build_audio_command(args, audio)
+        command = build_encoder_command(args, source, audio, filters)
         state["diagnostics"] = diagnostics.snapshot()
         state = publish_video_state(state, state_path=HOST_STATE)
         stream = VideoStream(client, session, answer["capability"], fps, cancel,
@@ -896,15 +895,7 @@ def main():
         stderr_tail = bytearray()
         stderr_thread = threading.Thread(target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True)
         stderr_thread.start()
-        pump = ChunkPump(encoder.stdout)
-        speaker = None
-        if audio_cmd is not None:
-            speaker = subprocess.Popen(
-                audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
-            )
-            threading.Thread(
-                target=drain_bounded, args=(speaker.stderr, bytearray()), daemon=True,
-            ).start()
+        pump = FramePump(encoder.stdout)
         def playhead_loop():
             while not cancel.is_set() and not finalizing:
                 publish_diagnostics()
@@ -921,10 +912,8 @@ def main():
                 diagnostics.started = diagnostics.clock()
                 diagnostics.milestones["firstConsumedReceipt"] = None
                 state["playheadAt"] = time.time()
-                stop_encoder(speaker, harsh=True)
                 stop_encoder(encoder, harsh=True)
-                command = build_encoder_command(args, source, None, filters)
-                audio_cmd = build_audio_command(args, audio)
+                command = build_encoder_command(args, source, audio, filters)
                 encoder = subprocess.Popen(
                     command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
                 )
@@ -933,15 +922,7 @@ def main():
                     target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True,
                 )
                 stderr_thread.start()
-                pump = ChunkPump(encoder.stdout)
-                speaker = None
-                if audio_cmd is not None:
-                    speaker = subprocess.Popen(
-                        audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
-                    )
-                    threading.Thread(
-                        target=drain_bounded, args=(speaker.stderr, bytearray()), daemon=True,
-                    ).start()
+                pump = FramePump(encoder.stdout)
                 publish_diagnostics()
         check_cancel(cancel)
         answer = video_bridge_request(dict(schemaVersion=1, op="videoStatus", **credentials), 5,

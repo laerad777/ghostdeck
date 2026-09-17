@@ -116,19 +116,18 @@ def test_take_seek_request_reads_and_clears_the_file(tmp_path):
     assert play.take_seek_request(path) == 33.5
     assert not path.exists()
     assert play.take_seek_request(path) is None
-def test_host_audio_is_a_separate_realtime_ffmpeg():
+def test_host_audio_is_in_the_same_realtime_ffmpeg():
     play = _play()
     args = type("Args", (), {"loop": False, "start": 12.5, "duration": 0, "quality": 12})()
-    video = play.build_encoder_command(
+    command = play.build_encoder_command(
         args, "https://v.example/video", "https://v.example/audio", "fps=30,scale=960:540",
     )
-    audio = play.build_audio_command(args, "https://v.example/audio")
-    assert video.count("-i") == 1
-    assert "audiotoolbox" not in video
-    assert "-an" in video
-    assert "-re" not in video
-    assert audio[0] == "ffmpeg"
-    assert "-re" in audio
-    assert "audiotoolbox" in audio
-    assert "12.5" in audio
-    assert play.build_audio_command(args, None) is None
+    assert command.count("-i") == 2
+    assert command.count("-re") == 2
+    assert "audiotoolbox" in command
+    assert "-an" not in command
+    assert "12.5" in command
+    silent = play.build_encoder_command(args, "/tmp/clip.mp4", None, "fps=30,scale=960:540")
+    assert "-an" in silent
+    assert "audiotoolbox" not in silent
+    assert "-re" in silent
