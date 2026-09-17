@@ -46,6 +46,7 @@ from ghostdeck.app import (
     playlist_should_loop,
     deck_now_playing,
     deck_session_active,
+    deck_has_picture,
     deck_playhead,
     format_clock,
     source_duration,
@@ -673,6 +674,33 @@ def test_deck_playhead_keeps_moving_after_the_last_host_publish(tmp_path):
     _source, pos, active = deck_playhead(path)
     assert active is True
     assert abs(pos - 20.0) < 0.3
+def test_deck_playhead_stays_at_start_until_the_first_frame(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text(
+        json.dumps(
+            {
+                "phase": "active",
+                "source": "/tmp/a.mp4",
+                "start": 0,
+                "playheadAt": time.time() - 3.0,
+                "diagnostics": {"startedMonotonicNs": 1_000_000_000, "hostElapsedNs": 3_000_000_000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    source, pos, active = deck_playhead(path)
+    assert source == "/tmp/a.mp4"
+    assert active is True
+    assert pos == 0.0
+    assert deck_has_picture(path) is False
+
+
+def test_deck_has_picture_needs_a_sent_frame(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text('{"phase":"active","diagnostics":{"framesSent":12}}\n', encoding="utf-8")
+    assert deck_has_picture(path) is True
+    path.write_text('{"phase":"active","diagnostics":{"framesSent":0}}\n', encoding="utf-8")
+    assert deck_has_picture(path) is False
 
 
 def test_source_duration_reads_ffprobe():

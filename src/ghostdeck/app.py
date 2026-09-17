@@ -560,6 +560,28 @@ def deck_session_active(path: Path = HOST_STATE) -> bool:
     return isinstance(data, dict) and str(data.get("phase") or "") == "active"
 
 
+def deck_has_picture(path: Path = HOST_STATE) -> bool:
+    """True only after the player has sent a frame. Claimed-but-opening is not playing."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    if not isinstance(data, dict) or str(data.get("phase") or "") != "active":
+        return False
+    diag = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
+    try:
+        if int(diag.get("framesSent") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    milestones = diag.get("milestones")
+    if isinstance(milestones, dict):
+        rec = milestones.get("firstConsumedReceipt")
+        if isinstance(rec, dict) and rec.get("monotonicNs") is not None:
+            return True
+    return False
+
+
 def format_clock(seconds: float) -> str:
     """m:ss or h:mm:ss. Junk is 0:00."""
     try:
@@ -614,7 +636,7 @@ def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
                 pos = start + (published - float(first)) / 1e9 * rate
     except (TypeError, ValueError):
         pos = start
-    if active:
+    if active and first is not None:
         try:
             wall = float(data.get("playheadAt") or 0.0)
         except (TypeError, ValueError):
@@ -1262,6 +1284,7 @@ def main() -> int:
             if op == "play":
                 ctrl.seen_watch = source
                 ctrl.played_start = play_offset(start)
+                ctrl.saw_picture = False
             _gui_set_busy(ctrl, True)
             ctrl.note.setStringValue_("재생 준비 중…" if op == "play" else "멈추는 중…")
         pasteboard = read_pasteboard() if op == "play" else ""
@@ -1393,7 +1416,7 @@ def main() -> int:
                 table.reloadData()
         play_btn = getattr(ctrl, "play_btn", None)
         if play_btn is not None:
-            play_btn.setTitle_("⏸" if source and deck_session_active() else "▶  재생")
+            play_btn.setTitle_("⏸" if deck_has_picture() else "▶  재생")
             _pill(play_btn, LIME, INK)
 
     def _gui_mode_draw(ctrl) -> None:
@@ -1450,15 +1473,18 @@ def main() -> int:
             pos = hold
         else:
             ctrl.hold_pos = None
-            wall = getattr(ctrl, "playhead_wall", None)
-            shown = getattr(ctrl, "playhead_shown", None)
-            active = _active
-            if active and wall is not None and shown is not None:
-                guessed = shown + (now - wall)
-                if abs(guessed - pos) < 2.5:
-                    pos = max(pos, guessed)
-            ctrl.playhead_wall = now
-            ctrl.playhead_shown = pos
+            if not deck_has_picture():
+                ctrl.playhead_wall = None
+                ctrl.playhead_shown = None
+            else:
+                wall = getattr(ctrl, "playhead_wall", None)
+                shown = getattr(ctrl, "playhead_shown", None)
+                if wall is not None and shown is not None:
+                    guessed = shown + (now - wall)
+                    if abs(guessed - pos) < 2.5:
+                        pos = max(pos, guessed)
+                ctrl.playhead_wall = now
+                ctrl.playhead_shown = pos
         if duration > 0 and pos > duration:
             pos = duration
         if elapsed is not None:
@@ -1480,11 +1506,19 @@ def main() -> int:
             _gui_playlist_put(ctrl, now)
         else:
             _gui_playlist_draw(ctrl)
-        was = getattr(ctrl, "was_playing", False)
-        if playing:
+        picture = deck_has_picture()
+        if picture:
             ctrl.was_playing = True
+            ctrl.saw_picture = True
             return
-        if was and not getattr(ctrl, "user_stopped", False) and not ctrl.busy:
+        if playing and not picture:
+            return
+        if (
+            getattr(ctrl, "was_playing", False)
+            and getattr(ctrl, "saw_picture", False)
+            and not getattr(ctrl, "user_stopped", False)
+            and not ctrl.busy
+        ):
             nxt = playlist_next(
                 getattr(ctrl, "playlist", []),
                 getattr(ctrl, "seen_watch", "") or now,
@@ -1492,6 +1526,7 @@ def main() -> int:
                 shuffle=getattr(ctrl, "shuffle", False),
             )
             ctrl.was_playing = False
+            ctrl.saw_picture = False
             if nxt:
                 _gui_kick(ctrl, "play", nxt)
                 return
@@ -1998,7 +2033,7 @@ def main() -> int:
             self.window.makeFirstResponder_(self.url_field)
 
         def play_(self, _sender):
-            if deck_session_active():
+            if deck_has_picture():
                 self.stop_(_sender)
                 return
             items = getattr(self, "playlist", [])
@@ -2214,7 +2249,7 @@ def main() -> int:
                 self.note.setStringValue_("재생할 항목을 고르십시오.")
                 return
             source = playlist_source(items[row])
-            if source and source == deck_now_playing() and deck_session_active():
+            if source and source == deck_now_playing() and deck_has_picture():
                 self.user_stopped = True
                 _gui_kick(self, "stop", "")
                 return
