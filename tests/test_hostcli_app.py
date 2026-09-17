@@ -34,6 +34,7 @@ from ghostdeck.app import (
     playlist_save,
     playlist_should_loop,
     deck_now_playing,
+    deck_session_active,
     playlist_entry,
     playlist_source,
     playlist_move,
@@ -527,3 +528,19 @@ def test_playlist_move_reorders_rows():
     moved = playlist_move(items, 0, 2)
     assert [playlist_source(item) for item in moved] == ["/tmp/b.mp4", "/tmp/c.mp4", "/tmp/a.mp4"]
     assert playlist_move(items, 9, 0) == items
+
+
+def test_deck_session_active_reads_phase(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text('{"phase":"active","source":"/tmp/a.mp4"}\n', encoding="utf-8")
+    assert deck_session_active(path) is True
+    path.write_text('{"phase":"terminal"}\n', encoding="utf-8")
+    assert deck_session_active(path) is False
+    assert deck_session_active(tmp_path / "gone.json") is False
+
+
+def test_youtube_overlay_queues_without_playing():
+    text = (ROOT / "src" / "ghostdeck" / "app.py").read_text(encoding="utf-8")
+    assert "ghostdeck-queue" in text
+    assert "post('queue')" in text
+    assert 'kind == "queue"' in text

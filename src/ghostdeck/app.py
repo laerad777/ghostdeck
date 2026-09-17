@@ -422,6 +422,16 @@ def deck_now_playing(path: Path = HOST_STATE) -> str:
     return str(src).strip() if src else ""
 
 
+def deck_session_active(path: Path = HOST_STATE) -> bool:
+    """True when the player last published an active session. No HID."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return isinstance(data, dict) and str(data.get("phase") or "") == "active"
+
+
+
 
 def play_request(
     field: str,
@@ -646,6 +656,8 @@ def main() -> int:
             NSFilenamesPboardType,
             NSFont,
             NSMakeRect,
+            NSMenu,
+            NSMenuItem,
             NSObject,
             NSOpenPanel,
             NSScrollView,
@@ -732,14 +744,36 @@ def main() -> int:
     v.addEventListener('play', function(){ post('play'); });
   }
   function scan(){ document.querySelectorAll('video').forEach(hook); }
+  function mountQueue(){
+    var id = ytId(location.href) || ytId(watchUrl());
+    var btn = document.getElementById('ghostdeck-queue');
+    if (!id) { if (btn) btn.remove(); return; }
+    if (btn) return;
+    btn = document.createElement('button');
+    btn.id = 'ghostdeck-queue';
+    btn.type = 'button';
+    btn.textContent = '＋ 대기열';
+    btn.setAttribute('aria-label', '대기열에 넣기');
+    btn.style.cssText = 'position:fixed;right:12px;bottom:72px;z-index:2147483647;padding:8px 12px;border:0;border-radius:16px;background:#111;color:#fff;font:600 13px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;opacity:.92;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35);';
+    btn.addEventListener('click', function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      post('queue');
+      btn.textContent = '넣음';
+      setTimeout(function(){ if (btn) btn.textContent = '＋ 대기열'; }, 1200);
+    }, true);
+    document.documentElement.appendChild(btn);
+  }
   scan();
-  new MutationObserver(scan).observe(document.documentElement, {childList:true, subtree:true});
+  mountQueue();
+  new MutationObserver(function(){ scan(); mountQueue(); }).observe(document.documentElement, {childList:true, subtree:true});
   var last = watchUrl();
   setInterval(function(){
     var now = watchUrl();
     if (now !== last){
       last = now;
       post('nav');
+      mountQueue();
     }
   }, 400);
 })();
@@ -1102,6 +1136,18 @@ def main() -> int:
             self.playlist_table.setDoubleAction_("playSelected:")
             self.playlist_table.registerForDraggedTypes_(["ghostdeck.playlist.row", NSFilenamesPboardType])
             self.playlist_table.setDraggingSourceOperationMask_forLocal_(NSDragOperationMove, True)
+            menu = NSMenu.alloc().init()
+            for title, action in (
+                ("재생", "playSelected:"),
+                ("정지", "stop:"),
+                ("대기열에서 제거", "removeSelected:"),
+                ("위로", "moveUp:"),
+                ("아래로", "moveDown:"),
+            ):
+                item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+                item.setTarget_(self)
+                menu.addItem_(item)
+            self.playlist_table.setMenu_(menu)
             scroll.setDocumentView_(self.playlist_table)
             view.addSubview_(scroll)
             bgap = 6
@@ -1460,8 +1506,13 @@ def main() -> int:
             if row < 0 or row >= len(items):
                 self.note.setStringValue_("재생할 항목을 고르십시오.")
                 return
+            source = playlist_source(items[row])
+            if source and source == deck_now_playing() and deck_session_active():
+                self.user_stopped = True
+                _gui_kick(self, "stop", "")
+                return
             self.user_stopped = False
-            _gui_kick(self, "play", playlist_source(items[row]))
+            _gui_kick(self, "play", source)
 
         def removeSelected_(self, _sender):
             row = int(self.playlist_table.selectedRow())
@@ -1487,6 +1538,12 @@ def main() -> int:
                     src = str(body.get("src") or "")
                     start = play_offset(body.get("t"))
             href = href or _gui_href(self)
+            if kind == "queue":
+                source = youtube_watch_url(href) or playable_source(href, src)
+                if source:
+                    _gui_playlist_put(self, source)
+                    self.note.setStringValue_("대기열에 넣었습니다.")
+                return
             if kind == "play":
                 source = should_start_play(getattr(self, "seen_watch", ""), href, src)
                 if source:
