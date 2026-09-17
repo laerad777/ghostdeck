@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -894,7 +895,7 @@ class DeckRemote:
     def stop(self) -> CommandResult:
         return self._run(["stop"])
 
-    def play(self, source: str, pasteboard: str = "", start: float = 0.0, loop: bool = True) -> list[CommandResult]:
+    def play(self, source: str, pasteboard: str = "", start: float = 0.0, loop: bool = True, crop: str = "auto") -> list[CommandResult]:
         source = resolve_source(source, pasteboard)
         if not source:
             return [CommandResult(["play"], 2, "", "유튜브에서 영상을 열거나 파일을 연 다음 재생을 누르십시오")]
@@ -909,6 +910,8 @@ class DeckRemote:
         start = play_offset(start)
         if start > 0:
             argv.extend(["--start", f"{start:.3f}"])
+        if crop and crop != "auto":
+            argv.extend(["--crop", crop])
         if not loop:
             argv.append("--no-loop")
         played = self._run(argv)
@@ -923,14 +926,14 @@ class DeckRemote:
         return results
 
 
-def _busy_call(remote: DeckRemote, op: str, source: str, pasteboard: str, done, start=0.0, loop=True) -> None:
+def _busy_call(remote: DeckRemote, op: str, source: str, pasteboard: str, done, start=0.0, loop=True, crop="auto") -> None:
     try:
         if op == "status":
             results = [remote.status()]
         elif op == "stop":
             results = [remote.stop()]
         else:
-            results = remote.play(source, pasteboard, start=start, loop=loop)
+            results = remote.play(source, pasteboard, start=start, loop=loop, crop=crop)
         done(results, None)
     except Exception as error:
         done([], error)
@@ -1197,7 +1200,7 @@ def main() -> int:
         ):
             _gui_kick(ctrl, "play", pending, start=pending_start)
 
-    def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False) -> None:
+    def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False, crop: str = "auto") -> None:
         if ctrl.busy and op == "play":
             ctrl.pending_source = source
             ctrl.pending_start = play_offset(start)
@@ -1225,6 +1228,7 @@ def main() -> int:
                     getattr(ctrl, "playlist", []),
                     getattr(ctrl, "repeat", "off"),
                 ) if op == "play" else loop,
+                crop,
             ),
             daemon=True,
         )
@@ -1382,6 +1386,22 @@ def main() -> int:
 
                 threading.Thread(target=fill, daemon=True).start()
         duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
+        now = time.monotonic()
+        hold = getattr(ctrl, "hold_pos", None)
+        hold_until = float(getattr(ctrl, "hold_until", 0.0) or 0.0)
+        if hold is not None and now < hold_until and abs(pos - hold) > 1.25:
+            pos = hold
+        else:
+            ctrl.hold_pos = None
+            wall = getattr(ctrl, "playhead_wall", None)
+            shown = getattr(ctrl, "playhead_shown", None)
+            active = _active
+            if active and wall is not None and shown is not None:
+                guessed = shown + (now - wall)
+                if abs(guessed - pos) < 2.5:
+                    pos = max(pos, guessed)
+            ctrl.playhead_wall = now
+            ctrl.playhead_shown = pos
         if duration > 0 and pos > duration:
             pos = duration
         if elapsed is not None:
@@ -1391,7 +1411,6 @@ def main() -> int:
         if bar is None:
             return
         if duration <= 0:
-            bar.setEnabled_(False)
             return
         bar.setMaxValue_(duration)
         bar.setDoubleValue_(pos)
@@ -1456,6 +1475,8 @@ def main() -> int:
             ctrl = self.ctrl
             ctrl.seeking = True
             objc.super(SeekSlider, self).mouseDown_(event)
+            ctrl.hold_pos = play_offset(self.doubleValue())
+            ctrl.hold_until = time.monotonic() + 8.0
             ctrl.seeking = False
             elapsed = getattr(ctrl, "elapsed_lab", None)
             if elapsed is not None:
@@ -1491,6 +1512,12 @@ def main() -> int:
             if added:
                 self.ctrl.note.setStringValue_("대기열에 넣었습니다.")
             return added
+
+        def hitTest_(self, point):
+            h = self.bounds().size.height
+            if point.y > h - 210:
+                return None
+            return objc.super(QueueDrop, self).hitTest_(point)
 
     class Controller(NSObject):
         def init(self):
@@ -1741,8 +1768,8 @@ def main() -> int:
             self.seek_bar.setMinValue_(0.0)
             self.seek_bar.setMaxValue_(1.0)
             self.seek_bar.setDoubleValue_(0.0)
-            self.seek_bar.setContinuous_(False)
-            self.seek_bar.setEnabled_(False)
+            self.seek_bar.setContinuous_(True)
+            self.seek_bar.setEnabled_(True)
             self.seek_bar.setTarget_(self)
             self.seek_bar.ctrl = self
             self.seek_bar.setAction_("seek:")
@@ -1968,17 +1995,14 @@ def main() -> int:
             at = play_offset(sender.doubleValue())
             if at > duration:
                 at = duration
-            source = deck_now_playing() or getattr(self, "seen_watch", "")
+            source = getattr(self, "seen_watch", "") or deck_now_playing()
             if not source:
                 self.note.setStringValue_("재생 중인 영상이 없습니다.")
                 return
             self.user_stopped = False
-            js = (
-                "(function(){ var v=document.querySelector('video');"
-                f" if(v&&isFinite({at:.3f})) v.currentTime={at:.3f}; }})()"
-            )
-            self.web.evaluateJavaScript_completionHandler_(js, lambda *_a: None)
-            _gui_kick(self, "play", source, start=at)
+            self.hold_pos = at
+            self.hold_until = time.monotonic() + 8.0
+            _gui_kick(self, "play", source, start=at, crop="none")
             self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
         def prevTrack_(self, _sender):
             now = deck_now_playing() or getattr(self, "seen_watch", "")

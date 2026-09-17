@@ -97,7 +97,7 @@ def _validate_source(source: str) -> None:
         raise RuntimeError(f"source is not a file and is not a URL: {source}")
 
 
-def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = True) -> None:
+def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = True, crop: str = "auto") -> None:
     _require_tools(source)
     adb.require_adb()
     # Before any device work: an unusable SOURCE must fail cheaply and name the user's own input,
@@ -141,7 +141,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         print(f"warning: {error}", file=sys.stderr)
     _signal_speakers()
     if predecessor:
-        _session_released(timeout=4.0)
+        _session_released(timeout=1.5 if start > 0 else 4.0)
     if not VENDOR_PLAY.is_file():
         raise RuntimeError(f"vendor player missing: {VENDOR_PLAY}")
     env = dict(os.environ)
@@ -158,7 +158,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         "--quality",
         "12",
         "--crop",
-        "auto",
+        crop if crop in ("auto", "none") else "auto",
         "--fit",
         fit,
     ]

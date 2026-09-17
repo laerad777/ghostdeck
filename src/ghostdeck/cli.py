@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     p_play.add_argument("source")
     p_play.add_argument("--fit", choices=("auto", "pad", "cover"), default="auto")
     p_play.add_argument("--start", type=float, default=0)
+    p_play.add_argument("--crop", default="auto")
     p_play.add_argument("--no-loop", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -81,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
                 fit=args.fit,
                 start=args.start,
                 loop=not args.no_loop,
+                crop=args.crop,
             )
             return 0
         if args.cmd == "stop":
