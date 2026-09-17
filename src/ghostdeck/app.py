@@ -605,6 +605,16 @@ def format_clock(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def wrap_playhead(pos: float, duration: float, looping: bool) -> float:
+    """Keep the bar on the timeline. Looping wraps; otherwise it sticks at the end."""
+    if not math.isfinite(pos) or pos < 0:
+        pos = 0.0
+    if duration <= 0:
+        return pos
+    if looping:
+        return pos % duration
+    return duration if pos > duration else pos
+
 def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
     """(source, seconds, active). Seconds is --start plus time since the first consumed frame."""
     try:
@@ -656,8 +666,7 @@ def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
             wall = 0.0
         if wall > 0:
             pos += max(0.0, time.time() - wall) * rate
-    if not math.isfinite(pos) or pos < 0:
-        pos = 0.0
+    pos = wrap_playhead(pos, parse_duration(data.get("duration")), bool(data.get("loop")))
     return source, pos, active
 
 
@@ -1528,8 +1537,15 @@ def main() -> int:
                         pos = max(pos, guessed)
                 ctrl.playhead_wall = now
                 ctrl.playhead_shown = pos
-        if duration > 0 and pos > duration:
-            pos = duration
+        pos = wrap_playhead(
+            pos,
+            duration,
+            playlist_should_loop(
+                source,
+                getattr(ctrl, "playlist", []),
+                getattr(ctrl, "repeat", "off"),
+            ),
+        )
         if elapsed is not None:
             elapsed.setStringValue_(format_clock(pos) if source else "0:00")
         if remain is not None:

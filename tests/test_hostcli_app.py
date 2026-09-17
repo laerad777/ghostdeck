@@ -50,6 +50,7 @@ from ghostdeck.app import (
     deck_playhead,
     deck_crop,
     request_live_seek,
+    wrap_playhead,
     format_clock,
     source_duration,
     deck_duration,
@@ -679,6 +680,37 @@ def test_deck_playhead_adds_elapsed_since_first_frame(tmp_path):
     assert source == "/tmp/a.mp4"
     assert active is True
     assert abs(pos - 18.0) < 0.01
+def test_wrap_playhead_loops_back_to_the_start():
+    assert wrap_playhead(18.0, 8.0, True) == 2.0
+    assert wrap_playhead(18.0, 8.0, False) == 8.0
+    assert wrap_playhead(-1, 8.0, True) == 0.0
+
+
+def test_deck_playhead_wraps_when_the_source_loops(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text(
+        json.dumps(
+            {
+                "phase": "active",
+                "source": "/tmp/a.mp4",
+                "start": 0,
+                "loop": True,
+                "duration": 8,
+                "playbackRate": 1,
+                "diagnostics": {
+                    "startedMonotonicNs": 1_000_000_000,
+                    "hostElapsedNs": 12_000_000_000,
+                    "milestones": {
+                        "firstConsumedReceipt": {"monotonicNs": 3_000_000_000},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _source, pos, active = deck_playhead(path)
+    assert active is True
+    assert abs(pos - 2.0) < 0.01
 def test_deck_playhead_keeps_moving_after_the_last_host_publish(tmp_path):
     path = tmp_path / "host.json"
     payload = {

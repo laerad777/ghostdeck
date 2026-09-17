@@ -17,6 +17,7 @@ import struct
 import subprocess
 import sys
 import threading
+import queue
 import time
 
 from d200_jpeg import JpegFramer, JpegFramingError
@@ -258,6 +259,32 @@ def drain_bounded(stream, storage, limit=64 * 1024):
         storage.extend(block)
         if len(storage) > limit:
             del storage[:-limit]
+class ChunkPump:
+    """Keep ffmpeg JPEG stdout moving so a credit wait cannot stall AudioToolbox."""
+
+    def __init__(self, raw, max_chunks=256):
+        self._q = queue.Queue(maxsize=max_chunks)
+        self._raw = raw
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        fd = self._raw.fileno()
+        try:
+            os.set_blocking(fd, True)
+        except OSError:
+            pass
+        while True:
+            try:
+                block = os.read(fd, 65536)
+            except OSError:
+                block = b""
+            self._q.put(block)
+            if not block:
+                return
+
+    def get(self, timeout=0.05):
+        return self._q.get(timeout=timeout)
+
 
 
 def check_cancel(cancel):
@@ -502,8 +529,7 @@ class VideoStream:
         """Never request a fill-sized buffered read; pause the framer at each JPEG."""
         framer = JpegFramer(max_frame_bytes=MAX_JPEG_BYTES)
         pending = iter(())
-        fd = source.fileno()
-        os.set_blocking(fd, False)
+        pump = source
         while True:
             check_cancel(self.cancel)
             wanted = take_seek_request()
@@ -519,12 +545,13 @@ class VideoStream:
             except StopIteration:
                 self.diagnostics.queue_highwater = max(self.diagnostics.queue_highwater,
                                                        sum(self.reservations.values()) + len(framer.data))
-                if not self.measured_wait("producer", source=fd):
-                    continue
                 try:
-                    block = os.read(fd, 65536)
-                except BlockingIOError:
-                    continue
+                    block = pump.get(timeout=0.05)
+                except queue.Empty:
+                    if encoder.poll() is not None:
+                        block = b""
+                    else:
+                        continue
                 if not block:
                     framer.finish()
                     # EOF alone is not successful encoder completion.
@@ -656,32 +683,35 @@ def source_has_audio(source):
 
 
 def build_encoder_command(args, video, audio, filters):
-    """JPEG pipe on stdout. Host audio is `build_audio_command` in another process."""
-    command = ["ffmpeg", "-v", "error"]
-    if args.loop:
-        command.extend(["-stream_loop", "-1"])
-    if args.start:
-        command.extend(["-ss", str(args.start)])
-    command.extend(["-i", video])
+    """One ffmpeg: JPEG on stdout, AudioToolbox as a second output."""
+    command = ["ffmpeg", "-v", "error", "-nostdin"]
+    _input_flags(command, video, args)
+    separate = bool(audio) and audio != video
+    if separate:
+        _input_flags(command, audio, args)
     if args.duration:
         command.extend(["-t", str(args.duration)])
     command.extend([
         "-map", "0:v:0",
-        "-an",
         "-vf", filters,
         "-q:v", str(args.quality),
         "-pix_fmt", "yuvj420p",
-        "-f", "image2pipe", "-",
+        "-f", "image2pipe", "pipe:1",
     ])
+    if audio:
+        command.extend([
+            "-map", "1:a:0" if separate else "0:a:0",
+            "-filter:a", "aresample=async=1:first_pts=0",
+            "-c:a", "pcm_s16le",
+            "-f", "audiotoolbox", "dummy",
+        ])
+    else:
+        command.append("-an")
     return command
 
 
-def build_audio_command(args, audio):
-    """Realtime AudioToolbox. Independent of the JPEG credit stall."""
-    if not audio:
-        return None
-    command = ["ffmpeg", "-v", "error", "-nostdin"]
-    if str(audio).startswith(("http://", "https://")):
+def _input_flags(command, url, args):
+    if str(url).startswith(("http://", "https://")):
         command.extend([
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -693,16 +723,7 @@ def build_audio_command(args, audio):
         command.extend(["-stream_loop", "-1"])
     if args.start:
         command.extend(["-ss", str(args.start)])
-    command.extend(["-i", audio])
-    if args.duration:
-        command.extend(["-t", str(args.duration)])
-    command.extend([
-        "-vn",
-        "-filter:a", "aresample=async=1:first_pts=0",
-        "-c:a", "pcm_s16le",
-        "-f", "audiotoolbox", "dummy",
-    ])
-    return command
+    command.extend(["-i", url])
 
 
 
@@ -749,8 +770,8 @@ def main():
         cancel.set()
         diagnostics.mark("cancelRequested")
         try:
-            if speaker is not None and speaker.poll() is None:
-                speaker.kill()
+            if encoder is not None and encoder.poll() is None:
+                encoder.kill()
         except OSError:
             pass
         if not finalizing:
@@ -839,8 +860,7 @@ def main():
         state["duration"] = duration_box[0]
         state["crop"] = crop
         filters = build_video_filters(args, fps, crop)
-        command = build_encoder_command(args, source, None, filters)
-        audio_cmd = build_audio_command(args, audio)
+        command = build_encoder_command(args, source, audio, filters)
         state["diagnostics"] = diagnostics.snapshot()
         state = publish_video_state(state, state_path=HOST_STATE)
         stream = VideoStream(client, session, answer["capability"], fps, cancel,
@@ -854,14 +874,7 @@ def main():
         stderr_tail = bytearray()
         stderr_thread = threading.Thread(target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True)
         stderr_thread.start()
-        speaker = None
-        if audio_cmd is not None:
-            speaker = subprocess.Popen(
-                audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
-            )
-            threading.Thread(
-                target=drain_bounded, args=(speaker.stderr, bytearray()), daemon=True,
-            ).start()
+        pump = ChunkPump(encoder.stdout)
         def playhead_loop():
             while not cancel.is_set() and not finalizing:
                 publish_diagnostics()
@@ -870,7 +883,7 @@ def main():
         threading.Thread(target=playhead_loop, daemon=True).start()
         while True:
             try:
-                total = stream.produce(encoder.stdout, encoder)
+                total = stream.produce(pump, encoder)
                 break
             except SeekRequested as seek:
                 args.start = seek.start
@@ -878,10 +891,8 @@ def main():
                 diagnostics.started = diagnostics.clock()
                 diagnostics.milestones["firstConsumedReceipt"] = None
                 state["playheadAt"] = time.time()
-                stop_encoder(speaker, harsh=True)
                 stop_encoder(encoder, harsh=True)
-                command = build_encoder_command(args, source, None, filters)
-                audio_cmd = build_audio_command(args, audio)
+                command = build_encoder_command(args, source, audio, filters)
                 encoder = subprocess.Popen(
                     command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
                 )
@@ -890,14 +901,7 @@ def main():
                     target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True,
                 )
                 stderr_thread.start()
-                speaker = None
-                if audio_cmd is not None:
-                    speaker = subprocess.Popen(
-                        audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
-                    )
-                    threading.Thread(
-                        target=drain_bounded, args=(speaker.stderr, bytearray()), daemon=True,
-                    ).start()
+                pump = ChunkPump(encoder.stdout)
                 publish_diagnostics()
         check_cancel(cancel)
         answer = video_bridge_request(dict(schemaVersion=1, op="videoStatus", **credentials), 5,
