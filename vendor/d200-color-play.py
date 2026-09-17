@@ -592,7 +592,7 @@ def source_has_audio(source):
 
 
 def build_encoder_command(args, video, audio, filters):
-    """JPEG pipe on stdout; optional CoreAudio on the host, same ffmpeg clock."""
+    """JPEG pipe on stdout; optional AudioToolbox on the host, same ffmpeg clock."""
     command = ["ffmpeg", "-v", "error"]
 
     def add_input(url):
@@ -623,7 +623,7 @@ def build_encoder_command(args, video, audio, filters):
             "-vn",
             "-filter:a", "aresample=async=1:first_pts=0",
             "-c:a", "pcm_s16le",
-            "-f", "coreaudio", "default",
+            "-f", "audiotoolbox", "dummy",
         ])
     return command
 
