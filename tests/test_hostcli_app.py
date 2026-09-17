@@ -42,6 +42,7 @@ from ghostdeck.app import (
     deck_playhead,
     format_clock,
     source_duration,
+    should_retry_pending,
     playlist_entry,
     playlist_source,
     playlist_move,
@@ -643,3 +644,16 @@ def test_source_duration_reads_ffprobe():
 
     assert source_duration("/tmp/clip.mp4", probe=probe) == 183.4
     assert source_duration("", probe=probe) == 0.0
+def test_should_retry_pending_allows_a_seek_on_the_same_source():
+    watch = "https://www.youtube.com/watch?v=x"
+    assert should_retry_pending(watch, 40.0, watch, 10.0) is True
+    assert should_retry_pending(watch, 10.0, watch, 10.0) is False
+    assert should_retry_pending("/tmp/b.mp4", 0.0, watch, 10.0) is True
+    assert should_retry_pending("", 40.0, watch, 10.0) is False
+
+
+def test_youtube_duration_is_not_probed_with_yt_dlp():
+    def probe(argv, **_k):
+        raise AssertionError("yt-dlp must not run for a watch URL")
+
+    assert source_duration("https://www.youtube.com/watch?v=x", probe=probe) == 0.0

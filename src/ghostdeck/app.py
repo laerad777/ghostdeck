@@ -513,25 +513,17 @@ def source_duration(source: str, probe=None) -> float:
     watch = youtube_watch_url(source)
     local = media_path_candidate(source)
     try:
-        if watch:
-            result = runner(
-                ["yt-dlp", "--no-warnings", "--no-playlist", "-O", "duration", watch],
-                capture_output=True, text=True, timeout=20, check=False,
-            )
-            lines = (result.stdout or "").strip().splitlines()
-            raw = lines[-1] if lines else ""
-        elif local:
-            result = runner(
-                [
-                    "ffprobe", "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "csv=p=0", local,
-                ],
-                capture_output=True, text=True, timeout=8, check=False,
-            )
-            raw = (result.stdout or "").strip()
-        else:
+        if watch or not local:
             return 0.0
+        result = runner(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0", local,
+            ],
+            capture_output=True, text=True, timeout=8, check=False,
+        )
+        raw = (result.stdout or "").strip()
     except (OSError, subprocess.TimeoutExpired):
         return 0.0
     try:
@@ -541,6 +533,16 @@ def source_duration(source: str, probe=None) -> float:
     if not math.isfinite(value) or value <= 0:
         return 0.0
     return value
+
+
+def should_retry_pending(pending: str, pending_start: float, seen: str, played_start: float) -> bool:
+    """True when a queued play is a different source or a real seek on the same one."""
+    if not pending:
+        return False
+    if pending != seen:
+        return True
+    return abs(play_offset(pending_start) - play_offset(played_start)) > 0.2
+
 
 
 
@@ -964,7 +966,13 @@ def main() -> int:
   }
   scan();
   mountQueue();
-  new MutationObserver(function(){ scan(); mountQueue(); }).observe(document.documentElement, {childList:true, subtree:true});
+  var mountSoon = false;
+  function requestMount(){
+    if (mountSoon) return;
+    mountSoon = true;
+    setTimeout(function(){ mountSoon = false; scan(); mountQueue(); }, 800);
+  }
+  new MutationObserver(requestMount).observe(document.documentElement, {childList:true, subtree:true});
   var last = watchUrl();
   setInterval(function(){
     var now = watchUrl();
@@ -1026,11 +1034,6 @@ def main() -> int:
             button = getattr(ctrl, name, None)
             if button is not None:
                 button.setEnabled_(not on)
-        bar = getattr(ctrl, "seek_bar", None)
-        if bar is not None:
-            bar.setEnabled_(
-                (not on) and float(getattr(ctrl, "media_duration", 0) or 0) > 0
-            )
 
     def _gui_apply(ctrl, results, error) -> None:
         _gui_set_busy(ctrl, False)
@@ -1041,7 +1044,9 @@ def main() -> int:
         if error is not None:
             ctrl.seen_watch = ""
             ctrl.note.setStringValue_(f"{type(error).__name__}: {error}")
-            if pending and pending != getattr(ctrl, "seen_watch", ""):
+            if should_retry_pending(
+                pending, pending_start, getattr(ctrl, "seen_watch", ""), getattr(ctrl, "played_start", 0.0)
+            ):
                 _gui_kick(ctrl, "play", pending, start=pending_start)
             return
         for item in results:
@@ -1054,7 +1059,9 @@ def main() -> int:
                 _gui_sync_deck(ctrl, parse_status_fields(item.stdout).get("playing") == "yes")
         last = results[-1] if results else None
         if last is None:
-            if pending and pending != getattr(ctrl, "seen_watch", ""):
+            if should_retry_pending(
+                pending, pending_start, getattr(ctrl, "seen_watch", ""), getattr(ctrl, "played_start", 0.0)
+            ):
                 _gui_kick(ctrl, "play", pending, start=pending_start)
             return
         if last.code != 0:
@@ -1070,7 +1077,9 @@ def main() -> int:
             ctrl.note.setStringValue_("덱에서 재생 중입니다. 창이 멈추거나 끊겨도 덱은 계속 재생됩니다.")
         elif last.argv[:1] == ["studio"]:
             ctrl.note.setStringValue_("브리지를 켰습니다. 이제 재생할 수 있습니다.")
-        if pending and pending != getattr(ctrl, "seen_watch", ""):
+        if should_retry_pending(
+            pending, pending_start, getattr(ctrl, "seen_watch", ""), getattr(ctrl, "played_start", 0.0)
+        ):
             _gui_kick(ctrl, "play", pending, start=pending_start)
 
     def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False) -> None:
@@ -1083,6 +1092,7 @@ def main() -> int:
         if op != "status":
             if op == "play":
                 ctrl.seen_watch = source
+                ctrl.played_start = play_offset(start)
             _gui_set_busy(ctrl, True)
             ctrl.note.setStringValue_("재생 준비 중…" if op == "play" else "멈추는 중…")
         pasteboard = read_pasteboard() if op == "play" else ""
@@ -1192,11 +1202,17 @@ def main() -> int:
         bar = getattr(ctrl, "seek_bar", None)
         elapsed = getattr(ctrl, "elapsed_lab", None)
         remain = getattr(ctrl, "remain_lab", None)
+        if getattr(ctrl, "seeking", False):
+            if elapsed is not None and bar is not None:
+                elapsed.setStringValue_(format_clock(bar.doubleValue()))
+            return
         source, pos, _active = deck_playhead()
+        duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
         if source and source != getattr(ctrl, "duration_for", ""):
             ctrl.duration_for = source
             ctrl.media_duration = 0.0
-            if not getattr(ctrl, "duration_busy", False):
+            duration = 0.0
+            if media_path_candidate(source) and not getattr(ctrl, "duration_busy", False):
                 ctrl.duration_busy = True
 
                 def fill():
@@ -1211,6 +1227,22 @@ def main() -> int:
                     AppHelper.callAfter(apply)
 
                 threading.Thread(target=fill, daemon=True).start()
+        if duration <= 0 and source and getattr(ctrl, "web", None) is not None:
+
+            def after(raw, _err):
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    return
+                if value > 0 and getattr(ctrl, "duration_for", "") == source:
+                    ctrl.media_duration = value
+                    _gui_playhead_draw(ctrl)
+
+            ctrl.web.evaluateJavaScript_completionHandler_(
+                "(function(){ var v=document.querySelector('video');"
+                " return (v && isFinite(v.duration) && v.duration>0) ? v.duration : 0; })()",
+                after,
+            )
         duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
         if duration > 0 and pos > duration:
             pos = duration
@@ -1222,11 +1254,10 @@ def main() -> int:
             return
         if duration <= 0:
             bar.setEnabled_(False)
-            bar.setDoubleValue_(0.0)
             return
         bar.setMaxValue_(duration)
         bar.setDoubleValue_(pos)
-        bar.setEnabled_(not getattr(ctrl, "busy", False))
+        bar.setEnabled_(True)
 
     def _gui_sync_deck(ctrl, playing: bool) -> None:
         now = deck_now_playing()
@@ -1273,6 +1304,30 @@ def main() -> int:
             _gui_kick(ctrl, "play", source)
             return True
 
+        def hitTest_(self, _point):
+            return None
+
+    class Ghost(NSView):
+        def hitTest_(self, _point):
+            return None
+
+    class SeekSlider(NSSlider):
+        def mouseDown_(self, event):
+            ctrl = self.ctrl
+            ctrl.seeking = True
+            objc.super(SeekSlider, self).mouseDown_(event)
+            ctrl.seeking = False
+            elapsed = getattr(ctrl, "elapsed_lab", None)
+            if elapsed is not None:
+                elapsed.setStringValue_(format_clock(self.doubleValue()))
+
+        def mouseDragged_(self, event):
+            objc.super(SeekSlider, self).mouseDragged_(event)
+            ctrl = self.ctrl
+            elapsed = getattr(ctrl, "elapsed_lab", None)
+            if elapsed is not None:
+                elapsed.setStringValue_(format_clock(self.doubleValue()))
+
     class QueueDrop(NSView):
         """The queue pane enqueues a drop. It does not start playback."""
 
@@ -1310,6 +1365,8 @@ def main() -> int:
             self.media_duration = 0.0
             self.duration_for = ""
             self.duration_busy = False
+            self.seeking = False
+            self.played_start = 0.0
             # Dark shell: phone column + frosted queue.
             PAD = 20
             PHONE_W = 392
@@ -1351,8 +1408,7 @@ def main() -> int:
                 pass
             self.window.center()
             view = self.window.contentView()
-            view.setWantsLayer_(True)
-            view.layer().setBackgroundColor_(INK.CGColor())
+            view.setWantsLayer_(False)
             drop = DropBar.alloc().initWithFrame_(view.bounds())
             drop.ctrl = self
             drop.registerForDraggedTypes_([NSFilenamesPboardType])
@@ -1404,13 +1460,13 @@ def main() -> int:
             self.web.loadRequest_(
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
-            notch = NSView.alloc().initWithFrame_(NSMakeRect((PHONE_W - 108) / 2, PHONE_H - 16, 108, 5))
+            notch = Ghost.alloc().initWithFrame_(NSMakeRect((PHONE_W - 108) / 2, PHONE_H - 16, 108, 5))
             notch.setWantsLayer_(True)
             notch.layer().setCornerRadius_(2.5)
             notch.layer().setBackgroundColor_(_rgb(0, 0, 0, 0.45).CGColor())
             notch.setAutoresizingMask_(NSViewMinYMargin)
             shell.addSubview_(notch)
-            home = NSView.alloc().initWithFrame_(NSMakeRect((PHONE_W - 118) / 2, 8, 118, 4))
+            home = Ghost.alloc().initWithFrame_(NSMakeRect((PHONE_W - 118) / 2, 8, 118, 4))
             home.setWantsLayer_(True)
             home.layer().setCornerRadius_(2.0)
             home.layer().setBackgroundColor_(_rgb(1, 1, 1, 0.28).CGColor())
@@ -1536,7 +1592,7 @@ def main() -> int:
             )
             self.remain_lab.setAlignment_(2)
             view.addSubview_(self.remain_lab)
-            self.seek_bar = NSSlider.alloc().initWithFrame_(
+            self.seek_bar = SeekSlider.alloc().initWithFrame_(
                 NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 168, SIDE_W - 36, 18)
             )
             self.seek_bar.setMinValue_(0.0)
@@ -1545,6 +1601,7 @@ def main() -> int:
             self.seek_bar.setContinuous_(False)
             self.seek_bar.setEnabled_(False)
             self.seek_bar.setTarget_(self)
+            self.seek_bar.ctrl = self
             self.seek_bar.setAction_("seek:")
             self.seek_bar.setAutoresizingMask_(stick_top)
             view.addSubview_(self.seek_bar)
@@ -1773,6 +1830,11 @@ def main() -> int:
                 self.note.setStringValue_("재생 중인 영상이 없습니다.")
                 return
             self.user_stopped = False
+            js = (
+                "(function(){ var v=document.querySelector('video');"
+                f" if(v&&isFinite({at:.3f})) v.currentTime={at:.3f}; }})()"
+            )
+            self.web.evaluateJavaScript_completionHandler_(js, lambda *_a: None)
             _gui_kick(self, "play", source, start=at)
             self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
 
