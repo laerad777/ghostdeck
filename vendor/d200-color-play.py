@@ -563,6 +563,72 @@ def build_video_filters(args, fps, crop):
     return f"{rate_filter},{source_crop}{spatial_filter},transpose=2"
 
 
+def resolve_media_urls(source):
+    """Video URL plus a separate audio URL when yt-dlp prints both."""
+    if source.startswith(("http://", "https://")):
+        probe = run(
+            "yt-dlp", "--no-warnings", "-f",
+            "bv*[vcodec^=avc][height<=1080]+ba/b[vcodec^=avc][height<=1080]/bv*[height<=720]+ba/b[height<=1080]",
+            "-g", source, capture=True,
+        )
+        urls = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+        if not urls:
+            raise RuntimeError("yt-dlp produced no stream URL")
+        return urls[0], urls[1] if len(urls) > 1 else None
+    return source, source
+
+
+def source_has_audio(source):
+    """True when ffprobe sees an audio stream. Missing tools mean no audio, not a crash."""
+    try:
+        result = run(
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=index", "-of", "csv=p=0", source,
+            check=False, capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return bool((result.stdout or "").strip())
+
+
+def build_encoder_command(args, video, audio, filters):
+    """JPEG pipe on stdout; optional CoreAudio on the host, same ffmpeg clock."""
+    command = ["ffmpeg", "-v", "error"]
+
+    def add_input(url):
+        if args.loop:
+            command.extend(["-stream_loop", "-1"])
+        if args.start:
+            command.extend(["-ss", str(args.start)])
+        command.extend(["-i", url])
+
+    add_input(video)
+    audio_index = 0
+    if audio and audio != video:
+        add_input(audio)
+        audio_index = 1
+    if args.duration:
+        command.extend(["-t", str(args.duration)])
+    command.extend([
+        "-map", "0:v:0",
+        "-an",
+        "-vf", filters,
+        "-q:v", str(args.quality),
+        "-pix_fmt", "yuvj420p",
+        "-f", "image2pipe", "-",
+    ])
+    if audio:
+        command.extend([
+            "-map", f"{audio_index}:a:0",
+            "-vn",
+            "-filter:a", "aresample=async=1:first_pts=0",
+            "-c:a", "pcm_s16le",
+            "-f", "coreaudio", "default",
+        ])
+    return command
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Stream owned persistent JPEG video to the D200 native DIVP display plane")
     parser.add_argument("input")
@@ -582,6 +648,7 @@ def main():
     parser.add_argument("--pause-stock-ui", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--crop", default="auto")
     parser.add_argument("--fit", choices=("auto", "pad", "cover"), default="auto")
+    parser.add_argument("--no-audio", action="store_true")
     args = parser.parse_args()
     if args.pause_stock_ui or args.studio_overlay or args.hardware_scale:
         raise SystemExit("stock zkgui remains authoritative; overlay/hardware-scale/pause-stock-ui are unsupported")
@@ -645,25 +712,18 @@ def main():
         state = publish_video_state(state, claim=True, state_path=HOST_STATE)
         claimed = True
         source = args.input
+        audio = None
         if source.startswith(("http://", "https://")):
-            probe = run("yt-dlp", "--no-warnings", "-f", "bv*[vcodec^=avc][height<=1080]+ba/b[vcodec^=avc][height<=1080]/bv*[height<=720]+ba/b[height<=1080]", "-g", source, capture=True)
-            urls = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
-            if not urls:
-                raise RuntimeError("yt-dlp produced no stream URL")
-            source = urls[0]
+            video, audio = resolve_media_urls(source)
+            source = video
+        elif not args.no_audio:
+            audio = source if source_has_audio(source) else None
+        if args.no_audio:
+            audio = None
         fps = parse_fps(args.fps, source)
         crop = detect_crop(source) if args.crop == "auto" else args.crop
         filters = build_video_filters(args, fps, crop)
-        command = ["ffmpeg", "-v", "error"]
-        if args.loop:
-            command += ["-stream_loop", "-1"]
-        if args.start:
-            command += ["-ss", str(args.start)]
-        command += ["-i", source]
-        if args.duration:
-            command += ["-t", str(args.duration)]
-        command += ["-vf", filters, "-q:v", str(args.quality),
-                    "-pix_fmt", "yuvj420p", "-f", "image2pipe", "-"]
+        command = build_encoder_command(args, source, audio, filters)
         ensure_runtime_modules()
         deadline = time.monotonic() + 10
         client = connect_bridge(BRIDGE_SOCKET, deadline, cancel)

@@ -84,3 +84,29 @@ def test_unproven_open_is_retried_once():
     )
     assert not play.should_retry_unproven_open({"accepted": True, "error": ""})
     assert not play.should_retry_unproven_open({"accepted": False, "error": "another video session is already opening"})
+
+
+def test_encoder_plays_host_audio_from_a_second_input():
+    play = _play()
+    args = type("Args", (), {"loop": False, "start": 12.5, "duration": 0, "quality": 12})()
+    command = play.build_encoder_command(
+        args, "https://v.example/video", "https://v.example/audio", "fps=30,scale=960:540",
+    )
+    assert command[:3] == ["ffmpeg", "-v", "error"]
+    assert command.count("-i") == 2
+    assert "-ss" in command
+    assert "12.5" in command
+    assert "-f" in command and "image2pipe" in command
+    assert "coreaudio" in command
+    assert "aresample=async=1:first_pts=0" in command
+    assert "-map" in command and "1:a:0" in command
+
+
+def test_encoder_skips_coreaudio_without_an_audio_stream():
+    play = _play()
+    args = type("Args", (), {"loop": True, "start": 0, "duration": 0, "quality": 5})()
+    command = play.build_encoder_command(args, "/tmp/clip.mp4", None, "fps=30")
+    assert command.count("-i") == 1
+    assert "-stream_loop" in command
+    assert "coreaudio" not in command
+    assert "-an" in command
