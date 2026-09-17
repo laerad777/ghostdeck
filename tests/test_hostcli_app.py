@@ -682,7 +682,7 @@ def test_deck_playhead_stays_at_start_until_the_first_frame(tmp_path):
                 "phase": "active",
                 "source": "/tmp/a.mp4",
                 "start": 0,
-                "playheadAt": time.time() - 3.0,
+                "playheadAt": time.time() - 0.5,
                 "diagnostics": {"startedMonotonicNs": 1_000_000_000, "hostElapsedNs": 3_000_000_000},
             }
         ),
@@ -697,10 +697,36 @@ def test_deck_playhead_stays_at_start_until_the_first_frame(tmp_path):
 
 def test_deck_has_picture_needs_a_sent_frame(tmp_path):
     path = tmp_path / "host.json"
-    path.write_text('{"phase":"active","diagnostics":{"framesSent":12}}\n', encoding="utf-8")
+    path.write_text(
+        json.dumps({"phase": "active", "playheadAt": time.time(), "diagnostics": {"framesSent": 12}}),
+        encoding="utf-8",
+    )
     assert deck_has_picture(path) is True
     path.write_text('{"phase":"active","diagnostics":{"framesSent":0}}\n', encoding="utf-8")
     assert deck_has_picture(path) is False
+
+
+def test_deck_has_picture_ignores_a_stale_host_receipt(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text(
+        json.dumps(
+            {
+                "phase": "active",
+                "playheadAt": time.time() - 10,
+                "diagnostics": {"framesSent": 231},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert deck_has_picture(path) is False
+
+
+def test_abandon_host_session_marks_a_leftover_active_receipt(tmp_path):
+    from ghostdeck.play import abandon_host_session
+    path = tmp_path / "host.json"
+    path.write_text('{"phase":"active","source":"/tmp/a.mp4","playheadAt":1}\n', encoding="utf-8")
+    abandon_host_session(path)
+    assert json.loads(path.read_text())["phase"] == "terminal"
 
 
 def test_source_duration_reads_ffprobe():

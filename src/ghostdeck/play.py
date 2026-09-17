@@ -7,6 +7,7 @@ patch stay on this module -- the split files read them from here at call time.
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -97,6 +98,31 @@ def _validate_source(source: str) -> None:
         raise RuntimeError(f"source is not a file and is not a URL: {source}")
 
 
+def abandon_host_session(path: Path | None = None) -> None:
+    """A dead player that left phase=active must not look like a live session."""
+    target = path or _HOST_STATE
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return
+    if not isinstance(data, dict) or str(data.get("phase") or "") != "active":
+        return
+    data["phase"] = "terminal"
+    data.pop("playheadAt", None)
+    try:
+        target.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+def _host_session_active() -> bool:
+    try:
+        data = json.loads(_HOST_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return isinstance(data, dict) and str(data.get("phase") or "") == "active"
+
+
 def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = True, crop: str = "auto") -> None:
     _require_tools(source)
     adb.require_adb()
@@ -142,6 +168,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     _signal_speakers()
     if predecessor:
         _session_released(timeout=1.5 if start > 0 else 4.0)
+    abandon_host_session()
     if not VENDOR_PLAY.is_file():
         raise RuntimeError(f"vendor player missing: {VENDOR_PLAY}")
     env = dict(os.environ)
@@ -250,5 +277,6 @@ def stop() -> None:
             raise hid_error
     if record_is_disposable:
         _clear_play_records()
+    abandon_host_session()
     if identity_error is not None:
         raise identity_error

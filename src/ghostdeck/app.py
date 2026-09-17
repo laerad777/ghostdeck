@@ -568,6 +568,12 @@ def deck_has_picture(path: Path = HOST_STATE) -> bool:
         return False
     if not isinstance(data, dict) or str(data.get("phase") or "") != "active":
         return False
+    try:
+        wall = float(data.get("playheadAt") or 0.0)
+    except (TypeError, ValueError):
+        wall = 0.0
+    if wall <= 0 or (time.time() - wall) > 2.5:
+        return False
     diag = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
     try:
         if int(diag.get("framesSent") or 0) > 0:
@@ -615,6 +621,12 @@ def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
     if not math.isfinite(rate) or rate <= 0:
         rate = 1.0
     active = str(data.get("phase") or "") == "active"
+    try:
+        published_at = float(data.get("playheadAt") or 0.0)
+    except (TypeError, ValueError):
+        published_at = 0.0
+    if active and published_at > 0 and (time.time() - published_at) > 2.5:
+        active = False
     diag = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
     started = diag.get("startedMonotonicNs")
     elapsed = diag.get("hostElapsedNs")

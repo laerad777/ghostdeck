@@ -54,6 +54,7 @@ def deck_home(tmp_path, monkeypatch):
     monkeypatch.setattr(studio, "BRIDGE_STATE", tmp_path / "bridge.pid")
     monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    monkeypatch.setattr(play, "_HOST_STATE", tmp_path / "d200-color-host.json")
     # `play` chooses between `require_bridge` (refuse and name `ghostdeck studio`) and starting the
     # bridge itself, based on whether the official app is installed. That decision must be pinned, or
     # every test here would answer differently on a host that has it. The default is "installed"
