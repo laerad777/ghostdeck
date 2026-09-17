@@ -645,6 +645,10 @@ def main() -> int:
         import objc
         from AppKit import (
             NSApp,
+            NSAppearance,
+            NSImage,
+            NSVisualEffectView,
+            NSWindowStyleMaskFullSizeContentView,
             NSApplication,
             NSBackingStoreBuffered,
             NSBezelStyleRounded,
@@ -754,7 +758,7 @@ def main() -> int:
     btn.type = 'button';
     btn.textContent = '＋ 대기열';
     btn.setAttribute('aria-label', '대기열에 넣기');
-    btn.style.cssText = 'position:fixed;right:12px;bottom:72px;z-index:2147483647;padding:8px 12px;border:0;border-radius:16px;background:#111;color:#fff;font:600 13px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;opacity:.92;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35);';
+    btn.style.cssText = 'position:fixed;right:14px;bottom:80px;z-index:2147483647;padding:9px 14px;border:0;border-radius:999px;background:#C8FF47;color:#111;font:700 12px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;letter-spacing:.02em;cursor:pointer;box-shadow:0 8px 24px rgba(200,255,71,.28);';
     btn.addEventListener('click', function(e){
       e.preventDefault();
       e.stopPropagation();
@@ -778,6 +782,42 @@ def main() -> int:
   }, 400);
 })();
 """
+    def _rgb(r, g, b, a=1.0):
+        return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, a)
+
+    INK = _rgb(0.035, 0.035, 0.04)
+    CARD = _rgb(0.12, 0.12, 0.135)
+    LIME = _rgb(0.784, 1.0, 0.278)
+    GHOST = _rgb(1, 1, 1, 0.52)
+    HAIR = _rgb(1, 1, 1, 0.12)
+    SNOW = NSColor.whiteColor()
+
+    def _label(frame, text, size=12, bold=False, color=None, mask=0):
+        lab = NSTextField.alloc().initWithFrame_(frame)
+        lab.setEditable_(False)
+        lab.setBezeled_(False)
+        lab.setDrawsBackground_(False)
+        lab.setFont_(NSFont.boldSystemFontOfSize_(size) if bold else NSFont.systemFontOfSize_(size))
+        lab.setTextColor_(color or SNOW)
+        lab.setStringValue_(text)
+        lab.setAutoresizingMask_(mask)
+        return lab
+
+    def _pill(btn, fill, ink):
+        btn.setBordered_(False)
+        btn.setWantsLayer_(True)
+        btn.layer().setCornerRadius_(9.0)
+        btn.layer().setBackgroundColor_(fill.CGColor())
+        if ink is not None:
+            btn.setContentTintColor_(ink)
+        return btn
+
+    def _symbol(name):
+        try:
+            return NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        except Exception:
+            return None
+
 
     def _gui_href(ctrl) -> str:
         url = ctrl.web.URL()
@@ -995,41 +1035,49 @@ def main() -> int:
             self.playlist = playlist_load(PLAYLIST_PATH)
             self.was_playing = False
             self.user_stopped = False
-            # Phone-width browser on the left; the deck queue on the right.
-            PAD = 10
-            PHONE_W = 390
-            SIDE_W = 360
-            SIDE_GAP = 12
+            # Dark shell: phone column + frosted queue.
+            PAD = 20
+            PHONE_W = 392
+            SIDE_W = 372
+            SIDE_GAP = 18
             W = PAD + PHONE_W + SIDE_GAP + SIDE_W + PAD
-            H = 780
-            BAR_H, BAR_Y = 34, 46
-            WEB_Y = BAR_Y + BAR_H + 10
-            RIGHT = 104
-            GAP = 8
-            FILE_W = 48
-            URL_X = 134
+            H = 820
+            FOOT = 26
+            PHONE_X, PHONE_Y = PAD, FOOT
+            PHONE_H = H - FOOT - 40
+            CHROME = 44
+            SIDE_X = PAD + PHONE_W + SIDE_GAP
+            stick_top = NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin
+            stick_bot = NSViewMinXMargin | NSViewMaxYMargin
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, W, H),
                 NSWindowStyleMaskTitled
                 | NSWindowStyleMaskClosable
                 | NSWindowStyleMaskMiniaturizable
-                | NSWindowStyleMaskResizable,
+                | NSWindowStyleMaskResizable
+                | NSWindowStyleMaskFullSizeContentView,
                 NSBackingStoreBuffered,
                 False,
             )
-            self.window.setTitle_("ghostdeck — 덱 플레이어")
+            self.window.setTitle_("ghostdeck")
+            self.window.setTitlebarAppearsTransparent_(True)
+            self.window.setTitleVisibility_(1)
             self.window.setReleasedWhenClosed_(False)
-            self.window.setMinSize_((PAD + PHONE_W + SIDE_GAP + 220 + PAD, 520))
-            # `initWithContentRect` is a request, and the toolbar's autolayout can leave the window at
-            # its minimum instead of the requested size (observed: 460x808 for a 980x780 request).
-            # Setting the frame after the content view exists makes the requested size authoritative.
+            self.window.setMinSize_((760, 560))
             self.window.setContentSize_((W, H))
+            self.window.setBackgroundColor_(INK)
+            try:
+                self.window.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua"))
+            except Exception:
+                pass
             self.window.center()
             view = self.window.contentView()
-            drop = DropBar.alloc().initWithFrame_(NSMakeRect(0, 0, W, WEB_Y))
+            view.setWantsLayer_(True)
+            view.layer().setBackgroundColor_(INK.CGColor())
+            drop = DropBar.alloc().initWithFrame_(view.bounds())
             drop.ctrl = self
             drop.registerForDraggedTypes_([NSFilenamesPboardType])
-            drop.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            drop.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             view.addSubview_(drop)
 
             config = WKWebViewConfiguration.alloc().init()
@@ -1057,77 +1105,164 @@ def main() -> int:
             prefs = config.defaultWebpagePreferences()
             if prefs is not None:
                 prefs.setPreferredContentMode_(0)
+
+            shell = NSView.alloc().initWithFrame_(NSMakeRect(PHONE_X, PHONE_Y, PHONE_W, PHONE_H))
+            shell.setWantsLayer_(True)
+            shell.layer().setCornerRadius_(28.0)
+            shell.layer().setMasksToBounds_(True)
+            shell.layer().setBorderWidth_(1.0)
+            shell.layer().setBorderColor_(HAIR.CGColor())
+            shell.setAutoresizingMask_(NSViewHeightSizable)
+            view.addSubview_(shell)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(PAD, WEB_Y, PHONE_W, H - WEB_Y),
+                NSMakeRect(0, 0, PHONE_W, PHONE_H - CHROME),
                 config,
             )
-            self.web.setAutoresizingMask_(NSViewHeightSizable)
+            self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             self.web.setUIDelegate_(self)
             self.web.setNavigationDelegate_(self)
-            view.addSubview_(self.web)
+            shell.addSubview_(self.web)
             self.web.loadRequest_(
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
-            SIDE_X = PAD + PHONE_W + SIDE_GAP
-            pane = QueueDrop.alloc().initWithFrame_(NSMakeRect(SIDE_X, WEB_Y, SIDE_W, H - WEB_Y))
+            chrome = NSView.alloc().initWithFrame_(NSMakeRect(0, PHONE_H - CHROME, PHONE_W, CHROME))
+            chrome.setWantsLayer_(True)
+            chrome.layer().setBackgroundColor_(_rgb(0.07, 0.07, 0.08).CGColor())
+            chrome.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+            shell.addSubview_(chrome)
+
+            def nav_btn(x, title, symbol, action):
+                btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, 7, 30, 30))
+                img = _symbol(symbol)
+                if img is not None:
+                    btn.setImage_(img)
+                    btn.setBordered_(False)
+                    btn.setContentTintColor_(SNOW)
+                else:
+                    btn.setTitle_(title)
+                    btn.setBordered_(False)
+                    btn.setFont_(NSFont.systemFontOfSize_(16))
+                btn.setTarget_(self)
+                btn.setAction_(action)
+                chrome.addSubview_(btn)
+                return btn
+
+            nav_btn(8, "‹", "chevron.left", "back:")
+            nav_btn(40, "›", "chevron.right", "forward:")
+            self.file_btn = NSButton.alloc().initWithFrame_(NSMakeRect(76, 7, 44, 30))
+            self.file_btn.setTitle_("파일")
+            self.file_btn.setFont_(NSFont.boldSystemFontOfSize_(11))
+            _pill(self.file_btn, CARD, SNOW)
+            self.file_btn.setTarget_(self)
+            self.file_btn.setAction_("openFile:")
+            self.file_btn.setKeyEquivalent_("o")
+            self.file_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            chrome.addSubview_(self.file_btn)
+            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(126, 8, PHONE_W - 138, 28))
+            self.url_field.setStringValue_("https://www.youtube.com")
+            self.url_field.setBezeled_(False)
+            self.url_field.setDrawsBackground_(True)
+            self.url_field.setBackgroundColor_(CARD)
+            self.url_field.setTextColor_(SNOW)
+            self.url_field.setFont_(NSFont.systemFontOfSize_(11))
+            self.url_field.setWantsLayer_(True)
+            self.url_field.layer().setCornerRadius_(8.0)
+            self.url_field.setTarget_(self)
+            self.url_field.setAction_("go:")
+            self.url_field.setAutoresizingMask_(NSViewWidthSizable)
+            chrome.addSubview_(self.url_field)
+
+            frost = NSVisualEffectView.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X, PHONE_Y, SIDE_W, PHONE_H)
+            )
+            frost.setMaterial_(7)
+            frost.setBlendingMode_(0)
+            frost.setState_(1)
+            frost.setWantsLayer_(True)
+            frost.layer().setCornerRadius_(22.0)
+            frost.layer().setMasksToBounds_(True)
+            frost.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
+            view.addSubview_(frost)
+            pane = QueueDrop.alloc().initWithFrame_(frost.bounds())
             pane.ctrl = self
             pane.registerForDraggedTypes_([NSFilenamesPboardType])
-            pane.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
-            view.addSubview_(pane)
-            heading = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 20, SIDE_W, 16))
-            heading.setEditable_(False)
-            heading.setBezeled_(False)
-            heading.setDrawsBackground_(False)
-            heading.setFont_(NSFont.boldSystemFontOfSize_(11))
-            heading.setTextColor_(NSColor.secondaryLabelColor())
-            heading.setStringValue_("지금 재생")
-            heading.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            pane.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            frost.addSubview_(pane)
+
+            heading = _label(
+                NSMakeRect(SIDE_X + 18, PHONE_Y + PHONE_H - 36, SIDE_W - 36, 14),
+                "NOW", 10, True, LIME, stick_top,
+            )
             view.addSubview_(heading)
-            self.now_title = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 42, SIDE_W, 20))
-            self.now_title.setEditable_(False)
-            self.now_title.setBezeled_(False)
-            self.now_title.setDrawsBackground_(False)
-            self.now_title.setFont_(NSFont.boldSystemFontOfSize_(13))
-            self.now_title.setStringValue_("재생 중인 영상이 없습니다")
-            self.now_title.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            self.now_title = _label(
+                NSMakeRect(SIDE_X + 18, PHONE_Y + PHONE_H - 62, SIDE_W - 36, 22),
+                "재생 중인 영상이 없습니다", 15, True, SNOW, stick_top,
+            )
             view.addSubview_(self.now_title)
-            self.now_channel = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 58, SIDE_W, 16))
-            self.now_channel.setEditable_(False)
-            self.now_channel.setBezeled_(False)
-            self.now_channel.setDrawsBackground_(False)
-            self.now_channel.setFont_(NSFont.labelFontOfSize_(11))
-            self.now_channel.setTextColor_(NSColor.secondaryLabelColor())
-            self.now_channel.setStringValue_("페이지에서 추가하거나 파일을 놓으십시오")
-            self.now_channel.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+            self.now_channel = _label(
+                NSMakeRect(SIDE_X + 18, PHONE_Y + PHONE_H - 80, SIDE_W - 36, 16),
+                "페이지에서 추가하거나 파일을 놓으십시오", 11, False, GHOST, stick_top,
+            )
             view.addSubview_(self.now_channel)
-            self.queue_head = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 80, SIDE_W, 16))
-            self.queue_head.setEditable_(False)
-            self.queue_head.setBezeled_(False)
-            self.queue_head.setDrawsBackground_(False)
-            self.queue_head.setFont_(NSFont.boldSystemFontOfSize_(11))
-            self.queue_head.setTextColor_(NSColor.secondaryLabelColor())
-            self.queue_head.setStringValue_("대기열")
-            self.queue_head.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin)
+
+            self.play_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + 18, PHONE_Y + PHONE_H - 120, 150, 32)
+            )
+            self.play_btn.setTitle_("▶   덱 재생")
+            self.play_btn.setFont_(NSFont.boldSystemFontOfSize_(12))
+            _pill(self.play_btn, LIME, INK)
+            self.play_btn.setTarget_(self)
+            self.play_btn.setAction_("play:")
+            self.play_btn.setKeyEquivalent_("\r")
+            self.play_btn.setAutoresizingMask_(stick_top)
+            view.addSubview_(self.play_btn)
+            self.stop_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + 176, PHONE_Y + PHONE_H - 120, 72, 32)
+            )
+            self.stop_btn.setTitle_("■  정지")
+            self.stop_btn.setFont_(NSFont.boldSystemFontOfSize_(12))
+            _pill(self.stop_btn, CARD, SNOW)
+            self.stop_btn.setTarget_(self)
+            self.stop_btn.setAction_("stop:")
+            self.stop_btn.setKeyEquivalent_("\x1b")
+            self.stop_btn.setAutoresizingMask_(stick_top)
+            view.addSubview_(self.stop_btn)
+
+            self.queue_head = _label(
+                NSMakeRect(SIDE_X + 18, PHONE_Y + PHONE_H - 150, SIDE_W - 36, 14),
+                "대기열", 10, True, GHOST, stick_top,
+            )
             view.addSubview_(self.queue_head)
+
             BTN_H = 28
-            table_y = WEB_Y + BTN_H + 8
-            table_h = max(80, (H - 86) - table_y)
-            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(SIDE_X, table_y, SIDE_W, table_h))
+            table_y = PHONE_Y + 46
+            table_h = max(80, (PHONE_Y + PHONE_H - 162) - table_y)
+            scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(SIDE_X + 10, table_y, SIDE_W - 20, table_h)
+            )
             scroll.setHasVerticalScroller_(True)
-            scroll.setBorderType_(NSBezelBorder)
+            scroll.setBorderType_(0)
+            scroll.setDrawsBackground_(False)
             scroll.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
             self.playlist_table = NSTableView.alloc().initWithFrame_(scroll.contentView().bounds())
             title_col = NSTableColumn.alloc().initWithIdentifier_("title")
-            title_col.setWidth_(SIDE_W - 120)
+            title_col.setWidth_(SIDE_W - 140)
             title_col.setEditable_(False)
             chan_col = NSTableColumn.alloc().initWithIdentifier_("channel")
-            chan_col.setWidth_(96)
+            chan_col.setWidth_(100)
             chan_col.setEditable_(False)
             self.playlist_table.addTableColumn_(title_col)
             self.playlist_table.addTableColumn_(chan_col)
             self.playlist_table.setHeaderView_(None)
-            self.playlist_table.setRowHeight_(36)
-            self.playlist_table.setUsesAlternatingRowBackgroundColors_(True)
+            self.playlist_table.setRowHeight_(40)
+            self.playlist_table.setUsesAlternatingRowBackgroundColors_(False)
+            self.playlist_table.setBackgroundColor_(NSColor.clearColor())
+            try:
+                self.playlist_table.setAppearance_(
+                    NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+                )
+            except Exception:
+                pass
             self.playlist_table.setDataSource_(self)
             self.playlist_table.setDelegate_(self)
             self.playlist_table.setAllowsEmptySelection_(True)
@@ -1150,116 +1285,25 @@ def main() -> int:
             self.playlist_table.setMenu_(menu)
             scroll.setDocumentView_(self.playlist_table)
             view.addSubview_(scroll)
-            bgap = 6
-            self.add_btn = NSButton.alloc().initWithFrame_(NSMakeRect(SIDE_X, WEB_Y, 72, BTN_H))
-            self.add_btn.setTitle_("＋ 넣기")
-            self.add_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.add_btn.setTarget_(self)
-            self.add_btn.setAction_("addToPlaylist:")
-            self.add_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
-            view.addSubview_(self.add_btn)
-            self.row_play_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + 72 + bgap, WEB_Y, 56, BTN_H)
-            )
-            self.row_play_btn.setTitle_("재생")
-            self.row_play_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.row_play_btn.setTarget_(self)
-            self.row_play_btn.setAction_("playSelected:")
-            self.row_play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
-            view.addSubview_(self.row_play_btn)
-            self.up_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + 134, WEB_Y, 32, BTN_H)
-            )
-            self.up_btn.setTitle_("↑")
-            self.up_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.up_btn.setTarget_(self)
-            self.up_btn.setAction_("moveUp:")
-            self.up_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
-            view.addSubview_(self.up_btn)
-            self.down_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + 172, WEB_Y, 32, BTN_H)
-            )
-            self.down_btn.setTitle_("↓")
-            self.down_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.down_btn.setTarget_(self)
-            self.down_btn.setAction_("moveDown:")
-            self.down_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
-            view.addSubview_(self.down_btn)
-            self.del_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + SIDE_W - 52, WEB_Y, 52, BTN_H)
-            )
-            self.del_btn.setTitle_("삭제")
-            self.del_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.del_btn.setTarget_(self)
-            self.del_btn.setAction_("removeSelected:")
-            self.del_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
-            view.addSubview_(self.del_btn)
+
+            def qbtn(x, w, title, action):
+                btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, PHONE_Y + 12, w, BTN_H))
+                btn.setTitle_(title)
+                btn.setFont_(NSFont.boldSystemFontOfSize_(11))
+                _pill(btn, CARD, SNOW)
+                btn.setTarget_(self)
+                btn.setAction_(action)
+                btn.setAutoresizingMask_(stick_bot)
+                view.addSubview_(btn)
+                return btn
+
+            self.add_btn = qbtn(SIDE_X + 12, 72, "＋ 넣기", "addToPlaylist:")
+            self.row_play_btn = qbtn(SIDE_X + 90, 52, "재생", "playSelected:")
+            self.up_btn = qbtn(SIDE_X + 148, 32, "↑", "moveUp:")
+            self.down_btn = qbtn(SIDE_X + 186, 32, "↓", "moveDown:")
+            self.del_btn = qbtn(SIDE_X + SIDE_W - 64, 52, "삭제", "removeSelected:")
             _gui_playlist_draw(self)
 
-            back = NSButton.alloc().initWithFrame_(NSMakeRect(10, BAR_Y, 32, BAR_H))
-            back.setTitle_("‹")
-            back.setBezelStyle_(NSBezelStyleRounded)
-            back.setTarget_(self)
-            back.setAction_("back:")
-            back.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(back)
-
-            fwd = NSButton.alloc().initWithFrame_(NSMakeRect(46, BAR_Y, 32, BAR_H))
-            fwd.setTitle_("›")
-            fwd.setBezelStyle_(NSBezelStyleRounded)
-            fwd.setTarget_(self)
-            fwd.setAction_("forward:")
-            fwd.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(fwd)
-
-            self.file_btn = NSButton.alloc().initWithFrame_(NSMakeRect(82, BAR_Y, FILE_W, BAR_H))
-            self.file_btn.setTitle_("파일")
-            self.file_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.file_btn.setTarget_(self)
-            self.file_btn.setAction_("openFile:")
-            self.file_btn.setKeyEquivalent_("o")
-            self.file_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
-            self.file_btn.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(self.file_btn)
-
-            # The field takes whatever is left over; the two action buttons keep their width and ride
-            # the right edge, so resizing moves the URL field and nothing overlaps.
-            phone_right = PAD + PHONE_W
-            url_w = max(80, phone_right - URL_X - (2 * RIGHT + GAP + 8))
-            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(URL_X, BAR_Y, url_w, BAR_H))
-            self.url_field.setStringValue_("https://www.youtube.com")
-            self.url_field.setTarget_(self)
-            self.url_field.setAction_("go:")
-            self.url_field.setFont_(NSFont.systemFontOfSize_(12))
-            self.url_field.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(self.url_field)
-
-            # Play AND stop. The stop path has always existed (`DeckRemote.stop` -> `ghostdeck stop`),
-            # but no control ever called it, so a video started from this window could only be stopped
-            # from a terminal -- which is exactly what this window exists to avoid.
-            self.play_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(phone_right - 8 - 2 * RIGHT - GAP, BAR_Y, RIGHT, BAR_H)
-            )
-            self.play_btn.setTitle_("▶  재생")
-            self.play_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.play_btn.setFont_(NSFont.boldSystemFontOfSize_(13))
-            self.play_btn.setTarget_(self)
-            self.play_btn.setAction_("play:")
-            self.play_btn.setKeyEquivalent_("\r")
-            self.play_btn.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(self.play_btn)
-
-            self.stop_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(phone_right - 8 - RIGHT, BAR_Y, RIGHT, BAR_H)
-            )
-            self.stop_btn.setTitle_("■  정지")
-            self.stop_btn.setBezelStyle_(NSBezelStyleRounded)
-            self.stop_btn.setFont_(NSFont.systemFontOfSize_(13))
-            self.stop_btn.setTarget_(self)
-            self.stop_btn.setAction_("stop:")
-            self.stop_btn.setKeyEquivalent_("\x1b")
-            self.stop_btn.setAutoresizingMask_(NSViewMaxYMargin)
-            view.addSubview_(self.stop_btn)
             reload_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
             reload_btn.setKeyEquivalent_("r")
             reload_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
@@ -1273,35 +1317,18 @@ def main() -> int:
             focus_btn.setAction_("focusUrl:")
             view.addSubview_(focus_btn)
 
-            # A status dot plus the summary. The dot is the only thing that has to be read at a
-            # glance; the text says which deck state it is.
-            self.dot = NSTextField.alloc().initWithFrame_(NSMakeRect(12, 24, 14, 18))
-            self.dot.setEditable_(False)
-            self.dot.setBezeled_(False)
-            self.dot.setDrawsBackground_(False)
-            self.dot.setFont_(NSFont.systemFontOfSize_(12))
-            self.dot.setStringValue_("●")
-            self.dot.setTextColor_(NSColor.secondaryLabelColor())
-            self.dot.setAutoresizingMask_(NSViewMaxYMargin)
+            self.dot = _label(NSMakeRect(PAD, 6, 14, 16), "●", 10, False, LIME, NSViewMaxYMargin)
             view.addSubview_(self.dot)
-
-            self.status = NSTextField.alloc().initWithFrame_(NSMakeRect(30, 24, W - 42, 18))
-            self.status.setEditable_(False)
-            self.status.setBezeled_(False)
-            self.status.setDrawsBackground_(False)
-            self.status.setFont_(NSFont.systemFontOfSize_(12))
-            self.status.setStringValue_("상태 확인 중…")
-            self.status.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            self.status = _label(
+                NSMakeRect(PAD + 16, 6, 280, 16), "상태 확인 중…", 10, False, GHOST,
+                NSViewMaxYMargin,
+            )
             view.addSubview_(self.status)
-
-            self.note = NSTextField.alloc().initWithFrame_(NSMakeRect(12, 6, W - 24, 16))
-            self.note.setEditable_(False)
-            self.note.setBezeled_(False)
-            self.note.setDrawsBackground_(False)
-            self.note.setFont_(NSFont.labelFontOfSize_(11))
-            self.note.setTextColor_(NSColor.secondaryLabelColor())
-            self.note.setStringValue_("파일 또는 유튜브를 열고 재생을 누르십시오. 광고는 무시합니다.")
-            self.note.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            self.note = _label(
+                NSMakeRect(PAD + 300, 6, W - PAD - 310, 16),
+                "유튜브를 열고 덱 재생. 대기열은 오른쪽.",
+                10, False, GHOST, NSViewWidthSizable | NSViewMaxYMargin,
+            )
             view.addSubview_(self.note)
 
             self.window.makeKeyAndOrderFront_(None)
