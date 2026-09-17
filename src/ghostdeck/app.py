@@ -587,11 +587,18 @@ def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
             and isinstance(elapsed, (int, float))
             and isinstance(first, (int, float))
         ):
-            now = float(started) + float(elapsed)
-            if now >= float(first):
-                pos = start + (now - float(first)) / 1e9 * rate
+            published = float(started) + float(elapsed)
+            if published >= float(first):
+                pos = start + (published - float(first)) / 1e9 * rate
     except (TypeError, ValueError):
         pos = start
+    if active:
+        try:
+            wall = float(data.get("playheadAt") or 0.0)
+        except (TypeError, ValueError):
+            wall = 0.0
+        if wall > 0:
+            pos += max(0.0, time.time() - wall) * rate
     if not math.isfinite(pos) or pos < 0:
         pos = 0.0
     return source, pos, active
@@ -1476,7 +1483,7 @@ def main() -> int:
             ctrl.seeking = True
             objc.super(SeekSlider, self).mouseDown_(event)
             ctrl.hold_pos = play_offset(self.doubleValue())
-            ctrl.hold_until = time.monotonic() + 8.0
+            ctrl.hold_until = time.monotonic() + 2.0
             ctrl.seeking = False
             elapsed = getattr(ctrl, "elapsed_lab", None)
             if elapsed is not None:
@@ -1884,7 +1891,7 @@ def main() -> int:
                 2.0, self, "poll:", None, True
             )
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                0.4, self, "tickPlayhead:", None, True
+                0.1, self, "tickPlayhead:", None, True
             )
             AppHelper.callAfter(lambda: _gui_kick(self, "status", ""))
             return self
@@ -2001,7 +2008,7 @@ def main() -> int:
                 return
             self.user_stopped = False
             self.hold_pos = at
-            self.hold_until = time.monotonic() + 8.0
+            self.hold_until = time.monotonic() + 2.0
             _gui_kick(self, "play", source, start=at, crop="none")
             self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
         def prevTrack_(self, _sender):

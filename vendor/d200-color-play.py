@@ -753,9 +753,9 @@ def main():
     def publish_diagnostics():
         nonlocal state, last_publication
         now = diagnostics.clock()
-        # Fixed-size snapshots at most once per second, plus lifecycle publications.
-        if last_publication is None or now - last_publication >= 1_000_000_000:
+        if last_publication is None or now - last_publication >= 200_000_000:
             state["diagnostics"] = diagnostics.snapshot()
+            state["playheadAt"] = time.time()
             state = publish_video_state(state, state_path=HOST_STATE)
             last_publication = now
 
@@ -823,6 +823,12 @@ def main():
             threading.Thread(
                 target=drain_bounded, args=(speaker.stderr, bytearray()), daemon=True,
             ).start()
+        def playhead_loop():
+            while not cancel.is_set() and not finalizing:
+                publish_diagnostics()
+                cancel.wait(0.2)
+
+        threading.Thread(target=playhead_loop, daemon=True).start()
         total = stream.produce(encoder.stdout, encoder)
         check_cancel(cancel)
         answer = video_bridge_request(dict(schemaVersion=1, op="videoStatus", **credentials), 5,

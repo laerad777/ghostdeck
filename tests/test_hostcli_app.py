@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import json
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -653,6 +654,24 @@ def test_deck_playhead_adds_elapsed_since_first_frame(tmp_path):
     assert source == "/tmp/a.mp4"
     assert active is True
     assert abs(pos - 18.0) < 0.01
+def test_deck_playhead_keeps_moving_after_the_last_host_publish(tmp_path):
+    path = tmp_path / "host.json"
+    payload = {
+        "phase": "active",
+        "source": "/tmp/a.mp4",
+        "start": 12,
+        "playbackRate": 1,
+        "playheadAt": time.time() - 2.0,
+        "diagnostics": {
+            "startedMonotonicNs": 1_000_000_000,
+            "hostElapsedNs": 8_000_000_000,
+            "milestones": {"firstConsumedReceipt": {"monotonicNs": 3_000_000_000}},
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    _source, pos, active = deck_playhead(path)
+    assert active is True
+    assert abs(pos - 20.0) < 0.3
 
 
 def test_source_duration_reads_ffprobe():
