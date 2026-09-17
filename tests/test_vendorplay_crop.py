@@ -69,6 +69,14 @@ def test_auto_crop_runs_on_http_streams():
     assert "detect_crop(source)" in text
 
 
+def test_host_speaker_argv_is_our_audiotoolbox_ffmpeg():
+    from ghostdeck.playident import is_host_speaker_argv
+    assert is_host_speaker_argv(["ffmpeg", "-f", "audiotoolbox", "dummy"]) is True
+    assert is_host_speaker_argv(["/opt/homebrew/bin/ffmpeg", "-re", "-i", "a", "-f", "audiotoolbox", "dummy"]) is True
+    assert is_host_speaker_argv(["ffmpeg", "-i", "in.mp4", "out.mp4"]) is False
+    assert is_host_speaker_argv(["python", "-u", "d200-color-play.py"]) is False
+
+
 def test_unproven_open_is_retried_once():
     """A YouTube session that dies messy leaves cleanup unproven; the next OPEN was refused.
 

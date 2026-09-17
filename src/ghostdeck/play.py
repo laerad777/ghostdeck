@@ -40,6 +40,7 @@ from ghostdeck.playident import (
     _remove_identity,
     _signal_host_stated_player,
     _signal_vendor_players,
+    _signal_speakers,
     _vendor_player_pids,
     _write_identity,
     deck_transport,
@@ -132,11 +133,15 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         found = usb.detect()
     if found is None or found.get("mode") != "adb":
         raise RuntimeError("deck is not in ADB after switch")
+    predecessor = gdstate.load().get("play_pid") is not None
     try:
         _kill_play()
     except RuntimeError as error:
-        # A new player is about to take over the pid, so an unverifiable predecessor is not fatal.
+        predecessor = True
         print(f"warning: {error}", file=sys.stderr)
+    _signal_speakers()
+    if predecessor:
+        _session_released(timeout=4.0)
     if not VENDOR_PLAY.is_file():
         raise RuntimeError(f"vendor player missing: {VENDOR_PLAY}")
     env = dict(os.environ)

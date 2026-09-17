@@ -417,6 +417,52 @@ def _signal_vendor_players() -> None:
         except OSError:
             pass
 
+
+def is_host_speaker_argv(tokens: list[str]) -> bool:
+    """True for our AudioToolbox ffmpeg (`-f audiotoolbox dummy`)."""
+    if not tokens:
+        return False
+    if Path(tokens[0]).name != "ffmpeg":
+        return False
+    return "audiotoolbox" in tokens and "dummy" in tokens
+
+
+def _speaker_pids() -> list[int]:
+    env = dict(os.environ, LC_ALL="C")
+    try:
+        result = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=P._PS_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if is_host_speaker_argv(parts[1].split()):
+            pids.append(pid)
+    return pids
+
+
+def _signal_speakers() -> None:
+    """SIGKILL leftover host speakers so a skip cannot overlap audio."""
+    for pid in _speaker_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def _signal_host_stated_player() -> None:
     """SIGTERM the pid published in host json if it is the vendor player.
 
@@ -475,6 +521,7 @@ def _kill_play(*, keep_record: bool = False) -> None:
     if pid is None:
         # No session is recorded, so an orphaned sidecar describes nothing and is just litter.
         _remove_identity()
+        _signal_speakers()
         _signal_vendor_players()
         return
     identity, reason = _player_identity(pid)
@@ -485,6 +532,7 @@ def _kill_play(*, keep_record: bool = False) -> None:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+    _signal_speakers()
     _signal_vendor_players()
     # Determinable either way, so the record is no longer meaningful. It is cleared here unless the
     # caller still needs it to outlive its own later steps.

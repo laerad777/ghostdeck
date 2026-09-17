@@ -166,7 +166,7 @@ def detect_crop(source):
         sample = min(8.0, max(2.0, duration - start))
         seek = [] if source.startswith(("http://", "https://")) else ["-ss", f"{start:.3f}"]
         if source.startswith(("http://", "https://")):
-            sample = min(6.0, sample)
+            sample = min(2.0, sample)
         result = run("ffmpeg", "-hide_banner", *seek, "-i", source,
                      "-t", f"{sample:.3f}",
                      "-vf", "fps=2,cropdetect=24:2:0", "-f", "null", "-",
@@ -532,16 +532,23 @@ class VideoStream:
             del frame
 
 
-def stop_encoder(encoder):
+def stop_encoder(encoder, *, harsh: bool = False):
     if encoder is None:
         return
     if encoder.poll() is None:
-        encoder.terminate()
-        try:
-            encoder.wait(timeout=3)
-        except subprocess.TimeoutExpired:
+        if harsh:
             encoder.kill()
-            encoder.wait(timeout=2)
+            try:
+                encoder.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            encoder.terminate()
+            try:
+                encoder.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                encoder.kill()
+                encoder.wait(timeout=2)
     for stream in (encoder.stdout, encoder.stderr):
         if stream:
             stream.close()
@@ -711,6 +718,11 @@ def main():
     def interrupt(_signum, _frame):
         cancel.set()
         diagnostics.mark("cancelRequested")
+        try:
+            if speaker is not None and speaker.poll() is None:
+                speaker.kill()
+        except OSError:
+            pass
         if not finalizing:
             raise InterruptedError("playback cancelled")
 
@@ -821,6 +833,11 @@ def main():
         success = True
     finally:
         finalizing = True
+        try:
+            if speaker is not None and speaker.poll() is None:
+                speaker.kill()
+        except OSError:
+            pass
         # Interrupt the data lane and begin encoder termination before control cancellation.
         if client is not None:
             client.close()
@@ -829,11 +846,11 @@ def main():
 
         def cleanup_encoder():
             try:
-                stop_encoder(encoder)
+                stop_encoder(speaker, harsh=True)
             except (OSError, subprocess.TimeoutExpired) as error:
                 encoder_errors.append(error)
             try:
-                stop_encoder(speaker)
+                stop_encoder(encoder)
             except (OSError, subprocess.TimeoutExpired) as error:
                 encoder_errors.append(error)
 
