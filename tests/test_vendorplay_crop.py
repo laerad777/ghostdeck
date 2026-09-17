@@ -125,6 +125,10 @@ def test_host_audio_is_in_the_same_realtime_ffmpeg():
     assert command.count("-i") == 2
     assert command.count("-re") == 2
     assert "audiotoolbox" in command
+    joined = " ".join(command)
+    assert "async=1" not in joined
+    assert "-max_interleave_delta" in command
+    assert "aresample=48000" in command
     assert "-an" not in command
     assert "12.5" in command
     silent = play.build_encoder_command(args, "/tmp/clip.mp4", None, "fps=30,scale=960:540")

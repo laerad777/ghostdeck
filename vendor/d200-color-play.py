@@ -724,6 +724,8 @@ def build_encoder_command(args, video, audio, filters):
     if args.duration:
         command.extend(["-t", str(args.duration)])
     command.extend([
+        "-max_interleave_delta", "0",
+        "-max_muxing_queue_size", "1024",
         "-map", "0:v:0",
         "-vf", filters,
         "-q:v", str(args.quality),
@@ -733,7 +735,9 @@ def build_encoder_command(args, video, audio, filters):
     if audio:
         command.extend([
             "-map", "1:a:0" if separate else "0:a:0",
-            "-filter:a", "aresample=async=1:first_pts=0",
+            "-filter:a", "aresample=48000",
+            "-ar", "48000",
+            "-ac", "2",
             "-c:a", "pcm_s16le",
             "-f", "audiotoolbox", "dummy",
         ])
@@ -754,7 +758,9 @@ def build_audio_command(args, audio):
         command.extend(["-t", str(args.duration)])
     command.extend([
         "-vn",
-        "-filter:a", "aresample=async=1:first_pts=0",
+        "-filter:a", "aresample=48000",
+        "-ar", "48000",
+        "-ac", "2",
         "-c:a", "pcm_s16le",
         "-f", "audiotoolbox", "dummy",
     ])
