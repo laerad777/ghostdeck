@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,9 @@ from ghostdeck.app import (
     shim_is_up,
     youtube_watch_url,
     playlist_add,
+    playlist_extend,
+    youtube_playlist_page,
+    youtube_playlist_entries,
     playlist_advance,
     playlist_label,
     playlist_load,
@@ -544,3 +548,51 @@ def test_youtube_overlay_queues_without_playing():
     assert "ghostdeck-queue" in text
     assert "post('queue')" in text
     assert 'kind == "queue"' in text
+
+
+def test_youtube_playlist_page_is_not_a_single_watch():
+    page = "https://www.youtube.com/playlist?list=PLabcdefghijk"
+    assert youtube_playlist_page(page) == page
+    assert youtube_playlist_page("https://www.youtube.com/watch?v=x&list=PLabcdefghijk") == ""
+    assert youtube_playlist_page("https://www.youtube.com/playlist?list=RDmix") == ""
+
+
+def test_youtube_playlist_entries_use_flat_yt_dlp():
+    payload = {
+        "entries": [
+            {"id": "aaa", "title": "One", "uploader": "Ch"},
+            {"id": "bbb", "title": "Two", "channel": "Ch"},
+        ]
+    }
+
+    def run(argv, **_k):
+        assert argv[:3] == ["yt-dlp", "--flat-playlist", "--no-warnings"]
+        class Result:
+            stdout = json.dumps(payload)
+        return Result()
+
+    items = youtube_playlist_entries("https://www.youtube.com/playlist?list=PLabc", run=run)
+    assert [playlist_source(item) for item in items] == [
+        "https://www.youtube.com/watch?v=aaa",
+        "https://www.youtube.com/watch?v=bbb",
+    ]
+    assert items[0]["title"] == "One"
+
+
+def test_playlist_extend_skips_sources_already_queued():
+    first = playlist_add([], "https://www.youtube.com/watch?v=aaa")
+    extra = [
+        playlist_entry("https://www.youtube.com/watch?v=aaa", "One", "Ch"),
+        playlist_entry("https://www.youtube.com/watch?v=bbb", "Two", "Ch"),
+    ]
+    out = playlist_extend(first, extra)
+    assert [playlist_source(item) for item in out] == [
+        "https://www.youtube.com/watch?v=aaa",
+        "https://www.youtube.com/watch?v=bbb",
+    ]
+
+
+def test_opening_a_playlist_page_does_not_stop_the_deck():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    page = "https://www.youtube.com/playlist?list=PLabc"
+    assert page_follow_action(watch, page) == (watch, "")

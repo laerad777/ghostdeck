@@ -270,6 +270,20 @@ def playlist_add(items, source: str, title: str = "", channel: str = "") -> list
     return out + [playlist_entry(source, title, channel)]
 
 
+def playlist_extend(items, entries) -> list[dict[str, str]]:
+    """Append many sources, skipping anything already queued."""
+    out = playlist_normalize(items)
+    seen = {playlist_source(item) for item in out}
+    for entry in playlist_normalize(entries):
+        src = playlist_source(entry)
+        if not src or src in seen:
+            continue
+        out.append(entry)
+        seen.add(src)
+    return out
+
+
+
 def playlist_title(item) -> str:
     """The primary line: the video title, never a URL."""
     if not isinstance(item, dict):
@@ -496,6 +510,70 @@ def youtube_watch_url(href: str) -> str:
         return f"https://www.youtube.com/watch?v={parts[1]}"
     return ""
 
+
+def youtube_playlist_page(href: str) -> str:
+    """A /playlist?list= URL. Watch pages with &list= stay a single video."""
+    href = (href or "").strip()
+    if not href:
+        return ""
+    parsed = urlparse(href)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in _YT_HOSTS and not host.endswith(".youtube.com"):
+        return ""
+    pid = (parse_qs(parsed.query).get("list") or [""])[0].strip()
+    if not pid:
+        return ""
+    parts = [part for part in parsed.path.split("/") if part]
+    if parts[:1] != ["playlist"]:
+        return ""
+    if not pid.startswith(("PL", "UU", "OL", "FL")):
+        return ""
+    return f"https://www.youtube.com/playlist?list={pid}"
+
+
+def youtube_playlist_entries(href: str, run=None, limit: int = 200) -> list[dict[str, str]]:
+    """Watch URLs for a playlist page, via yt-dlp. Empty on failure."""
+    page = youtube_playlist_page(href)
+    if not page:
+        return []
+    runner = subprocess.run if run is None else run
+    try:
+        result = runner(
+            ["yt-dlp", "--flat-playlist", "--no-warnings", "-J", page],
+            capture_output=True, text=True, timeout=90, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    try:
+        data = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: list[dict[str, str]] = []
+    for entry in data.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        vid = str(entry.get("id") or "").strip()
+        if not vid or vid.startswith("http"):
+            watch = youtube_watch_url(str(entry.get("url") or entry.get("id") or ""))
+            vid = (parse_qs(urlparse(watch).query).get("v") or [""])[0] if watch else ""
+        if not vid or "/" in vid or " " in vid:
+            continue
+        out.append(
+            playlist_entry(
+                f"https://www.youtube.com/watch?v={vid}",
+                str(entry.get("title") or ""),
+                str(entry.get("uploader") or entry.get("channel") or ""),
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 def playable_source(href: str, media_src: str = "") -> str:
     """Page or media URL to send to play. YouTube stays a watch URL so ads do not restart."""
     href = (href or "").strip()
@@ -561,6 +639,8 @@ def page_follow_action(seen_watch: str, href: str) -> tuple[str, str]:
     Stop only if the current source is a YouTube watch. A local file playing while the
     window sits on youtube.com would otherwise look like "left the video" and halt the deck.
     """
+    if youtube_playlist_page(href):
+        return seen_watch, ""
     watch = youtube_watch_url(href)
     if watch == seen_watch:
         return seen_watch, ""
@@ -711,7 +791,19 @@ def main() -> int:
     } catch (e) {}
     return '';
   }
+  function playlistUrl(){
+    try {
+      var u = new URL(location.href);
+      if (u.pathname.indexOf('/playlist') === 0) {
+        var list = u.searchParams.get('list') || '';
+        if (list) return 'https://www.youtube.com/playlist?list=' + list;
+      }
+    } catch (e) {}
+    return '';
+  }
   function watchUrl(){
+    var pl = playlistUrl();
+    if (pl) return pl;
     var id = ytId(location.href);
     if (!id) {
       var el = document.querySelector('[video-id]');
@@ -749,14 +841,16 @@ def main() -> int:
   }
   function scan(){ document.querySelectorAll('video').forEach(hook); }
   function mountQueue(){
-    var id = ytId(location.href) || ytId(watchUrl());
+    var pl = playlistUrl();
+    var id = ytId(location.href) || (!pl && ytId(watchUrl()));
     var btn = document.getElementById('ghostdeck-queue');
-    if (!id) { if (btn) btn.remove(); return; }
-    if (btn) return;
+    var label = pl ? '＋ 재생목록' : '＋ 대기열';
+    if (!id && !pl) { if (btn) btn.remove(); return; }
+    if (btn) { btn.textContent = label; return; }
     btn = document.createElement('button');
     btn.id = 'ghostdeck-queue';
     btn.type = 'button';
-    btn.textContent = '＋ 대기열';
+    btn.textContent = label;
     btn.setAttribute('aria-label', '대기열에 넣기');
     btn.style.cssText = 'position:fixed;right:14px;bottom:80px;z-index:2147483647;padding:9px 14px;border:0;border-radius:999px;background:#C8FF47;color:#111;font:700 12px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;letter-spacing:.02em;cursor:pointer;box-shadow:0 8px 24px rgba(200,255,71,.28);';
     btn.addEventListener('click', function(e){
@@ -764,7 +858,7 @@ def main() -> int:
       e.stopPropagation();
       post('queue');
       btn.textContent = '넣음';
-      setTimeout(function(){ if (btn) btn.textContent = '＋ 대기열'; }, 1200);
+      setTimeout(function(){ if (btn) btn.textContent = playlistUrl() ? '＋ 재생목록' : '＋ 대기열'; }, 1200);
     }, true);
     document.documentElement.appendChild(btn);
   }
@@ -932,6 +1026,38 @@ def main() -> int:
             AppHelper.callAfter(apply)
 
         threading.Thread(target=fill, daemon=True).start()
+
+
+    def _gui_queue_href(ctrl, href: str) -> None:
+        href = (href or "").strip()
+        if not href:
+            return
+        if youtube_playlist_page(href):
+            ctrl.note.setStringValue_("재생목록을 읽는 중…")
+
+            def fill_list():
+                entries = youtube_playlist_entries(href)
+
+                def apply():
+                    if not entries:
+                        ctrl.note.setStringValue_("재생목록을 읽지 못했습니다.")
+                        return
+                    ctrl.playlist = playlist_extend(getattr(ctrl, "playlist", []), entries)
+                    playlist_save(PLAYLIST_PATH, ctrl.playlist)
+                    _gui_playlist_draw(ctrl)
+                    ctrl.note.setStringValue_(f"재생목록 {len(entries)}곡을 넣었습니다.")
+
+                AppHelper.callAfter(apply)
+
+            threading.Thread(target=fill_list, daemon=True).start()
+            return
+        source = youtube_watch_url(href) or playable_source(href)
+        if not source:
+            ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
+            return
+        _gui_playlist_put(ctrl, source)
+        ctrl.note.setStringValue_("대기열에 넣었습니다.")
+
 
     def _gui_playlist_draw(ctrl) -> None:
         table = getattr(ctrl, "playlist_table", None)
@@ -1533,17 +1659,12 @@ def main() -> int:
 
         def addToPlaylist_(self, _sender):
             ctrl = self
-            field = str(self.url_field.stringValue() or "")
 
             def after(raw, _err):
-                page, start = parse_watch_payload(raw)
+                page, _start = parse_watch_payload(raw)
                 page = page or _gui_href(ctrl)
-                source, _off = play_request(field, page, "", read_pasteboard(), start)
-                if not source:
-                    ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
-                    return
-                _gui_playlist_put(ctrl, source)
-                ctrl.note.setStringValue_("플레이리스트에 넣었습니다.")
+                _gui_queue_href(ctrl, page)
+
 
             self.web.evaluateJavaScript_completionHandler_(
                 "(window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href)",
@@ -1589,10 +1710,7 @@ def main() -> int:
                     start = play_offset(body.get("t"))
             href = href or _gui_href(self)
             if kind == "queue":
-                source = youtube_watch_url(href) or playable_source(href, src)
-                if source:
-                    _gui_playlist_put(self, source)
-                    self.note.setStringValue_("대기열에 넣었습니다.")
+                _gui_queue_href(self, href)
                 return
             if kind == "play":
                 source = should_start_play(getattr(self, "seen_watch", ""), href, src)
