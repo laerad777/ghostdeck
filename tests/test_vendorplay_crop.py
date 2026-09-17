@@ -139,6 +139,8 @@ def test_http_loop_restarts_instead_of_stream_loop():
     )
     assert "-stream_loop" not in command
     assert "-shortest" in command
+    assert "audiotoolbox" in command
     local = play.build_encoder_command(args, "/tmp/clip.mp4", "/tmp/clip.mp4", "fps=30,scale=960:540")
-    assert local.count("-stream_loop") == 1
-    assert "-shortest" not in local
+    assert "-stream_loop" not in local
+    assert local.count("-i") == 1
+    assert "audiotoolbox" in local

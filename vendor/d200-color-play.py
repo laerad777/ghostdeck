@@ -262,15 +262,29 @@ def drain_bounded(stream, storage, limit=64 * 1024):
         if len(storage) > limit:
             del storage[:-limit]
 class FramePump:
-    """Drain complete JPEGs off stdout so encode is not stalled by credit wait."""
+    """Drain JPEG stdout. Keep only the newest frames so video cannot lag audio."""
 
-    def __init__(self, raw):
-        self._q = queue.Queue()
+    def __init__(self, raw, max_frames=2):
+        self._q = queue.Queue(maxsize=max_frames)
         self._raw = raw
         threading.Thread(target=self._run, daemon=True).start()
 
     def _offer(self, item):
-        self._q.put(item)
+        if item is None:
+            self._q.put(item)
+            return
+        while True:
+            try:
+                self._q.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    dropped = self._q.get_nowait()
+                except queue.Empty:
+                    continue
+                if dropped is None:
+                    self._q.put(None)
+                    return
 
     def _run(self):
         framer = JpegFramer(max_frame_bytes=MAX_JPEG_BYTES)
@@ -298,10 +312,18 @@ class FramePump:
             self._offer(None)
 
     def get(self, timeout=0.05):
-        return self._q.get(timeout=timeout)
-
-    def get_nowait(self):
-        return self._q.get_nowait()
+        item = self._q.get(timeout=timeout)
+        if item is None:
+            return None
+        while True:
+            try:
+                nxt = self._q.get_nowait()
+            except queue.Empty:
+                return item
+            if nxt is None:
+                self._q.put(None)
+                return item
+            item = nxt
 
 
 
@@ -750,8 +772,6 @@ def _input_flags(command, url, args, realtime=False):
         ])
     if realtime:
         command.append("-re")
-    if args.loop and not str(url).startswith(("http://", "https://")):
-        command.extend(["-stream_loop", "-1"])
     if args.start:
         command.extend(["-ss", str(args.start)])
     command.extend(["-i", url])
@@ -908,6 +928,17 @@ def main():
         stderr_thread = threading.Thread(target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True)
         stderr_thread.start()
         pump = FramePump(encoder.stdout)
+        pending_http = [None]
+
+        def prefetch_http():
+            if not args.loop or not args.input.startswith(("http://", "https://")):
+                return
+            try:
+                pending_http[0] = resolve_media_urls(args.input)
+            except Exception:
+                pending_http[0] = None
+
+        threading.Thread(target=prefetch_http, daemon=True).start()
         def playhead_loop():
             while not cancel.is_set() and not finalizing:
                 publish_diagnostics()
@@ -926,10 +957,16 @@ def main():
                 state["playheadAt"] = time.time()
                 stop_encoder(encoder, harsh=True)
                 if args.input.startswith(("http://", "https://")):
-                    video, audio = resolve_media_urls(args.input)
+                    grabbed = pending_http[0]
+                    pending_http[0] = None
+                    if grabbed:
+                        video, audio = grabbed
+                    else:
+                        video, audio = resolve_media_urls(args.input)
                     source = video
                     if args.no_audio:
                         audio = None
+                    threading.Thread(target=prefetch_http, daemon=True).start()
                 command = build_encoder_command(args, source, audio, filters)
                 encoder = subprocess.Popen(
                     command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
