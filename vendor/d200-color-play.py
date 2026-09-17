@@ -240,6 +240,8 @@ def probe_duration(source):
 def parse_fps(value, source):
     if value == "source":
         fps = probe_source_fps(source)
+        if fps > 60:
+            fps = Fraction(60, 1)
     else:
         try:
             fps = Fraction(value)
@@ -260,29 +262,15 @@ def drain_bounded(stream, storage, limit=64 * 1024):
         if len(storage) > limit:
             del storage[:-limit]
 class FramePump:
-    """Drain JPEG stdout. Keep only the newest complete frames so video cannot lag."""
+    """Drain complete JPEGs off stdout so encode is not stalled by credit wait."""
 
-    def __init__(self, raw, max_frames=3):
-        self._q = queue.Queue(maxsize=max_frames)
+    def __init__(self, raw):
+        self._q = queue.Queue()
         self._raw = raw
         threading.Thread(target=self._run, daemon=True).start()
 
     def _offer(self, item):
-        if item is None:
-            self._q.put(item)
-            return
-        while True:
-            try:
-                self._q.put_nowait(item)
-                return
-            except queue.Full:
-                try:
-                    dropped = self._q.get_nowait()
-                except queue.Empty:
-                    continue
-                if dropped is None:
-                    self._q.put(None)
-                    return
+        self._q.put(item)
 
     def _run(self):
         framer = JpegFramer(max_frame_bytes=MAX_JPEG_BYTES)
@@ -575,11 +563,6 @@ class VideoStream:
                     item = None
                 else:
                     continue
-            while item is not None:
-                try:
-                    item = pump.get_nowait()
-                except queue.Empty:
-                    break
             if item is None:
                 exit_deadline = time.monotonic() + 3
                 while encoder.poll() is None:
@@ -876,8 +859,6 @@ def main():
         if args.no_audio:
             audio = None
         fps = parse_fps(args.fps, source)
-        if fps > Fraction(24, 1):
-            fps = Fraction(24, 1)
         crop_box = [args.crop]
 
         def fill_crop():
