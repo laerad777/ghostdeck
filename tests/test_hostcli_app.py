@@ -33,6 +33,7 @@ from ghostdeck.app import (
     youtube_playlist_page,
     youtube_playlist_entries,
     playlist_advance,
+    queue_play_source,
     playlist_next,
     playlist_prev,
     repeat_label,
@@ -734,3 +735,10 @@ def test_player_prefs_roundtrip(tmp_path):
     player_prefs_save(path, {"repeat": "one", "shuffle": True})
     assert player_prefs_load(path) == {"repeat": "one", "shuffle": True}
     assert player_prefs_load(tmp_path / "gone.json") == {"repeat": "off", "shuffle": False}
+def test_queue_play_source_prefers_selection_then_now_then_head():
+    items = playlist_add(playlist_add([], "/tmp/a.mp4"), "/tmp/b.mp4")
+    assert queue_play_source(items, 1) == "/tmp/b.mp4"
+    assert queue_play_source(items, -1, now="/tmp/a.mp4") == "/tmp/a.mp4"
+    assert queue_play_source(items, -1, seen="/tmp/b.mp4") == "/tmp/b.mp4"
+    assert queue_play_source(items, -1) == "/tmp/a.mp4"
+    assert queue_play_source([], -1) == ""

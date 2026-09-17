@@ -407,6 +407,28 @@ def playlist_advance(items, current: str) -> str:
     return playlist_next(items, current, repeat="off", shuffle=False)
 
 
+def queue_play_source(items, selected, now: str = "", seen: str = "") -> str:
+    """What ▶ plays: the selected row, else the live/last source, else the queue head."""
+    items = playlist_normalize(items)
+    try:
+        row = int(selected)
+    except (TypeError, ValueError):
+        row = -1
+    if 0 <= row < len(items):
+        return playlist_source(items[row])
+    now = playlist_identity(now)
+    if now:
+        return now
+    seen = playlist_identity(seen)
+    if seen:
+        return seen
+    if items:
+        return playlist_source(items[0])
+    return ""
+
+
+
+
 def playlist_should_loop(source: str, items, repeat: str = "off") -> bool:
     """Whether the player process itself loops. Queue wrap is `playlist_next`."""
     if repeat == "one":
@@ -1152,15 +1174,13 @@ def main() -> int:
 
     def _gui_set_busy(ctrl, on: bool) -> None:
         ctrl.busy = on
-        # The window is a remote for a CLI that takes seconds per press (a `play` waits for the player
-        # to survive its grace window). Without this the buttons looked inert and were re-pressable
-        # while a command was still in flight, which the log showed as stacked players.
-        for name in ("play_btn", "stop_btn", "file_btn"):
-            button = getattr(ctrl, name, None)
-            if button is not None:
-                button.setEnabled_(not on)
+        button = getattr(ctrl, "file_btn", None)
+        if button is not None:
+            button.setEnabled_(not on)
 
-    def _gui_apply(ctrl, results, error) -> None:
+    def _gui_apply(ctrl, results, error, epoch=None) -> None:
+        if epoch is not None and epoch != getattr(ctrl, "epoch", 0):
+            return
         _gui_set_busy(ctrl, False)
         pending = getattr(ctrl, "pending_source", "")
         pending_start = getattr(ctrl, "pending_start", 0.0)
@@ -1208,6 +1228,30 @@ def main() -> int:
             _gui_kick(ctrl, "play", pending, start=pending_start)
 
     def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False, crop: str = "auto") -> None:
+        if op == "stop":
+            ctrl.epoch = getattr(ctrl, "epoch", 0) + 1
+            ctrl.pending_source = ""
+            ctrl.pending_start = 0.0
+            ctrl.user_stopped = True
+            epoch = ctrl.epoch
+            if not ctrl.busy:
+                _gui_set_busy(ctrl, True)
+            ctrl.note.setStringValue_("멈추는 중…")
+            threading.Thread(
+                target=_busy_call,
+                args=(
+                    remote,
+                    "stop",
+                    "",
+                    "",
+                    lambda r, e: AppHelper.callAfter(lambda: _gui_apply(ctrl, r, e, epoch)),
+                    0.0,
+                    False,
+                    "auto",
+                ),
+                daemon=True,
+            ).start()
+            return
         if ctrl.busy and op == "play":
             ctrl.pending_source = source
             ctrl.pending_start = play_offset(start)
@@ -1228,7 +1272,9 @@ def main() -> int:
                 op,
                 source,
                 pasteboard,
-                lambda r, e: AppHelper.callAfter(lambda: _gui_apply(ctrl, r, e)),
+                lambda r, e, epoch=getattr(ctrl, "epoch", 0): AppHelper.callAfter(
+                    lambda: _gui_apply(ctrl, r, e, epoch)
+                ),
                 play_offset(start),
                 playlist_should_loop(
                     source,
@@ -1345,6 +1391,10 @@ def main() -> int:
             table = getattr(ctrl, "playlist_table", None)
             if table is not None:
                 table.reloadData()
+        play_btn = getattr(ctrl, "play_btn", None)
+        if play_btn is not None:
+            play_btn.setTitle_("⏸" if source and deck_session_active() else "▶  재생")
+            _pill(play_btn, LIME, INK)
 
     def _gui_mode_draw(ctrl) -> None:
         shuffle_btn = getattr(ctrl, "shuffle_btn", None)
@@ -1539,6 +1589,9 @@ def main() -> int:
             self.shuffle = prefs["shuffle"]
             self.was_playing = False
             self.user_stopped = False
+            self.epoch = 0
+            self.resume_pos = 0.0
+            self.resume_source = ""
             self.media_duration = 0.0
             self.duration_for = ""
             self.duration_busy = False
@@ -1945,11 +1998,26 @@ def main() -> int:
             self.window.makeFirstResponder_(self.url_field)
 
         def play_(self, _sender):
-            """Play the field's file, or the video on this page, on the deck.
-
-            A local path in the URL field wins so 파일 / a drop / a typed path actually play.
-            Otherwise resume the page (정지 leaves it paused) and read the watch URL.
-            """
+            if deck_session_active():
+                self.stop_(_sender)
+                return
+            items = getattr(self, "playlist", [])
+            row = -1
+            table = getattr(self, "playlist_table", None)
+            if table is not None:
+                row = int(table.selectedRow())
+            source = queue_play_source(
+                items, row, deck_now_playing(),
+                getattr(self, "seen_watch", "") or getattr(self, "resume_source", ""),
+            )
+            if source:
+                start = 0.0
+                if playlist_identity(source) == playlist_identity(getattr(self, "resume_source", "")):
+                    start = play_offset(getattr(self, "resume_pos", 0.0))
+                self.resume_pos = 0.0
+                self.user_stopped = False
+                _gui_kick(self, "play", source, start=start)
+                return
             ctrl = self
             field = str(self.url_field.stringValue() or "")
             local = media_path_candidate(field)
@@ -1973,19 +2041,15 @@ def main() -> int:
             )
 
         def stop_(self, _sender):
-            """Stop the deck player AND the page's video, so the stop actually sticks.
-
-            Clearing `seen_watch` alone was not enough: the page kept playing, its `play` listener
-            fired again, and `should_start_play("")` treats an unknown seen-id as a NEW video -- so the
-            deck restarted on the next event and 정지 looked broken (observed: `playing=no` for a
-            moment, then `playing=yes` again with the page's own YouTube id). Pausing the page first
-            is what makes the stop hold; the deck stop runs after it, so no `play` can slip between.
-            """
+            source, pos, active = deck_playhead()
+            if active and source:
+                self.resume_pos = pos
+                self.resume_source = source
             self.user_stopped = True
-            self.seen_watch = ""
+            _gui_kick(self, "stop", "")
             self.web.evaluateJavaScript_completionHandler_(
                 "document.querySelectorAll('video').forEach(function(v){v.pause()}); null",
-                lambda _result, _error: _gui_kick(self, "stop", ""),
+                lambda *_a: None,
             )
 
         def poll_(self, _timer):
