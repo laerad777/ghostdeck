@@ -1045,7 +1045,6 @@ def main() -> int:
             FOOT = 26
             PHONE_X, PHONE_Y = PAD, FOOT
             PHONE_H = H - FOOT - 40
-            CHROME = 44
             SIDE_X = PAD + PHONE_W + SIDE_GAP
             stick_top = NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin
             stick_bot = NSViewMinXMargin | NSViewMaxYMargin
@@ -1115,7 +1114,7 @@ def main() -> int:
             shell.setAutoresizingMask_(NSViewHeightSizable)
             view.addSubview_(shell)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(0, 0, PHONE_W, PHONE_H - CHROME),
+                NSMakeRect(0, 0, PHONE_W, PHONE_H),
                 config,
             )
             self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -1125,52 +1124,45 @@ def main() -> int:
             self.web.loadRequest_(
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
-            chrome = NSView.alloc().initWithFrame_(NSMakeRect(0, PHONE_H - CHROME, PHONE_W, CHROME))
-            chrome.setWantsLayer_(True)
-            chrome.layer().setBackgroundColor_(_rgb(0.07, 0.07, 0.08).CGColor())
-            chrome.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
-            shell.addSubview_(chrome)
+            notch = NSView.alloc().initWithFrame_(NSMakeRect((PHONE_W - 108) / 2, PHONE_H - 16, 108, 5))
+            notch.setWantsLayer_(True)
+            notch.layer().setCornerRadius_(2.5)
+            notch.layer().setBackgroundColor_(_rgb(0, 0, 0, 0.45).CGColor())
+            notch.setAutoresizingMask_(NSViewMinYMargin)
+            shell.addSubview_(notch)
+            home = NSView.alloc().initWithFrame_(NSMakeRect((PHONE_W - 118) / 2, 8, 118, 4))
+            home.setWantsLayer_(True)
+            home.layer().setCornerRadius_(2.0)
+            home.layer().setBackgroundColor_(_rgb(1, 1, 1, 0.28).CGColor())
+            shell.addSubview_(home)
 
-            def nav_btn(x, title, symbol, action):
-                btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, 7, 30, 30))
-                img = _symbol(symbol)
-                if img is not None:
-                    btn.setImage_(img)
-                    btn.setBordered_(False)
-                    btn.setContentTintColor_(SNOW)
-                else:
-                    btn.setTitle_(title)
-                    btn.setBordered_(False)
-                    btn.setFont_(NSFont.systemFontOfSize_(16))
-                btn.setTarget_(self)
-                btn.setAction_(action)
-                chrome.addSubview_(btn)
-                return btn
-
-            nav_btn(8, "‹", "chevron.left", "back:")
-            nav_btn(40, "›", "chevron.right", "forward:")
-            self.file_btn = NSButton.alloc().initWithFrame_(NSMakeRect(76, 7, 44, 30))
-            self.file_btn.setTitle_("파일")
-            self.file_btn.setFont_(NSFont.boldSystemFontOfSize_(11))
-            _pill(self.file_btn, CARD, SNOW)
+            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
+            self.url_field.setHidden_(True)
+            self.url_field.setStringValue_("https://www.youtube.com")
+            self.url_field.setTarget_(self)
+            self.url_field.setAction_("go:")
+            view.addSubview_(self.url_field)
+            self.file_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
+            self.file_btn.setHidden_(True)
             self.file_btn.setTarget_(self)
             self.file_btn.setAction_("openFile:")
             self.file_btn.setKeyEquivalent_("o")
             self.file_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
-            chrome.addSubview_(self.file_btn)
-            self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(126, 8, PHONE_W - 138, 28))
-            self.url_field.setStringValue_("https://www.youtube.com")
-            self.url_field.setBezeled_(False)
-            self.url_field.setDrawsBackground_(True)
-            self.url_field.setBackgroundColor_(CARD)
-            self.url_field.setTextColor_(SNOW)
-            self.url_field.setFont_(NSFont.systemFontOfSize_(11))
-            self.url_field.setWantsLayer_(True)
-            self.url_field.layer().setCornerRadius_(8.0)
-            self.url_field.setTarget_(self)
-            self.url_field.setAction_("go:")
-            self.url_field.setAutoresizingMask_(NSViewWidthSizable)
-            chrome.addSubview_(self.url_field)
+            view.addSubview_(self.file_btn)
+            back = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
+            back.setHidden_(True)
+            back.setTarget_(self)
+            back.setAction_("back:")
+            back.setKeyEquivalent_("[")
+            back.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            view.addSubview_(back)
+            fwd = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
+            fwd.setHidden_(True)
+            fwd.setTarget_(self)
+            fwd.setAction_("forward:")
+            fwd.setKeyEquivalent_("]")
+            fwd.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            view.addSubview_(fwd)
 
             frost = NSVisualEffectView.alloc().initWithFrame_(
                 NSMakeRect(SIDE_X, PHONE_Y, SIDE_W, PHONE_H)
@@ -1297,11 +1289,13 @@ def main() -> int:
                 view.addSubview_(btn)
                 return btn
 
-            self.add_btn = qbtn(SIDE_X + 12, 72, "＋ 넣기", "addToPlaylist:")
-            self.row_play_btn = qbtn(SIDE_X + 90, 52, "재생", "playSelected:")
-            self.up_btn = qbtn(SIDE_X + 148, 32, "↑", "moveUp:")
-            self.down_btn = qbtn(SIDE_X + 186, 32, "↓", "moveDown:")
-            self.del_btn = qbtn(SIDE_X + SIDE_W - 64, 52, "삭제", "removeSelected:")
+            self.file_btn = qbtn(SIDE_X + 12, 52, "파일", "openFile:")
+            self.file_btn.setHidden_(False)
+            self.add_btn = qbtn(SIDE_X + 70, 64, "＋ 넣기", "addToPlaylist:")
+            self.row_play_btn = qbtn(SIDE_X + 140, 48, "재생", "playSelected:")
+            self.up_btn = qbtn(SIDE_X + 194, 28, "↑", "moveUp:")
+            self.down_btn = qbtn(SIDE_X + 228, 28, "↓", "moveDown:")
+            self.del_btn = qbtn(SIDE_X + SIDE_W - 60, 48, "삭제", "removeSelected:")
             _gui_playlist_draw(self)
 
             reload_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
