@@ -219,17 +219,37 @@ def playlist_source(item) -> str:
     return str(item or "").strip()
 
 
+def playlist_identity(source: str) -> str:
+    """Canonical playable identity. Watch URLs collapse to watch?v=."""
+    source = (source or "").strip()
+    return youtube_watch_url(source) or source
+
+
+
 def playlist_normalize(items) -> list[dict[str, str]]:
     out = []
+    seen: dict[str, int] = {}
     for item in items or []:
         if isinstance(item, dict):
             source = str(item.get("source") or "").strip()
-            if source:
-                out.append(playlist_entry(source, item.get("title") or "", item.get("channel") or ""))
+            title = str(item.get("title") or "").strip()
+            channel = str(item.get("channel") or "").strip()
         else:
             source = str(item).strip()
-            if source:
-                out.append(playlist_entry(source))
+            title = ""
+            channel = ""
+        if not source:
+            continue
+        key = playlist_identity(source)
+        if key in seen:
+            existing = out[seen[key]]
+            if title and not existing.get("title"):
+                existing["title"] = title
+            if channel and not existing.get("channel"):
+                existing["channel"] = channel
+            continue
+        seen[key] = len(out)
+        out.append(playlist_entry(key, title, channel))
     return out
 
 
@@ -257,28 +277,31 @@ def playlist_label(item) -> str:
 
 
 def playlist_add(items, source: str, title: str = "", channel: str = "") -> list[dict[str, str]]:
-    """Append a playable source. Consecutive duplicates are ignored."""
-    source = (source or "").strip()
+    """Append a playable source. A source already in the queue is not added again."""
+    source = playlist_identity((source or "").strip())
     out = playlist_normalize(items)
     if not source:
         return out
-    if out and playlist_source(out[-1]) == source:
-        last = dict(out[-1])
-        if title and not last.get("title"):
-            last["title"] = title.strip()
-        if channel and not last.get("channel"):
-            last["channel"] = channel.strip()
-        out[-1] = last
-        return out
+    title = (title or "").strip()
+    channel = (channel or "").strip()
+    for i, item in enumerate(out):
+        if playlist_identity(playlist_source(item)) == source:
+            merged = dict(item)
+            if title and not merged.get("title"):
+                merged["title"] = title
+            if channel and not merged.get("channel"):
+                merged["channel"] = channel
+            out[i] = merged
+            return out
     return out + [playlist_entry(source, title, channel)]
 
 
 def playlist_extend(items, entries) -> list[dict[str, str]]:
     """Append many sources, skipping anything already queued."""
     out = playlist_normalize(items)
-    seen = {playlist_source(item) for item in out}
+    seen = {playlist_identity(playlist_source(item)) for item in out}
     for entry in playlist_normalize(entries):
-        src = playlist_source(entry)
+        src = playlist_identity(playlist_source(entry))
         if not src or src in seen:
             continue
         out.append(entry)
@@ -336,8 +359,8 @@ def playlist_remove(items, index: int) -> list[dict[str, str]]:
 
 def playlist_next(items, current: str, *, repeat: str = "off", shuffle: bool = False, rng=None) -> str:
     """The next source to play. Empty means stop."""
-    sources = [playlist_source(item) for item in playlist_normalize(items)]
-    current = (current or "").strip()
+    sources = [playlist_identity(playlist_source(item)) for item in playlist_normalize(items)]
+    current = playlist_identity((current or "").strip())
     if not sources:
         return ""
     if repeat == "one" and current in sources:
@@ -360,8 +383,8 @@ def playlist_next(items, current: str, *, repeat: str = "off", shuffle: bool = F
 
 def playlist_prev(items, current: str, *, repeat: str = "off", shuffle: bool = False, rng=None) -> str:
     """The previous source. Shuffle picks another track."""
-    sources = [playlist_source(item) for item in playlist_normalize(items)]
-    current = (current or "").strip()
+    sources = [playlist_identity(playlist_source(item)) for item in playlist_normalize(items)]
+    current = playlist_identity((current or "").strip())
     if not sources:
         return ""
     if shuffle:
@@ -420,9 +443,9 @@ def player_prefs_save(path: Path, prefs) -> None:
 
 
 def playlist_find(items, source: str) -> dict[str, str]:
-    source = (source or "").strip()
+    source = playlist_identity((source or "").strip())
     for item in playlist_normalize(items):
-        if playlist_source(item) == source:
+        if playlist_identity(playlist_source(item)) == source:
             return item
     return playlist_entry(source)
 
@@ -571,28 +594,8 @@ def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
     return source, pos, active
 
 
-def source_duration(source: str, probe=None) -> float:
-    """Length in seconds. 0 if unknown. Never HID."""
-    source = (source or "").strip()
-    if not source:
-        return 0.0
-    runner = subprocess.run if probe is None else probe
-    watch = youtube_watch_url(source)
-    local = media_path_candidate(source)
-    try:
-        if watch or not local:
-            return 0.0
-        result = runner(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0", local,
-            ],
-            capture_output=True, text=True, timeout=8, check=False,
-        )
-        raw = (result.stdout or "").strip()
-    except (OSError, subprocess.TimeoutExpired):
-        return 0.0
+def parse_duration(raw) -> float:
+    """A media length in seconds. Junk is 0."""
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -600,6 +603,49 @@ def source_duration(source: str, probe=None) -> float:
     if not math.isfinite(value) or value <= 0:
         return 0.0
     return value
+
+
+def source_duration(source: str, probe=None) -> float:
+    """Length of the playable source. Never HID. Never the page's video tag."""
+    source = (source or "").strip()
+    if not source:
+        return 0.0
+    runner = subprocess.run if probe is None else probe
+    watch = youtube_watch_url(source)
+    local = media_path_candidate(source)
+    try:
+        if watch:
+            result = runner(
+                ["yt-dlp", "--no-warnings", "--skip-download", "-O", "%(duration)s", watch],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            raw = (result.stdout or "").strip()
+        elif local:
+            result = runner(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0", local,
+                ],
+                capture_output=True, text=True, timeout=8, check=False,
+            )
+            raw = (result.stdout or "").strip()
+        else:
+            return 0.0
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    return parse_duration(raw)
+
+
+def deck_duration(path: Path = HOST_STATE) -> float:
+    """Duration the player published for the current source. 0 if unknown."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return 0.0
+    if not isinstance(data, dict):
+        return 0.0
+    return parse_duration(data.get("duration"))
 
 
 def should_retry_pending(pending: str, pending_start: float, seen: str, played_start: float) -> bool:
@@ -1291,12 +1337,16 @@ def main() -> int:
                 elapsed.setStringValue_(format_clock(bar.doubleValue()))
             return
         source, pos, _active = deck_playhead()
+        host_len = deck_duration()
+        if host_len > 0 and source:
+            ctrl.duration_for = source
+            ctrl.media_duration = host_len
         duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
         if source and source != getattr(ctrl, "duration_for", ""):
             ctrl.duration_for = source
             ctrl.media_duration = 0.0
             duration = 0.0
-            if media_path_candidate(source) and not getattr(ctrl, "duration_busy", False):
+            if not getattr(ctrl, "duration_busy", False):
                 ctrl.duration_busy = True
 
                 def fill():
@@ -1311,22 +1361,6 @@ def main() -> int:
                     AppHelper.callAfter(apply)
 
                 threading.Thread(target=fill, daemon=True).start()
-        if duration <= 0 and source and getattr(ctrl, "web", None) is not None:
-
-            def after(raw, _err):
-                try:
-                    value = float(raw)
-                except (TypeError, ValueError):
-                    return
-                if value > 0 and getattr(ctrl, "duration_for", "") == source:
-                    ctrl.media_duration = value
-                    _gui_playhead_draw(ctrl)
-
-            ctrl.web.evaluateJavaScript_completionHandler_(
-                "(function(){ var v=document.querySelector('video');"
-                " return (v && isFinite(v.duration) && v.duration>0) ? v.duration : 0; })()",
-                after,
-            )
         duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
         if duration > 0 and pos > duration:
             pos = duration
@@ -1344,8 +1378,8 @@ def main() -> int:
         bar.setEnabled_(True)
 
     def _gui_sync_deck(ctrl, playing: bool) -> None:
-        now = deck_now_playing()
-        sources = [playlist_source(item) for item in getattr(ctrl, "playlist", [])]
+        now = playlist_identity(deck_now_playing())
+        sources = [playlist_identity(playlist_source(item)) for item in getattr(ctrl, "playlist", [])]
         if now and now not in sources:
             _gui_playlist_put(ctrl, now)
         else:

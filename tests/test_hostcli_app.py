@@ -47,6 +47,9 @@ from ghostdeck.app import (
     deck_playhead,
     format_clock,
     source_duration,
+    deck_duration,
+    parse_duration,
+    playlist_normalize,
     should_retry_pending,
     playlist_entry,
     playlist_source,
@@ -460,10 +463,18 @@ def test_playlist_label_is_a_name_not_a_path():
     assert playlist_label("") == ""
 
 
-def test_playlist_add_skips_a_consecutive_duplicate():
+def test_playlist_add_skips_a_source_already_queued():
     first = playlist_add([], "/tmp/a.mp4")
     assert [playlist_source(item) for item in first] == ["/tmp/a.mp4"]
     assert playlist_add(first, "/tmp/a.mp4") == first
+    later = playlist_add(playlist_add(first, "/tmp/b.mp4"), "/tmp/a.mp4")
+    assert [playlist_source(item) for item in later] == ["/tmp/a.mp4", "/tmp/b.mp4"]
+    watch = "https://www.youtube.com/watch?v=x"
+    queued = playlist_add([], watch)
+    assert playlist_add(queued, watch + "&list=PLabc") == queued
+    assert [playlist_source(item) for item in playlist_normalize([watch, watch, "/tmp/b.mp4"])] == [
+        watch, "/tmp/b.mp4",
+    ]
     assert [playlist_source(item) for item in playlist_add(first, "/tmp/b.mp4")] == [
         "/tmp/a.mp4", "/tmp/b.mp4",
     ]
@@ -659,11 +670,25 @@ def test_should_retry_pending_allows_a_seek_on_the_same_source():
     assert should_retry_pending("", 40.0, watch, 10.0) is False
 
 
-def test_youtube_duration_is_not_probed_with_yt_dlp():
+def test_youtube_duration_uses_yt_dlp_metadata():
     def probe(argv, **_k):
-        raise AssertionError("yt-dlp must not run for a watch URL")
+        assert argv[0] == "yt-dlp"
+        assert "-O" in argv
+        class Result:
+            stdout = "146.601\n"
+        return Result()
 
-    assert source_duration("https://www.youtube.com/watch?v=x", probe=probe) == 0.0
+    assert source_duration("https://www.youtube.com/watch?v=x", probe=probe) == 146.601
+
+
+def test_deck_duration_reads_the_player_receipt(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text('{"source":"/tmp/a.mp4","duration":183.4,"phase":"active"}\n', encoding="utf-8")
+    assert deck_duration(path) == 183.4
+    assert parse_duration("NA") == 0.0
+    assert parse_duration(-1) == 0.0
+
+
 def test_playlist_next_respects_repeat_and_shuffle():
     items = playlist_add(playlist_add([], "/tmp/a.mp4"), "/tmp/b.mp4")
     items = playlist_add(items, "/tmp/c.mp4")

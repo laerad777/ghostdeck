@@ -86,6 +86,21 @@ def test_unproven_open_is_retried_once():
     assert not play.should_retry_unproven_open({"accepted": False, "error": "another video session is already opening"})
 
 
+def test_probe_duration_uses_yt_dlp_for_http():
+    play = _play()
+    calls = []
+
+    def fake_run(*arguments, **_k):
+        calls.append(list(arguments))
+        class Result:
+            stdout = "146.6\n"
+        return Result()
+
+    play.run = fake_run
+    assert play.probe_duration("https://www.youtube.com/watch?v=x") == 146.6
+    assert calls[0][0] == "yt-dlp"
+
+
 def test_encoder_plays_host_audio_from_a_second_input():
     play = _play()
     args = type("Args", (), {"loop": False, "start": 12.5, "duration": 0, "quality": 12})()

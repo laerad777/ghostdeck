@@ -185,6 +185,33 @@ def detect_crop(source):
         return "none"
 
 
+def probe_duration(source):
+    """Seconds of the origin source. 0 if unknown. Never HID."""
+    if source.startswith(("http://", "https://")):
+        try:
+            result = run(
+                "yt-dlp", "--no-warnings", "--skip-download", "-O", "%(duration)s", source,
+                capture=True,
+            )
+            value = float((result.stdout or "").strip())
+            if math.isfinite(value) and value > 0:
+                return value
+        except (OSError, ValueError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+    try:
+        result = run(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "csv=p=0", source, capture=True,
+        )
+        value = float((result.stdout or "").strip())
+        if math.isfinite(value) and value > 0:
+            return value
+    except (OSError, ValueError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+    return 0.0
+
+
+
 def parse_fps(value, source):
     if value == "source":
         fps = probe_source_fps(source)
@@ -711,6 +738,8 @@ def main():
         state["diagnostics"] = diagnostics.snapshot()
         state = publish_video_state(state, claim=True, state_path=HOST_STATE)
         claimed = True
+        state["duration"] = probe_duration(args.input)
+        state = publish_video_state(state, state_path=HOST_STATE)
         source = args.input
         audio = None
         if source.startswith(("http://", "https://")):
