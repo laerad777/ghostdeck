@@ -48,6 +48,8 @@ from ghostdeck.app import (
     deck_session_active,
     deck_has_picture,
     deck_playhead,
+    deck_crop,
+    request_live_seek,
     format_clock,
     source_duration,
     deck_duration,
@@ -242,6 +244,18 @@ def test_a_resume_skips_the_status_probe():
 
     DeckRemote(run).play("/tmp/clip.mp4", start=12.0, crop="none")
     assert calls == [["play", "/tmp/clip.mp4", "--start", "12.000", "--crop", "none"]]
+def test_request_live_seek_writes_the_player_file(tmp_path):
+    path = tmp_path / "seek"
+    assert request_live_seek(41.25, path=path) is True
+    assert path.read_text(encoding="utf-8").strip() == "41.250"
+
+
+def test_deck_crop_reads_a_letterbox_rect(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text('{"crop":"1920:804:0:138","phase":"active"}\n', encoding="utf-8")
+    assert deck_crop(path) == "1920:804:0:138"
+    path.write_text('{"crop":"auto"}\n', encoding="utf-8")
+    assert deck_crop(path) == ""
 
 
 def test_empty_field_plays_a_copied_url():

@@ -109,6 +109,13 @@ def test_probe_duration_uses_yt_dlp_for_http():
     assert calls[0][0] == "yt-dlp"
 
 
+def test_take_seek_request_reads_and_clears_the_file(tmp_path):
+    play = _play()
+    path = tmp_path / "seek"
+    path.write_text("33.5\n", encoding="utf-8")
+    assert play.take_seek_request(path) == 33.5
+    assert not path.exists()
+    assert play.take_seek_request(path) is None
 def test_host_audio_is_a_separate_realtime_ffmpeg():
     play = _play()
     args = type("Args", (), {"loop": False, "start": 12.5, "duration": 0, "quality": 12})()

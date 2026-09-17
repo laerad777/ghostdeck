@@ -123,6 +123,21 @@ def _host_session_active() -> bool:
     return isinstance(data, dict) and str(data.get("phase") or "") == "active"
 
 
+def play_crop(crop: str) -> str:
+    """auto, none, or a letterbox rect. Junk becomes auto so crop stays on."""
+    crop = (crop or "auto").strip()
+    if crop in ("auto", "none"):
+        return crop
+    parts = crop.split(":")
+    if len(parts) == 4:
+        try:
+            width, height, _x, _y = (int(part) for part in parts)
+        except ValueError:
+            return "auto"
+        if width > 0 and height > 0:
+            return crop
+    return "auto"
+
 def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = True, crop: str = "auto") -> None:
     _require_tools(source)
     adb.require_adb()
@@ -185,7 +200,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         "--quality",
         "12",
         "--crop",
-        crop if crop in ("auto", "none") else "auto",
+        play_crop(crop),
         "--fit",
         fit,
     ]

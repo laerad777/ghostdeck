@@ -30,12 +30,36 @@ SERIAL = __import__("os").environ.get("GHOSTDECK_SERIAL") or ""
 # cannot drift; align_jpeg_payload applies the stricter padded budget below.
 MAX_JPEG_BYTES = wire.MAX_JPEG
 HOST_STATE = Path("/tmp/d200-color-host.json")
+SEEK_PATH = Path("/tmp/d200-color-seek")
 BRIDGE_SOCKET = Path("/tmp/d200-adb-bridge.sock")
 # Keep FRAME records under 12KiB; 14387-byte records stalled at upHave=12288.
 FRAME_JPEG_CHUNK = 12288 - wire.HEADER_SIZE - 16
 UNPROVEN_OPEN = "has not proven it released the deck"
 # Measured: 0s between sessions -> CLEANUP_FAILED. Stop already waited for release.
 OPEN_RETRY_WAIT = 1.0
+class SeekRequested(Exception):
+    def __init__(self, start):
+        super().__init__(start)
+        self.start = float(start)
+
+
+def take_seek_request(path=SEEK_PATH):
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
 
 
 def align_jpeg_payload(frame):
@@ -482,7 +506,13 @@ class VideoStream:
         os.set_blocking(fd, False)
         while True:
             check_cancel(self.cancel)
+            wanted = take_seek_request()
+            if wanted is not None:
+                raise SeekRequested(wanted)
             while self.state.received - self.state.consumed >= wire.WINDOW_FRAMES:
+                wanted = take_seek_request()
+                if wanted is not None:
+                    raise SeekRequested(wanted)
                 self.measured_wait("credit")
             try:
                 frame = next(pending)
@@ -763,8 +793,12 @@ def main():
         state["diagnostics"] = diagnostics.snapshot()
         state = publish_video_state(state, claim=True, state_path=HOST_STATE)
         claimed = True
-        state["duration"] = probe_duration(args.input)
-        state = publish_video_state(state, state_path=HOST_STATE)
+        duration_box = [0.0]
+        dur_thread = threading.Thread(
+            target=lambda: duration_box.__setitem__(0, probe_duration(args.input)),
+            daemon=True,
+        )
+        dur_thread.start()
         source = args.input
         audio = None
         if source.startswith(("http://", "https://")):
@@ -775,10 +809,13 @@ def main():
         if args.no_audio:
             audio = None
         fps = parse_fps(args.fps, source)
-        crop = detect_crop(source) if args.crop == "auto" else args.crop
-        filters = build_video_filters(args, fps, crop)
-        command = build_encoder_command(args, source, None, filters)
-        audio_cmd = build_audio_command(args, audio)
+        crop_box = [args.crop]
+
+        def fill_crop():
+            crop_box[0] = detect_crop(source) if args.crop == "auto" else args.crop
+
+        crop_thread = threading.Thread(target=fill_crop, daemon=True)
+        crop_thread.start()
         ensure_runtime_modules()
         deadline = time.monotonic() + 10
         client = connect_bridge(BRIDGE_SOCKET, deadline, cancel)
@@ -786,22 +823,24 @@ def main():
                             fpsNumerator=fps.numerator, fpsDenominator=fps.denominator)
         answer = json_exchange(client, open_request, deadline, cancel)
         if should_retry_unproven_open(answer):
-            # The previous native session is still draining. One wait, one retry; a second
-            # refusal is a real stuck boundary and is reported.
             time.sleep(OPEN_RETRY_WAIT)
             deadline = time.monotonic() + 10
             answer = json_exchange(client, open_request, deadline, cancel)
         if not answer["accepted"]:
             open_rejected = True
-            # FIX-5-T16: the bridge's own `error` text is why it refused, and it used to be
-            # dropped here, so a named refusal (an unproven session boundary) reached the user
-            # as a bare `code 1`. The validator above already bounded it (no NUL, <= 252 bytes),
-            # so it is safe to show; without it the fix would refuse silently in effect.
             detail = answer.get("error")
             raise RuntimeError(f"video OPEN failed with code {answer['resultCode']}"
                                + (f": {detail}" if detail else ""))
         credentials = dict(session=session, epoch=1, capability=answer["capability"])
         state["video"].update(epoch=1, capability=answer["capability"])
+        crop_thread.join()
+        dur_thread.join()
+        crop = crop_box[0]
+        state["duration"] = duration_box[0]
+        state["crop"] = crop
+        filters = build_video_filters(args, fps, crop)
+        command = build_encoder_command(args, source, None, filters)
+        audio_cmd = build_audio_command(args, audio)
         state["diagnostics"] = diagnostics.snapshot()
         state = publish_video_state(state, state_path=HOST_STATE)
         stream = VideoStream(client, session, answer["capability"], fps, cancel,
@@ -829,7 +868,37 @@ def main():
                 cancel.wait(0.2)
 
         threading.Thread(target=playhead_loop, daemon=True).start()
-        total = stream.produce(encoder.stdout, encoder)
+        while True:
+            try:
+                total = stream.produce(encoder.stdout, encoder)
+                break
+            except SeekRequested as seek:
+                args.start = seek.start
+                state["start"] = seek.start
+                diagnostics.started = diagnostics.clock()
+                diagnostics.milestones["firstConsumedReceipt"] = None
+                state["playheadAt"] = time.time()
+                stop_encoder(speaker, harsh=True)
+                stop_encoder(encoder, harsh=True)
+                command = build_encoder_command(args, source, None, filters)
+                audio_cmd = build_audio_command(args, audio)
+                encoder = subprocess.Popen(
+                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+                )
+                stderr_tail = bytearray()
+                stderr_thread = threading.Thread(
+                    target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True,
+                )
+                stderr_thread.start()
+                speaker = None
+                if audio_cmd is not None:
+                    speaker = subprocess.Popen(
+                        audio_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
+                    )
+                    threading.Thread(
+                        target=drain_bounded, args=(speaker.stderr, bytearray()), daemon=True,
+                    ).start()
+                publish_diagnostics()
         check_cancel(cancel)
         answer = video_bridge_request(dict(schemaVersion=1, op="videoStatus", **credentials), 5,
                                       socket_path=BRIDGE_SOCKET)

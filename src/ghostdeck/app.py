@@ -36,6 +36,7 @@ _YT_HOSTS = {
 }
 _MEDIA_SUFFIXES = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")
 HOST_STATE = Path("/tmp/d200-color-host.json")
+SEEK_PATH = Path("/tmp/d200-color-seek")
 PLAYLIST_PATH = Path.home() / ".ghostdeck" / "playlist.json"
 PLAYER_PATH = Path.home() / ".ghostdeck" / "player.json"
 _REPEAT_MODES = ("off", "all", "one")
@@ -701,6 +702,34 @@ def source_duration(source: str, probe=None) -> float:
     except (OSError, subprocess.TimeoutExpired):
         return 0.0
     return parse_duration(raw)
+
+
+def deck_crop(path: Path = HOST_STATE) -> str:
+    """Detected letterbox crop from the player receipt. Empty if unknown."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    crop = str(data.get("crop") or "").strip()
+    parts = crop.split(":")
+    if len(parts) != 4:
+        return ""
+    try:
+        width, height, _x, _y = (int(part) for part in parts)
+    except ValueError:
+        return ""
+    return crop if width > 0 and height > 0 else ""
+
+
+def request_live_seek(seconds, path: Path = SEEK_PATH) -> bool:
+    """Ask the running player to jump. True if the request was written."""
+    try:
+        path.write_text(f"{play_offset(seconds):.3f}\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def deck_duration(path: Path = HOST_STATE) -> float:
@@ -2064,7 +2093,7 @@ def main() -> int:
                 crop = "auto"
                 if playlist_identity(source) == playlist_identity(getattr(self, "resume_source", "")):
                     start = play_offset(getattr(self, "resume_pos", 0.0))
-                    crop = "none"
+                    crop = deck_crop() or "auto"
                 self.resume_pos = 0.0
                 self.user_stopped = False
                 _gui_kick(self, "play", source, start=start, crop=crop)
@@ -2124,7 +2153,10 @@ def main() -> int:
             self.user_stopped = False
             self.hold_pos = at
             self.hold_until = time.monotonic() + 2.0
-            _gui_kick(self, "play", source, start=at, crop="none")
+            if deck_has_picture() and request_live_seek(at):
+                self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
+                return
+            _gui_kick(self, "play", source, start=at, crop=deck_crop() or "auto")
             self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
         def prevTrack_(self, _sender):
             now = deck_now_playing() or getattr(self, "seen_watch", "")
