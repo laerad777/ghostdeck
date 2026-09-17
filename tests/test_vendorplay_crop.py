@@ -55,6 +55,20 @@ def test_letterbox_then_cover_fills_the_native_plane():
     assert "pad=" not in graph
 
 
+def test_auto_without_detected_crop_still_covers_the_plane():
+    play = _play()
+    args = type("Args", (), {"image_resolution": "native", "playback_rate": 1.0, "interpolate": False})()
+    graph = play.build_video_filters(args, Fraction(30), "none")
+    assert "force_original_aspect_ratio=increase" in graph
+    assert "pad=" not in graph
+
+
+def test_auto_crop_runs_on_http_streams():
+    text = PLAY.read_text(encoding="utf-8")
+    assert 'args.crop == "auto" and args.input.startswith' not in text
+    assert "detect_crop(source)" in text
+
+
 def test_unproven_open_is_retried_once():
     """A YouTube session that dies messy leaves cleanup unproven; the next OPEN was refused.
 

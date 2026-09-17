@@ -164,10 +164,11 @@ def detect_crop(source):
             duration = 30.0
         start = min(max(duration * 0.15, 1.0), max(0.0, duration - 4.0))
         sample = min(8.0, max(2.0, duration - start))
-        result = run("ffmpeg", "-hide_banner", "-ss", f"{start:.3f}", "-i", source,
+        seek = [] if source.startswith(("http://", "https://")) else ["-ss", f"{start:.3f}"]
+        if source.startswith(("http://", "https://")):
+            sample = min(6.0, sample)
+        result = run("ffmpeg", "-hide_banner", *seek, "-i", source,
                      "-t", f"{sample:.3f}",
-                     # 8 misses compressed letterbox (iris 1080p: 8→1920x1080,
-                     # 24→1920:804:0:138). Round 2, reset 0 stay.
                      "-vf", "fps=2,cropdetect=24:2:0", "-f", "null", "-",
                      check=False, capture=True)
         candidates = re.findall(r"crop=(\d+:\d+:\d+:\d+)", result.stderr or "")
@@ -531,14 +532,13 @@ def build_video_filters(args, fps, crop):
         raise ValueError("only native image resolution is supported")
     source_crop = f"crop={crop}," if crop != "none" else ""
     fit = getattr(args, "fit", "auto")
-    if fit == "cover" or (fit == "auto" and crop != "none"):
-        spatial_filter = "scale=960:540:force_original_aspect_ratio=increase,crop=960:540"
-        if fit == "cover":
-            source_crop = ""
-    else:
+    if fit == "pad":
         spatial_filter = ("scale=960:540:force_original_aspect_ratio=decrease,"
                           "pad=960:540:(ow-iw)/2:(oh-ih)/2:black")
-        if fit == "pad":
+        source_crop = ""
+    else:
+        spatial_filter = "scale=960:540:force_original_aspect_ratio=increase,crop=960:540"
+        if fit == "cover":
             source_crop = ""
     timeline_filter = (
         f"setpts=PTS/{args.playback_rate:.9g},"
@@ -652,8 +652,7 @@ def main():
                 raise RuntimeError("yt-dlp produced no stream URL")
             source = urls[0]
         fps = parse_fps(args.fps, source)
-        crop = ("none" if args.crop == "auto" and args.input.startswith(("http://", "https://"))
-                else detect_crop(source) if args.crop == "auto" else args.crop)
+        crop = detect_crop(source) if args.crop == "auto" else args.crop
         filters = build_video_filters(args, fps, crop)
         command = ["ffmpeg", "-v", "error"]
         if args.loop:

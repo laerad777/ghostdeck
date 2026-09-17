@@ -34,6 +34,9 @@ from ghostdeck.app import (
     playlist_save,
     playlist_should_loop,
     deck_now_playing,
+    playlist_entry,
+    playlist_source,
+    source_identity,
     playable_source,
     should_start_play,
     play_offset,
@@ -432,24 +435,29 @@ def test_a_local_file_is_not_stopped_by_sitting_on_youtube():
 
 
 def test_playlist_label_is_a_name_not_a_path():
-    assert playlist_label("/tmp/clips/iris.mp4") == "iris.mp4"
+    assert playlist_label("/tmp/clips/iris.mp4") == "iris"
     assert playlist_label("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "YouTube · dQw4w9WgXcQ"
+    assert playlist_label({"source": "https://www.youtube.com/watch?v=x",
+                           "title": "Never Gonna Give You Up",
+                           "channel": "Rick Astley"}) == "Rick Astley · Never Gonna Give You Up"
     assert playlist_label("") == ""
 
 
 def test_playlist_add_skips_a_consecutive_duplicate():
     first = playlist_add([], "/tmp/a.mp4")
-    assert first == ["/tmp/a.mp4"]
+    assert [playlist_source(item) for item in first] == ["/tmp/a.mp4"]
     assert playlist_add(first, "/tmp/a.mp4") == first
-    assert playlist_add(first, "/tmp/b.mp4") == ["/tmp/a.mp4", "/tmp/b.mp4"]
+    assert [playlist_source(item) for item in playlist_add(first, "/tmp/b.mp4")] == [
+        "/tmp/a.mp4", "/tmp/b.mp4",
+    ]
 
 
 def test_playlist_advance_plays_through_then_stops():
-    items = ["/tmp/a.mp4", "/tmp/b.mp4"]
+    items = playlist_add(playlist_add([], "/tmp/a.mp4"), "/tmp/b.mp4")
     assert playlist_advance(items, "/tmp/a.mp4") == "/tmp/b.mp4"
     assert playlist_advance(items, "/tmp/b.mp4") == ""
     assert playlist_advance(items, "") == "/tmp/a.mp4"
-    assert playlist_remove(items, 0) == ["/tmp/b.mp4"]
+    assert [playlist_source(item) for item in playlist_remove(items, 0)] == ["/tmp/b.mp4"]
 
 
 def test_a_queue_does_not_loop_a_file():
@@ -461,7 +469,9 @@ def test_a_queue_does_not_loop_a_file():
 def test_playlist_roundtrip(tmp_path):
     path = tmp_path / "playlist.json"
     playlist_save(path, ["/tmp/a.mp4", "https://www.youtube.com/watch?v=x"])
-    assert playlist_load(path) == ["/tmp/a.mp4", "https://www.youtube.com/watch?v=x"]
+    assert [playlist_source(item) for item in playlist_load(path)] == [
+        "/tmp/a.mp4", "https://www.youtube.com/watch?v=x",
+    ]
     assert playlist_load(tmp_path / "missing.json") == []
 
 
@@ -470,3 +480,31 @@ def test_deck_now_playing_reads_the_player_receipt(tmp_path):
     path.write_text('{"source":"/tmp/iris.mp4","phase":"active"}\n', encoding="utf-8")
     assert deck_now_playing(path) == "/tmp/iris.mp4"
     assert deck_now_playing(tmp_path / "gone.json") == ""
+
+
+def test_source_identity_uses_oembed_title_and_channel():
+    class Resp:
+        def read(self):
+            return b'{"title":"Never Gonna Give You Up","author_name":"Rick Astley"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    def fetch(_req, timeout=5):
+        return Resp()
+
+    title, channel = source_identity(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ", fetch=fetch,
+    )
+    assert (title, channel) == ("Never Gonna Give You Up", "Rick Astley")
+
+
+def test_file_identity_falls_back_to_the_stem():
+    def probe(*_a, **_k):
+        raise OSError("no ffprobe")
+
+    title, channel = source_identity("/tmp/clips/iris.mp4", probe=probe)
+    assert (title, channel) == ("iris", "")

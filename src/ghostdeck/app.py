@@ -11,7 +11,8 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.request import Request, urlopen
 
 from ghostdeck import studio
 
@@ -34,10 +35,6 @@ _YT_HOSTS = {
 _MEDIA_SUFFIXES = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")
 HOST_STATE = Path("/tmp/d200-color-host.json")
 PLAYLIST_PATH = Path.home() / ".ghostdeck" / "playlist.json"
-_IPHONE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-)
 
 
 @dataclass(frozen=True)
@@ -205,14 +202,50 @@ def dropped_play_source(filenames) -> str:
     return ""
 
 
-def playlist_label(source: str) -> str:
-    """A short name for a playlist row. Not a URL dump."""
-    source = (source or "").strip()
+def playlist_entry(source: str, title: str = "", channel: str = "") -> dict[str, str]:
+    return {
+        "source": (source or "").strip(),
+        "title": (title or "").strip(),
+        "channel": (channel or "").strip(),
+    }
+
+
+def playlist_source(item) -> str:
+    if isinstance(item, dict):
+        return str(item.get("source") or "").strip()
+    return str(item or "").strip()
+
+
+def playlist_normalize(items) -> list[dict[str, str]]:
+    out = []
+    for item in items or []:
+        if isinstance(item, dict):
+            source = str(item.get("source") or "").strip()
+            if source:
+                out.append(playlist_entry(source, item.get("title") or "", item.get("channel") or ""))
+        else:
+            source = str(item).strip()
+            if source:
+                out.append(playlist_entry(source))
+    return out
+
+
+def playlist_label(item) -> str:
+    """Channel · title when known. Never a raw watch URL."""
+    if not isinstance(item, dict):
+        item = playlist_entry(str(item or ""))
+    title = str(item.get("title") or "").strip()
+    channel = str(item.get("channel") or "").strip()
+    if title and channel:
+        return f"{channel} · {title}"
+    if title:
+        return title
+    source = playlist_source(item)
     if not source:
         return ""
     local = media_path_candidate(source)
     if local:
-        return Path(local).name
+        return Path(local).stem
     watch = youtube_watch_url(source)
     if watch:
         vid = parse_qs(urlparse(watch).query).get("v", [""])[0]
@@ -220,19 +253,25 @@ def playlist_label(source: str) -> str:
     return source if len(source) <= 48 else source[:45] + "..."
 
 
-def playlist_add(items, source: str) -> list[str]:
+def playlist_add(items, source: str, title: str = "", channel: str = "") -> list[dict[str, str]]:
     """Append a playable source. Consecutive duplicates are ignored."""
     source = (source or "").strip()
-    out = [str(item) for item in (items or []) if str(item).strip()]
+    out = playlist_normalize(items)
     if not source:
         return out
-    if out and out[-1] == source:
+    if out and playlist_source(out[-1]) == source:
+        last = dict(out[-1])
+        if title and not last.get("title"):
+            last["title"] = title.strip()
+        if channel and not last.get("channel"):
+            last["channel"] = channel.strip()
+        out[-1] = last
         return out
-    return out + [source]
+    return out + [playlist_entry(source, title, channel)]
 
 
-def playlist_remove(items, index: int) -> list[str]:
-    out = [str(item) for item in (items or [])]
+def playlist_remove(items, index: int) -> list[dict[str, str]]:
+    out = playlist_normalize(items)
     if index < 0 or index >= len(out):
         return out
     del out[index]
@@ -241,38 +280,95 @@ def playlist_remove(items, index: int) -> list[str]:
 
 def playlist_advance(items, current: str) -> str:
     """The next queued source after `current`, or empty at the end."""
-    items = [str(item) for item in (items or []) if str(item).strip()]
+    items = playlist_normalize(items)
     current = (current or "").strip()
-    if not items:
+    sources = [playlist_source(item) for item in items]
+    if not sources:
         return ""
-    if current in items:
-        nxt = items.index(current) + 1
-        return items[nxt] if nxt < len(items) else ""
-    return items[0]
+    if current in sources:
+        nxt = sources.index(current) + 1
+        return sources[nxt] if nxt < len(sources) else ""
+    return sources[0]
 
 
 def playlist_should_loop(source: str, items) -> bool:
     """A queue plays through. A single file still loops (CLI default)."""
-    items = [str(item) for item in (items or []) if str(item).strip()]
+    items = playlist_normalize(items)
     if len(items) > 1:
         return False
     return play_should_loop(source)
 
 
-def playlist_load(path: Path) -> list[str]:
+def playlist_find(items, source: str) -> dict[str, str]:
+    source = (source or "").strip()
+    for item in playlist_normalize(items):
+        if playlist_source(item) == source:
+            return item
+    return playlist_entry(source)
+
+
+def playlist_load(path: Path) -> list[dict[str, str]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         return []
     if not isinstance(raw, list):
         return []
-    return [str(item).strip() for item in raw if str(item).strip()]
+    return playlist_normalize(raw)
 
 
 def playlist_save(path: Path, items) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps([str(item) for item in items], indent=2, ensure_ascii=False) + "\n"
+    text = json.dumps(playlist_normalize(items), indent=2, ensure_ascii=False) + "\n"
     path.write_text(text, encoding="utf-8")
+
+
+def source_identity(source: str, fetch=None, probe=None) -> tuple[str, str]:
+    """(title, channel) for a source. Never HID. Empty on failure."""
+    source = (source or "").strip()
+    watch = youtube_watch_url(source)
+    if watch:
+        return _youtube_oembed(watch, fetch=fetch)
+    local = media_path_candidate(source)
+    if local:
+        return _file_identity(local, probe=probe)
+    return "", ""
+
+
+def _youtube_oembed(watch: str, fetch=None) -> tuple[str, str]:
+    opener = urlopen if fetch is None else fetch
+    url = "https://www.youtube.com/oembed?format=json&url=" + quote(watch, safe="")
+    try:
+        req = Request(url, headers={"User-Agent": "ghostdeck/0.1"})
+        with opener(req, timeout=5) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+    except (OSError, json.JSONDecodeError, UnicodeError, ValueError, TypeError):
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    return str(data.get("title") or "").strip(), str(data.get("author_name") or "").strip()
+
+
+def _file_identity(path: str, probe=None) -> tuple[str, str]:
+    runner = subprocess.run if probe is None else probe
+    try:
+        result = runner(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format_tags=title,artist,album_artist",
+                "-of", "json", path,
+            ],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        tags = ((json.loads(result.stdout or "{}").get("format") or {}).get("tags") or {})
+        title = str(tags.get("title") or "").strip()
+        channel = str(tags.get("artist") or tags.get("album_artist") or "").strip()
+        if title:
+            return title, channel
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
+        pass
+    return Path(path).stem, ""
 
 
 def deck_now_playing(path: Path = HOST_STATE) -> str:
@@ -708,6 +804,20 @@ def main() -> int:
         ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source)
         playlist_save(PLAYLIST_PATH, ctrl.playlist)
         _gui_playlist_draw(ctrl)
+        if playlist_find(ctrl.playlist, source).get("title"):
+            return
+
+        def fill():
+            title, channel = source_identity(source)
+
+            def apply():
+                ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, title, channel)
+                playlist_save(PLAYLIST_PATH, ctrl.playlist)
+                _gui_playlist_draw(ctrl)
+
+            AppHelper.callAfter(apply)
+
+        threading.Thread(target=fill, daemon=True).start()
 
     def _gui_playlist_draw(ctrl) -> None:
         table = getattr(ctrl, "playlist_table", None)
@@ -716,11 +826,14 @@ def main() -> int:
         now = deck_now_playing()
         field = getattr(ctrl, "now_field", None)
         if field is not None:
-            field.setStringValue_(playlist_label(now) if now else "없음")
+            field.setStringValue_(
+                playlist_label(playlist_find(getattr(ctrl, "playlist", []), now)) if now else "없음"
+            )
 
     def _gui_sync_deck(ctrl, playing: bool) -> None:
         now = deck_now_playing()
-        if now and now not in getattr(ctrl, "playlist", []):
+        sources = [playlist_source(item) for item in getattr(ctrl, "playlist", [])]
+        if now and now not in sources:
             _gui_playlist_put(ctrl, now)
         else:
             _gui_playlist_draw(ctrl)
@@ -833,18 +946,17 @@ def main() -> int:
             self.popups = []
             prefs = config.defaultWebpagePreferences()
             if prefs is not None:
-                prefs.setPreferredContentMode_(1)
+                prefs.setPreferredContentMode_(0)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
                 NSMakeRect(PAD, WEB_Y, PHONE_W, H - WEB_Y),
                 config,
             )
             self.web.setAutoresizingMask_(NSViewHeightSizable)
-            self.web.setCustomUserAgent_(_IPHONE_UA)
             self.web.setUIDelegate_(self)
             self.web.setNavigationDelegate_(self)
             view.addSubview_(self.web)
             self.web.loadRequest_(
-                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://m.youtube.com"))
+                NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
             SIDE_X = PAD + PHONE_W + SIDE_GAP
             heading = NSTextField.alloc().initWithFrame_(NSMakeRect(SIDE_X, H - 22, SIDE_W, 18))
@@ -943,20 +1055,21 @@ def main() -> int:
 
             # The field takes whatever is left over; the two action buttons keep their width and ride
             # the right edge, so resizing moves the URL field and nothing overlaps.
-            url_w = W - URL_X - (2 * RIGHT + GAP + 10)
+            phone_right = PAD + PHONE_W
+            url_w = max(80, phone_right - URL_X - (2 * RIGHT + GAP + 8))
             self.url_field = NSTextField.alloc().initWithFrame_(NSMakeRect(URL_X, BAR_Y, url_w, BAR_H))
-            self.url_field.setStringValue_("https://m.youtube.com")
+            self.url_field.setStringValue_("https://www.youtube.com")
             self.url_field.setTarget_(self)
             self.url_field.setAction_("go:")
             self.url_field.setFont_(NSFont.systemFontOfSize_(12))
-            self.url_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            self.url_field.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(self.url_field)
 
             # Play AND stop. The stop path has always existed (`DeckRemote.stop` -> `ghostdeck stop`),
             # but no control ever called it, so a video started from this window could only be stopped
             # from a terminal -- which is exactly what this window exists to avoid.
             self.play_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(W - 10 - 2 * RIGHT - GAP, BAR_Y, RIGHT, BAR_H)
+                NSMakeRect(phone_right - 8 - 2 * RIGHT - GAP, BAR_Y, RIGHT, BAR_H)
             )
             self.play_btn.setTitle_("▶  재생")
             self.play_btn.setBezelStyle_(NSBezelStyleRounded)
@@ -964,11 +1077,11 @@ def main() -> int:
             self.play_btn.setTarget_(self)
             self.play_btn.setAction_("play:")
             self.play_btn.setKeyEquivalent_("\r")
-            self.play_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            self.play_btn.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(self.play_btn)
 
             self.stop_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(W - 10 - RIGHT, BAR_Y, RIGHT, BAR_H)
+                NSMakeRect(phone_right - 8 - RIGHT, BAR_Y, RIGHT, BAR_H)
             )
             self.stop_btn.setTitle_("■  정지")
             self.stop_btn.setBezelStyle_(NSBezelStyleRounded)
@@ -976,7 +1089,7 @@ def main() -> int:
             self.stop_btn.setTarget_(self)
             self.stop_btn.setAction_("stop:")
             self.stop_btn.setKeyEquivalent_("\x1b")
-            self.stop_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            self.stop_btn.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(self.stop_btn)
             reload_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
             reload_btn.setKeyEquivalent_("r")
@@ -1134,7 +1247,7 @@ def main() -> int:
             if row < 0 or row >= len(items):
                 return ""
             name = playlist_label(items[row])
-            return ("▶ " + name) if items[row] == deck_now_playing() else name
+            return ("▶ " + name) if playlist_source(items[row]) == deck_now_playing() else name
 
         def tableView_shouldEditTableColumn_row_(self, _table, _col, _row):
             return False
@@ -1165,7 +1278,7 @@ def main() -> int:
                 self.note.setStringValue_("재생할 항목을 고르십시오.")
                 return
             self.user_stopped = False
-            _gui_kick(self, "play", items[row])
+            _gui_kick(self, "play", playlist_source(items[row]))
 
         def removeSelected_(self, _sender):
             row = int(self.playlist_table.selectedRow())
