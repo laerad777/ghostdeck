@@ -219,7 +219,7 @@ def test_status_annotates_an_offline_transport(monkeypatch, capsys, home):
     code = _run(monkeypatch, WEDGED_DECK, "status")
     captured = capsys.readouterr()
     assert code == OFFLINE_EXIT, (code, captured)
-    assert "usb=adb (offline)" in captured.out, captured
+    assert "usb=adb transport=offline " in captured.out, captured
     assert "shim=" in captured.out, captured
     assert "power-cycle" in captured.err, captured
 

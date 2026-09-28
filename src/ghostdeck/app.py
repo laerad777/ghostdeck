@@ -20,7 +20,8 @@ from ghostdeck import studio
 
 _SHIM_UP = re.compile(r"(?:^|\s)shim=up(?:\s|$)")
 # The fields `status` prints. Parsed by name so a new field cannot be mistaken for a value.
-_STATUS_FIELDS = ("usb", "shim", "copy", "playing")
+# `transport` is present only when the deck is attached but its adb transport cannot run a command.
+_STATUS_FIELDS = ("usb", "transport", "shim", "copy", "playing")
 _USB_TEXT = {
     "adb": "덱 ADB",
     "hid": "덱 HID",
@@ -37,9 +38,13 @@ _YT_HOSTS = {
 _MEDIA_SUFFIXES = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".m3u8", ".mpd")
 HOST_STATE = Path("/tmp/d200-color-host.json")
 SEEK_PATH = Path("/tmp/d200-color-seek")
+VOLUME_PATH = Path("/tmp/d200-color-volume")
+OVERLAY_PATH = Path("/tmp/d200-color-overlay")
 PLAYLIST_PATH = Path.home() / ".ghostdeck" / "playlist.json"
 PLAYER_PATH = Path.home() / ".ghostdeck" / "player.json"
 _REPEAT_MODES = ("off", "all", "one")
+_FIT_MODES = ("auto", "pad", "cover")
+_CROP_MODES = ("auto", "none")
 
 
 @dataclass(frozen=True)
@@ -51,10 +56,7 @@ class CommandResult:
 
     @property
     def detail(self) -> str:
-        text = (self.stderr or self.stdout).strip()
-        if text:
-            return text.splitlines()[-1]
-        return f"exit {self.code}"
+        return message_head(self.stderr or self.stdout) or f"exit {self.code}"
 
 
 def run_cli(argv: list[str]) -> CommandResult:
@@ -69,7 +71,7 @@ def run_cli(argv: list[str]) -> CommandResult:
     env = os.environ.copy()
     previous = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(root / "src") if not previous else str(root / "src") + os.pathsep + previous
-    timeout = {"studio": 180.0, "play": 30.0, "bridge": 90.0, "stop": 60.0}.get(argv[0] if argv else "", 20.0)
+    timeout = {"studio": 180.0, "play": 30.0, "bridge": 90.0, "stop": 60.0, "reconnect": 180.0}.get(argv[0] if argv else "", 20.0)
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "ghostdeck", *argv],
@@ -83,6 +85,26 @@ def run_cli(argv: list[str]) -> CommandResult:
     except OSError as error:
         return CommandResult(list(argv), 1, "", f"{type(error).__name__}: {error}")
     return CommandResult(list(argv), int(proc.returncode), proc.stdout or "", proc.stderr or "")
+
+
+def message_head(text: str) -> str:
+    """The headline of the last message a CLI child printed, or empty.
+
+    A multi-line error indents its continuation lines (`d200-color-agent is not built.` is followed
+    by indented download/install steps), so the last line alone was an indented URL with no reason
+    attached. Warnings printed earlier sit on their own unindented lines, so the last unindented
+    line is the start of the final message either way.
+    """
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    for line in reversed(lines):
+        if not line[:1].isspace():
+            return line.strip()
+    return lines[-1].strip() if lines else ""
+
+
+def studio_installed() -> bool:
+    """Whether `studio` can work on this host at all. A directory check: no HID, no subprocess."""
+    return studio.ORIGINAL.is_dir()
 
 
 def shim_is_up(status_stdout: str) -> bool:
@@ -108,30 +130,41 @@ def parse_status_fields(status_stdout: str) -> dict[str, str]:
     return fields
 
 
-def status_text(status_stdout: str) -> str:
+def status_text(status_stdout: str, *, has_picture=None, has_studio: bool = True) -> str:
     """A one-line summary for the window, in Korean.
 
-    The CLI's raw line is `usb=adb shim=up copy=yes playing=no`, which reads as a debug dump in a
-    window someone is using to watch a video. The two facts that matter are where the deck is and
-    whether it is playing; a bridge that is down is worth saying only when it is, because that is the
-    state in which pressing 재생 will start it.
+    The CLI's raw line is `usb=adb shim=up copy=yes playing=no`. USB stays, then the hidshim
+    key surface, then play. Official Studio is named only when it is missing, because that is why
+    there are no keys. `has_picture=False` is opening: pid live is not 재생 중.
     """
     fields = parse_status_fields(status_stdout)
     if not fields:
         return "상태를 읽지 못했습니다"
+    if fields.get("transport"):
+        # Attached but adb cannot run a command on it. Keys and play state are moot, and nothing on
+        # the host recovers it, so the physical remedy is the whole message.
+        return f"덱 응답 없음 ({fields['transport']}) · 덱을 뽑았다 다시 꽂으십시오"
     piece = [_USB_TEXT.get(fields.get("usb", ""), f"덱 {fields.get('usb')}")]
-    piece.append("재생 중" if fields.get("playing") == "yes" else "멈춤")
-    if fields.get("shim") == "down":
-        piece.append("브리지 꺼짐")
+    if fields.get("shim") == "up":
+        piece.append("키 연결됨")
+    else:
+        piece.append("키 없음" if has_studio else "Studio 없음")
+    if fields.get("playing") == "yes":
+        piece.append("재생 중" if has_picture is not False else "여는 중")
+    else:
+        piece.append("멈춤")
+    if fields.get("usb", "").startswith("none"):
+        piece.append("연결을 누르십시오")
     return " · ".join(piece)
 
 
-def status_dot_color(status_stdout: str):
+def status_dot_color(status_stdout: str, *, has_picture=None, has_studio: bool = True):
     """An `NSColor` for the status dot, or None when AppKit is not loadable.
 
     Colour is the part that is read without looking: green only while the deck is actually playing,
-    red when there is no usable deck, amber when the deck is there but the bridge is down (the one
-    state where pressing 재생 has something to do), and grey when it is simply idle and ready.
+    red when there is no usable deck, amber when the deck is there but the keys are down and
+    `studio` can bring them up, and grey when it is simply idle and ready. A host without the
+    official app has no keys to bring up, so `shim=down` is its normal state, not amber.
     """
     fields = parse_status_fields(status_stdout)
     if not fields:
@@ -140,13 +173,35 @@ def status_dot_color(status_stdout: str):
         from AppKit import NSColor
     except ImportError:
         return None
-    if fields.get("usb", "").startswith("none") or fields.get("usb") == "unknown":
+    if (
+        fields.get("usb", "").startswith("none")
+        or fields.get("usb") == "unknown"
+        or fields.get("transport")
+    ):
         return NSColor.systemRedColor()
-    if fields.get("playing") == "yes":
+    if fields.get("playing") == "yes" and has_picture is not False:
         return NSColor.systemGreenColor()
-    if fields.get("shim") == "down":
+    if fields.get("shim") == "down" and has_studio:
         return NSColor.systemOrangeColor()
     return NSColor.secondaryLabelColor()
+
+
+def recovery_action(status_stdout: str, *, has_studio: bool = True) -> str:
+    """The one recovery button this state calls for: "reconnect", "studio", or "" for none.
+
+    `연결` finds a deck that is not on USB. `스튜디오` brings the keys up on a deck that is there.
+    A wedged transport and a missing Python backend have no button that fixes them, so nothing is
+    offered rather than a button that cannot help.
+    """
+    fields = parse_status_fields(status_stdout)
+    if not fields or fields.get("transport"):
+        return ""
+    usb = fields.get("usb", "")
+    if usb == "none":
+        return "reconnect"
+    if usb in ("adb", "hid") and fields.get("shim") == "down" and has_studio:
+        return "studio"
+    return ""
 
 def bridge_down(detail: str) -> bool:
     """True when `play` refused because the bridge is not up, so `studio` is the remedy.
@@ -444,6 +499,178 @@ def repeat_label(repeat: str) -> str:
     return {"all": "전체", "one": "한곡"}.get(repeat, "반복")
 
 
+def play_fit(fit: str) -> str:
+    fit = (fit or "auto").strip()
+    return fit if fit in _FIT_MODES else "auto"
+
+
+def play_crop_choice(crop: str) -> str:
+    crop = (crop or "auto").strip()
+    return crop if crop in _CROP_MODES else "auto"
+
+
+def play_crop_argv(source: str, crop: str) -> str:
+    """auto letterbox detect is a local-file job. HTTP waits on ffmpeg cropdetect."""
+    chosen = play_crop_choice(crop)
+    if chosen != "auto":
+        return chosen
+    src = source or ""
+    if youtube_watch_url(src) or src.startswith(("http://", "https://")):
+        return "none"
+    return "auto"
+
+
+def playlist_click_row(clicked, selected, count) -> int:
+    """Double-click uses clickedRow. Empty-selection tables deselect on the second click."""
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        n = 0
+    for raw in (clicked, selected):
+        try:
+            row = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= row < n:
+            return row
+    return -1
+
+def playlist_playing(item, now: str, seen: str = "") -> bool:
+    ident = playlist_identity(playlist_source(item) if isinstance(item, dict) else str(item or ""))
+    if not ident:
+        return False
+    live = playlist_identity(now) or playlist_identity(seen)
+    return ident == live
+
+
+def fit_label(fit: str) -> str:
+    """What the frame does on the deck. It applies from the next play; the tooltip says so."""
+    return {"pad": "화면: 맞춤", "cover": "화면: 채움"}.get(play_fit(fit), "화면: 자동")
+
+
+def crop_label(crop: str) -> str:
+    return "여백: 유지" if play_crop_choice(crop) == "none" else "여백: 자동"
+
+def overlay_label() -> str:
+    """The slider sets how opaque the Studio buttons are over the video; right is solid."""
+    return "버튼"
+
+QUEUE_CHROME = 270
+
+def console_row(count, width=372, inset=16, gap=8):
+    """Equal cells on the queue pane. Last cell ends at width - inset."""
+    inner = width - inset * 2
+    cell = (inner - gap * (count - 1)) // count
+    x = inset
+    cells = []
+    for _ in range(count):
+        cells.append((x, cell))
+        x += cell + gap
+    return cells
+
+
+# CLI refusal fragment (lower-cased) -> the Korean line the window shows. First match wins, so the
+# more specific phrase comes first. Each line names the next thing to do, not the internal cause.
+_FAILURE_NOTES = (
+    ("open failed", "덱이 아직 이전 영상을 안 놓았습니다."),
+    ("busy with another video", "덱이 아직 이전 영상을 안 놓았습니다."),
+    ("has not proven", "덱이 아직 이전 영상을 안 놓았습니다."),
+    ("before it started", "재생을 시작하지 못했습니다."),
+    ("nothing is playing", "재생을 시작하지 못했습니다."),
+    ("transport is", "덱이 응답하지 않습니다. 덱을 뽑았다 다시 꽂으십시오."),
+    ("no d200 on usb", "덱이 USB에 없습니다. 케이블을 꽂고 연결을 누르십시오."),
+    ("not enumerating through adb", "덱이 ADB로 전환되지 않았습니다. 연결을 누르십시오."),
+    ("not in adb after switch", "덱이 ADB로 전환되지 않았습니다. 연결을 누르십시오."),
+    ("did not enumerate through adb", "덱이 ADB로 전환되지 않았습니다. 연결을 누르십시오."),
+    ("no adb device reachable", "덱이 보이지 않습니다. 케이블을 꽂고 연결을 누르십시오."),
+    (studio.STUDIO_MISSING.lower(), "Ulanzi Studio가 없습니다. 브리지를 누르면 키 없이 재생됩니다."),
+    (studio.BRIDGE_DOWN.lower(), "브리지가 꺼져 있습니다. 스튜디오를 누르십시오."),
+    (f"no live {studio.BRIDGE.name} of ours", "다른 프로세스가 브리지 소켓을 잡고 있습니다."),
+    ("bridge socket did not come up", "브리지를 띄우지 못했습니다. 연결을 누른 다음 다시 시도하십시오."),
+    ("did not stay running", "Studio 복사본이 바로 꺼졌습니다. 스튜디오를 다시 누르십시오."),
+    ("d200-color-agent is not built", "덱 에이전트가 없습니다. README의 디바이스 에이전트 설치를 따르십시오."),
+    ("ffmpeg not on path", "ffmpeg가 없습니다. brew install ffmpeg 후 다시 시도하십시오."),
+    ("ffprobe not on path", "ffprobe가 없습니다. brew install ffmpeg 후 다시 시도하십시오."),
+    ("yt-dlp not on path", "yt-dlp가 없습니다. brew install yt-dlp 후 다시 시도하십시오."),
+    ("is not installed (pip install", "파이썬 패키지가 없습니다. pip install -e \".[device]\" 후 다시 여십시오."),
+    ("source is not a file", "재생할 파일을 찾지 못했습니다."),
+    ("did not release within", "덱이 영상을 놓지 않았습니다. 정지를 한 번 더 누르십시오."),
+    ("timed out", "응답이 너무 늦습니다. 연결을 누른 다음 다시 시도하십시오."),
+)
+
+
+def failure_note(detail: str, *, fallback: str = "실패했습니다.") -> str:
+    """Korean note for a failed CLI step. Known refusals are mapped; anything else passes through.
+
+    An unknown message is shown as-is (without a `RuntimeError:` prefix) rather than replaced with a
+    generic line: a reason the table does not know is still more useful than no reason.
+    """
+    text = (detail or "").strip()
+    if text.lower().startswith("runtimeerror:"):
+        text = text.split(":", 1)[-1].strip()
+    lower = text.lower()
+    for needle, note in _FAILURE_NOTES:
+        if needle in lower:
+            return note
+    return text or fallback
+
+
+def play_failure_note(detail: str) -> str:
+    """Korean note for a failed play."""
+    return failure_note(detail, fallback="재생을 시작하지 못했습니다.")
+
+
+def play_success_note(has_picture: bool) -> str:
+    if has_picture:
+        return "덱에서 재생 중입니다. 창이 멈추거나 끊겨도 덱은 계속 재생됩니다."
+    return "첫 프레임을 기다리는 중입니다."
+
+
+def should_auto_next(
+    *,
+    playing: bool,
+    session_active: bool,
+    was_playing: bool,
+    saw_picture: bool,
+    user_stopped: bool,
+    busy: bool,
+) -> bool:
+    if user_stopped or busy or playing:
+        return False
+    if session_active and not saw_picture:
+        return False
+    return was_playing and saw_picture
+
+
+def opening_session(*, playing: bool, has_picture: bool, session_active: bool = False) -> bool:
+    return (playing or session_active) and not has_picture
+
+
+def seek_note(seconds, live: bool) -> str:
+    clock = format_clock(play_offset(seconds))
+    return f"{clock}부터 다시 재생합니다."
+
+
+def clamp_volume(value) -> float:
+    """Host speaker gain in [0, 1]. Junk becomes 1."""
+    try:
+        gain = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(gain):
+        return 1.0
+    if gain < 0:
+        return 0.0
+    if gain > 1:
+        return 1.0
+    return gain
+
+
+def audio_gain(volume, muted: bool) -> float:
+    """Linear gain sent to the player. Mute is 0 without losing the slider."""
+    return 0.0 if muted else clamp_volume(volume)
+
+
 def player_prefs_load(path: Path = PLAYER_PATH) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -454,7 +681,15 @@ def player_prefs_load(path: Path = PLAYER_PATH) -> dict:
     repeat = str(data.get("repeat") or "off")
     if repeat not in _REPEAT_MODES:
         repeat = "off"
-    return {"repeat": repeat, "shuffle": bool(data.get("shuffle"))}
+    return {
+        "repeat": repeat,
+        "shuffle": bool(data.get("shuffle")),
+        "volume": clamp_volume(data["volume"]) if "volume" in data else 1.0,
+        "muted": bool(data.get("muted")),
+        "overlay": clamp_volume(data["overlay"]) if "overlay" in data else 1.0,
+        "fit": play_fit(str(data.get("fit") or "auto")),
+        "crop": play_crop_choice(str(data.get("crop") or "auto")),
+    }
 
 
 def player_prefs_save(path: Path, prefs) -> None:
@@ -462,8 +697,27 @@ def player_prefs_save(path: Path, prefs) -> None:
     repeat = str((prefs or {}).get("repeat") or "off")
     if repeat not in _REPEAT_MODES:
         repeat = "off"
-    payload = {"repeat": repeat, "shuffle": bool((prefs or {}).get("shuffle"))}
+    payload = {
+        "repeat": repeat,
+        "shuffle": bool((prefs or {}).get("shuffle")),
+        "volume": clamp_volume((prefs or {}).get("volume", 1.0)),
+        "muted": bool((prefs or {}).get("muted")),
+        "overlay": clamp_volume((prefs or {}).get("overlay", 1.0)),
+        "fit": play_fit(str((prefs or {}).get("fit") or "auto")),
+        "crop": play_crop_choice(str((prefs or {}).get("crop") or "auto")),
+    }
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def playlist_index(items, source: str) -> int:
+    """The queue row holding `source`, or -1."""
+    source = playlist_identity((source or "").strip())
+    if not source:
+        return -1
+    for index, item in enumerate(playlist_normalize(items)):
+        if playlist_identity(playlist_source(item)) == source:
+            return index
+    return -1
 
 
 def playlist_find(items, source: str) -> dict[str, str]:
@@ -741,6 +995,44 @@ def request_live_seek(seconds, path: Path = SEEK_PATH) -> bool:
     return True
 
 
+def request_live_volume(gain, path: Path = VOLUME_PATH) -> bool:
+    """Ask the running player to set host gain. True if the request was written."""
+    try:
+        path.write_text(f"{clamp_volume(gain):.4f}\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _push_studio_alpha(gain: float) -> None:
+    n = int(round(clamp_volume(gain) * 255))
+    try:
+        from ghostdeck import adb
+        binary = adb.adb_bin()
+    except (FileNotFoundError, OSError):
+        return
+    try:
+        subprocess.run(
+            [binary, "shell", f"echo {n} >/tmp/d200-studio-alpha"],
+            timeout=5,
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        return
+
+
+def request_live_overlay(gain, path: Path = OVERLAY_PATH) -> bool:
+    """Ask the running player, and the deck preload, to set Studio button opacity."""
+    value = clamp_volume(gain)
+    try:
+        path.write_text(f"{value:.4f}\n", encoding="utf-8")
+    except OSError:
+        return False
+    threading.Thread(target=_push_studio_alpha, args=(value,), daemon=True).start()
+    return True
+
+
 def deck_duration(path: Path = HOST_STATE) -> float:
     """Duration the player published for the current source. 0 if unknown."""
     try:
@@ -952,20 +1244,7 @@ def is_google_login_host(host: str) -> bool:
     return host == "accounts.youtube.com" or host == "accounts.google.com" or host.startswith("accounts.google.")
 
 def page_follow_action(seen_watch: str, href: str) -> tuple[str, str]:
-    """When the page changes: (new_seen, play_url | 'stop' | ''). Same YouTube id is a no-op.
-
-    Stop only if the current source is a YouTube watch. A local file playing while the
-    window sits on youtube.com would otherwise look like "left the video" and halt the deck.
-    """
-    if youtube_playlist_page(href):
-        return seen_watch, ""
-    watch = youtube_watch_url(href)
-    if watch == seen_watch:
-        return seen_watch, ""
-    if watch:
-        return watch, watch
-    if youtube_watch_url(seen_watch):
-        return "", "stop"
+    """Browse freely. Deck playback is only the queue and the play button."""
     return seen_watch, ""
 
 def ensure_store_id(path: Path, mint) -> str:
@@ -996,7 +1275,31 @@ class DeckRemote:
     def stop(self) -> CommandResult:
         return self._run(["stop"])
 
-    def play(self, source: str, pasteboard: str = "", start: float = 0.0, loop: bool = True, crop: str = "auto") -> list[CommandResult]:
+    def reconnect(self) -> CommandResult:
+        return self._run(["reconnect"])
+
+    def studio(self) -> CommandResult:
+        return self._run(["studio"])
+
+    def bridge(self) -> CommandResult:
+        return self._run(["bridge"])
+
+    def _bring_up(self, results: list[CommandResult]) -> bool:
+        """`studio`, or the bridge alone when this host has no Studio to start. True if either is up.
+
+        Without the official app `studio` can never succeed, but video does not need it: the bridge
+        is the transport and Studio is only the keys. Stopping at that refusal left a Studio-less
+        host with no way to play from the window at all.
+        """
+        results.append(self._run(["studio"]))
+        if results[-1].code == 0:
+            return True
+        if studio.STUDIO_MISSING not in results[-1].detail:
+            return False
+        results.append(self._run(["bridge"]))
+        return results[-1].code == 0
+
+    def play(self, source: str, pasteboard: str = "", start: float = 0.0, loop: bool = True, crop: str = "auto", volume: float = 1.0, fit: str = "auto") -> list[CommandResult]:
         source = resolve_source(source, pasteboard)
         if not source:
             return [CommandResult(["play"], 2, "", "유튜브에서 영상을 열거나 파일을 연 다음 재생을 누르십시오")]
@@ -1005,10 +1308,8 @@ class DeckRemote:
         if not resume:
             st = self._run(["status"])
             results.append(st)
-            if not shim_is_up(st.stdout):
-                results.append(self._run(["studio"]))
-                if results[-1].code != 0:
-                    return results
+            if not shim_is_up(st.stdout) and not self._bring_up(results):
+                return results
         argv = ["play", source]
         start = play_offset(start)
         if start > 0:
@@ -1017,26 +1318,36 @@ class DeckRemote:
             argv.extend(["--crop", crop])
         if not loop:
             argv.append("--no-loop")
+        gain = audio_gain(volume, False)
+        if gain != 1.0:
+            argv.extend(["--volume", f"{gain:.4f}"])
+        fit = play_fit(fit)
+        if fit != "auto":
+            argv.extend(["--fit", fit])
         played = self._run(argv)
         results.append(played)
         # `shim=up` said the copy was running, so `studio` was skipped -- but the bridge it needs was
         # gone, and `play` refused. Start it now and retry once: this is the same recovery the
         # shim-down branch already does, reached from the failure instead of from `status`.
-        if played.code != 0 and bridge_down(played.detail):
-            results.append(self._run(["studio"]))
-            if results[-1].code == 0:
-                results.append(self._run(argv))
+        if played.code != 0 and bridge_down(played.detail) and self._bring_up(results):
+            results.append(self._run(argv))
         return results
 
 
-def _busy_call(remote: DeckRemote, op: str, source: str, pasteboard: str, done, start=0.0, loop=True, crop="auto") -> None:
+def _busy_call(remote: DeckRemote, op: str, source: str, pasteboard: str, done, start=0.0, loop=True, crop="auto", volume=1.0, fit="auto") -> None:
     try:
         if op == "status":
             results = [remote.status()]
         elif op == "stop":
             results = [remote.stop()]
+        elif op == "reconnect":
+            results = [remote.reconnect()]
+        elif op == "studio":
+            results = [remote.studio()]
+        elif op == "bridge":
+            results = [remote.bridge()]
         else:
-            results = remote.play(source, pasteboard, start=start, loop=loop, crop=crop)
+            results = remote.play(source, pasteboard, start=start, loop=loop, crop=crop, volume=volume, fit=fit)
         done(results, None)
     except Exception as error:
         done([], error)
@@ -1059,6 +1370,7 @@ def main() -> int:
             NSDragOperationCopy,
             NSDragOperationMove,
             NSEventModifierFlagCommand,
+            NSEventModifierFlagShift,
             NSFilenamesPboardType,
             NSFont,
             NSMakeRect,
@@ -1066,6 +1378,7 @@ def main() -> int:
             NSMenuItem,
             NSObject,
             NSOpenPanel,
+            NSProgressIndicator,
             NSScrollView,
             NSSlider,
             NSTableColumn,
@@ -1099,6 +1412,13 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    # `NSColor.CGColor()` hands back an opaque CGColorRef that PyObjC wraps with a warning each
+    # time. The layer only stores the pointer, so the warning is noise, and the 0.1s playhead redraw
+    # repaints pills: it printed ~2 lines a second into the launcher's log for as long as the window
+    # was open.
+    import warnings
+
+    warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
 
     remote = DeckRemote()
     hook_js = """
@@ -1157,12 +1477,17 @@ def main() -> int:
       });
     } catch (e) {}
   }
+  function silence(v){
+    try { v.muted = true; v.volume = 0; v.pause(); } catch (e) {}
+  }
   function hook(v){
     if (v.__ghostdeck) return;
     v.__ghostdeck = true;
-    v.addEventListener('play', function(){ post('play'); });
+    silence(v);
+    v.addEventListener('play', function(){ silence(v); }, true);
+    v.addEventListener('volumechange', function(){ if (!v.muted || v.volume) silence(v); }, true);
   }
-  function scan(){ document.querySelectorAll('video').forEach(hook); }
+  function scan(){ document.querySelectorAll('video,audio').forEach(hook); }
   function mountQueue(){
     var pl = playlistUrl();
     var id = ytId(location.href) || (!pl && ytId(watchUrl()));
@@ -1241,6 +1566,21 @@ def main() -> int:
         except Exception:
             return None
 
+    def _icon(btn, name, ink=SNOW):
+        img = _symbol(name)
+        if img is not None:
+            btn.setImage_(img)
+            btn.setTitle_("")
+            btn.setContentTintColor_(ink)
+        return btn
+
+    def _describe(view, text):
+        """Tooltip and VoiceOver label. Icon-only buttons have no other name."""
+        if view is not None:
+            view.setToolTip_(text)
+            view.setAccessibilityLabel_(text)
+        return view
+
 
     def _gui_href(ctrl) -> str:
         url = ctrl.web.URL()
@@ -1248,9 +1588,113 @@ def main() -> int:
 
     def _gui_set_busy(ctrl, on: bool) -> None:
         ctrl.busy = on
-        button = getattr(ctrl, "file_btn", None)
+        for name in ("file_btn", "reconnect_btn", "bridge_btn"):
+            button = getattr(ctrl, name, None)
+            if button is not None:
+                button.setEnabled_(not on)
+        button = getattr(ctrl, "studio_btn", None)
         if button is not None:
-            button.setEnabled_(not on)
+            # Without the official app `studio` can only fail, so it is never offered.
+            button.setEnabled_(not on and studio_installed())
+        # studio/reconnect can take minutes; the dot turns into a spinner so the window does not
+        # look frozen while a CLI child works.
+        spinner = getattr(ctrl, "spinner", None)
+        dot = getattr(ctrl, "dot", None)
+        if spinner is not None:
+            if on:
+                spinner.startAnimation_(None)
+            else:
+                spinner.stopAnimation_(None)
+        if dot is not None:
+            dot.setHidden_(on)
+
+    def _gui_recovery_draw(ctrl, action: str) -> None:
+        """Light up only the recovery button this state calls for."""
+        for name, key in (("reconnect_btn", "reconnect"), ("studio_btn", "studio")):
+            button = getattr(ctrl, name, None)
+            if button is None:
+                continue
+            on = action == key
+            _pill(button, LIME if on else CARD, INK if on else SNOW)
+
+    def _gui_install_menu(ctrl) -> None:
+        """The menu bar. Without one, ⌘Q/⌘C/⌘V/⌘A had nothing to route through.
+
+        Edit and window items keep a nil target so AppKit sends them down the responder chain to the
+        field editor or the key window. Shortcuts that a text field also uses (⌘←, Space, Esc) are
+        deliberately not bound: a menu key equivalent beats the field editor, so they would stop
+        working while typing a URL.
+        """
+
+        def item(menu, title, action, key="", mods=None, target=ctrl):
+            entry = menu.addItemWithTitle_action_keyEquivalent_(title, action, key)
+            if mods is not None:
+                entry.setKeyEquivalentModifierMask_(mods)
+            if target is not None:
+                entry.setTarget_(target)
+            return entry
+
+        def submenu(bar, title):
+            # `init` leaves the title as "NSMenuItem"; name the holder like its menu.
+            holder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+            bar.addItem_(holder)
+            menu = NSMenu.alloc().initWithTitle_(title)
+            holder.setSubmenu_(menu)
+            return menu
+
+        bar = NSMenu.alloc().init()
+        app_menu = submenu(bar, "ghostdeck")
+        item(app_menu, "ghostdeck 숨기기", "hide:", "h", target=None)
+        app_menu.addItem_(NSMenuItem.separatorItem())
+        item(app_menu, "ghostdeck 종료", "terminate:", "q", target=None)
+
+        file_menu = submenu(bar, "파일")
+        item(file_menu, "파일 열기…", "openFile:", "o")
+        item(file_menu, "페이지를 대기열에 추가", "addToPlaylist:")
+
+        edit_menu = submenu(bar, "편집")
+        item(edit_menu, "실행 취소", "undo:", "z", target=None)
+        item(edit_menu, "다시 실행", "redo:", "z", NSEventModifierFlagCommand | NSEventModifierFlagShift, None)
+        edit_menu.addItem_(NSMenuItem.separatorItem())
+        item(edit_menu, "오려두기", "cut:", "x", target=None)
+        item(edit_menu, "복사하기", "copy:", "c", target=None)
+        item(edit_menu, "붙여넣기", "paste:", "v", target=None)
+        item(edit_menu, "모두 선택", "selectAll:", "a", target=None)
+
+        view_menu = submenu(bar, "보기")
+        item(view_menu, "새로 고침", "reload:", "r")
+        item(view_menu, "주소 입력", "focusUrl:", "l")
+        view_menu.addItem_(NSMenuItem.separatorItem())
+        item(view_menu, "뒤로", "back:", "[")
+        item(view_menu, "앞으로", "forward:", "]")
+
+        play_menu = submenu(bar, "재생")
+        item(play_menu, "재생 / 일시정지 (↩)", "play:")
+        item(play_menu, "정지", "stop:", ".")
+        play_menu.addItem_(NSMenuItem.separatorItem())
+        item(play_menu, "이전 곡", "prevTrack:")
+        item(play_menu, "다음 곡", "nextTrack:")
+        item(play_menu, "셔플", "toggleShuffle:")
+        item(play_menu, "반복 모드 바꾸기", "cycleRepeat:")
+        item(play_menu, "음소거", "toggleMute:")
+
+        deck_menu = submenu(bar, "덱")
+        item(deck_menu, "덱 다시 연결", "reconnect:")
+        item(deck_menu, "스튜디오 켜기 (키 + 영상)", "studio:")
+        item(deck_menu, "브리지만 켜기 (영상만)", "bridge:")
+
+        window_menu = submenu(bar, "윈도우")
+        item(window_menu, "최소화", "performMiniaturize:", "m", target=None)
+        item(window_menu, "닫기", "performClose:", "w", target=None)
+
+        NSApp.setMainMenu_(bar)
+        NSApp.setWindowsMenu_(window_menu)
+
+    def _gui_note_failure(ctrl, note: str, full: str) -> None:
+        """The short Korean line in the strip; the whole CLI message on hover."""
+        ctrl.note.setStringValue_(note)
+        full = (full or "").strip()
+        ctrl.note.setToolTip_(full if full and full != note else None)
 
     def _gui_apply(ctrl, results, error, epoch=None) -> None:
         if epoch is not None and epoch != getattr(ctrl, "epoch", 0):
@@ -1260,9 +1704,11 @@ def main() -> int:
         pending_start = getattr(ctrl, "pending_start", 0.0)
         ctrl.pending_source = ""
         ctrl.pending_start = 0.0
+        ctrl.note.setToolTip_(None)
         if error is not None:
             ctrl.seen_watch = ""
-            ctrl.note.setStringValue_(f"{type(error).__name__}: {error}")
+            raw = f"{type(error).__name__}: {error}"
+            _gui_note_failure(ctrl, play_failure_note(raw), raw)
             if should_retry_pending(
                 pending, pending_start, getattr(ctrl, "seen_watch", ""), getattr(ctrl, "played_start", 0.0)
             ):
@@ -1270,11 +1716,15 @@ def main() -> int:
             return
         for item in results:
             if item.argv[:1] == ["status"] and item.stdout.strip():
-                ctrl.status.setStringValue_(status_text(item.stdout))
+                picture = deck_has_picture()
+                has = studio_installed()
+                ctrl.status.setStringValue_(status_text(item.stdout, has_picture=picture, has_studio=has))
+                ctrl.status.setToolTip_(item.stderr.strip() or None)
                 dot = getattr(ctrl, "dot", None)
-                colour = status_dot_color(item.stdout)
+                colour = status_dot_color(item.stdout, has_picture=picture, has_studio=has)
                 if dot is not None and colour is not None:
                     dot.setTextColor_(colour)
+                _gui_recovery_draw(ctrl, recovery_action(item.stdout, has_studio=has))
                 _gui_sync_deck(ctrl, parse_status_fields(item.stdout).get("playing") == "yes")
         last = results[-1] if results else None
         if last is None:
@@ -1285,7 +1735,11 @@ def main() -> int:
             return
         if last.code != 0:
             ctrl.seen_watch = ""
-            ctrl.note.setStringValue_(last.detail)
+            if last.argv[:1] == ["play"]:
+                note = play_failure_note(last.detail)
+            else:
+                note = failure_note(last.detail)
+            _gui_note_failure(ctrl, note, last.stderr or last.stdout)
         elif last.argv[:1] == ["stop"]:
             ctrl.seen_watch = ""
             ctrl.note.setStringValue_("멈췄습니다.")
@@ -1293,15 +1747,42 @@ def main() -> int:
             if len(last.argv) > 1:
                 ctrl.seen_watch = last.argv[1]
                 _gui_playlist_put(ctrl, last.argv[1])
-            ctrl.note.setStringValue_("덱에서 재생 중입니다. 창이 멈추거나 끊겨도 덱은 계속 재생됩니다.")
+            ctrl.note.setStringValue_(play_success_note(deck_has_picture()))
         elif last.argv[:1] == ["studio"]:
-            ctrl.note.setStringValue_("브리지를 켰습니다. 이제 재생할 수 있습니다.")
+            ctrl.note.setStringValue_("스튜디오를 켰습니다. 이제 재생할 수 있습니다.")
+        elif last.argv[:1] == ["bridge"]:
+            ctrl.note.setStringValue_("브리지를 켰습니다. 키 없이 재생할 수 있습니다.")
+        elif last.argv[:1] == ["reconnect"]:
+            ctrl.note.setStringValue_("연결했습니다. 재생할 수 있습니다.")
         if should_retry_pending(
             pending, pending_start, getattr(ctrl, "seen_watch", ""), getattr(ctrl, "played_start", 0.0)
         ):
             _gui_kick(ctrl, "play", pending, start=pending_start)
 
     def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False, crop: str = "auto") -> None:
+        if op in ("reconnect", "studio", "bridge"):
+            ctrl.epoch = getattr(ctrl, "epoch", 0) + 1
+            epoch = ctrl.epoch
+            if not ctrl.busy:
+                _gui_set_busy(ctrl, True)
+            ctrl.note.setStringValue_(
+                {"reconnect": "연결 다시 잡는 중…", "studio": "스튜디오 켜는 중…", "bridge": "브리지 켜는 중…"}.get(op, "준비 중…")
+            )
+            threading.Thread(
+                target=_busy_call,
+                args=(
+                    remote,
+                    op,
+                    "",
+                    "",
+                    lambda r, e: AppHelper.callAfter(lambda: _gui_apply(ctrl, r, e, epoch)),
+                    0.0,
+                    False,
+                    "auto",
+                ),
+                daemon=True,
+            ).start()
+            return
         if op == "stop":
             ctrl.epoch = getattr(ctrl, "epoch", 0) + 1
             ctrl.pending_source = ""
@@ -1329,6 +1810,7 @@ def main() -> int:
         if ctrl.busy and op == "play":
             ctrl.pending_source = source
             ctrl.pending_start = play_offset(start)
+            ctrl.note.setStringValue_("지금 작업이 끝나면 재생합니다.")
             return
         if ctrl.busy and op != "status":
             return
@@ -1340,6 +1822,11 @@ def main() -> int:
             _gui_set_busy(ctrl, True)
             ctrl.note.setStringValue_("재생 준비 중…" if op == "play" else "멈추는 중…")
         pasteboard = read_pasteboard() if op == "play" else ""
+        if op == "play":
+            pref = play_crop_choice(getattr(ctrl, "crop", "auto"))
+            if crop == "auto":
+                crop = pref
+            crop = play_crop_argv(source, crop)
         thread = threading.Thread(
             target=_busy_call,
             args=(
@@ -1357,6 +1844,8 @@ def main() -> int:
                     getattr(ctrl, "repeat", "off"),
                 ) if op == "play" else loop,
                 crop,
+                audio_gain(getattr(ctrl, "volume", 1.0), getattr(ctrl, "muted", False)),
+                play_fit(getattr(ctrl, "fit", "auto")),
             ),
             daemon=True,
         )
@@ -1427,9 +1916,14 @@ def main() -> int:
 
     def _gui_playlist_draw(ctrl) -> None:
         table = getattr(ctrl, "playlist_table", None)
-        if table is not None:
-            table.reloadData()
         items = getattr(ctrl, "playlist", [])
+        if table is not None:
+            selected = int(table.selectedRow())
+            table.reloadData()
+            if 0 <= selected < len(items):
+                table.selectRowIndexes_byExtendingSelection_(
+                    NSIndexSet.indexSetWithIndex_(selected), False
+                )
         heading = getattr(ctrl, "queue_head", None)
         if heading is not None:
             n = len(items)
@@ -1449,7 +1943,7 @@ def main() -> int:
         found = playlist_find(items, source) if source else playlist_entry("")
         now_head = getattr(ctrl, "now_head", None)
         if now_head is not None:
-            now_head.setStringValue_("NOW · 재생 중" if source else "NOW")
+            now_head.setStringValue_("NOW · 재생 중" if deck_has_picture() else ("NOW · 여는 중" if source else "NOW"))
         title = getattr(ctrl, "now_title", None)
         if title is not None:
             title.setStringValue_(playlist_title(found) if source else "재생 중인 영상이 없습니다")
@@ -1466,22 +1960,75 @@ def main() -> int:
             table = getattr(ctrl, "playlist_table", None)
             if table is not None:
                 table.reloadData()
+                # The selection follows the deck, so ▶ after ■ resumes the track that was playing
+                # instead of whatever row happened to be selected. A source that ends (stop, end of
+                # track) leaves the selection where it was, which is that same track.
+                row = playlist_index(items, source)
+                if row >= 0:
+                    table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(row), False)
+                    table.scrollRowToVisible_(row)
         play_btn = getattr(ctrl, "play_btn", None)
         if play_btn is not None:
-            play_btn.setTitle_("⏸" if deck_has_picture() else "▶  재생")
+            _icon(play_btn, "pause.fill" if deck_has_picture() else "play.fill", INK)
             _pill(play_btn, LIME, INK)
 
     def _gui_mode_draw(ctrl) -> None:
         shuffle_btn = getattr(ctrl, "shuffle_btn", None)
         if shuffle_btn is not None:
             on = bool(getattr(ctrl, "shuffle", False))
-            shuffle_btn.setTitle_("셔플")
+            _icon(shuffle_btn, "shuffle", INK if on else SNOW)
             _pill(shuffle_btn, LIME if on else CARD, INK if on else SNOW)
+            _describe(shuffle_btn, "셔플: 켬" if on else "셔플: 꺼짐")
         repeat_btn = getattr(ctrl, "repeat_btn", None)
         if repeat_btn is not None:
             mode = getattr(ctrl, "repeat", "off")
-            repeat_btn.setTitle_(repeat_label(mode))
+            _icon(repeat_btn, "repeat.1" if mode == "one" else "repeat", INK if mode != "off" else SNOW)
             _pill(repeat_btn, LIME if mode != "off" else CARD, INK if mode != "off" else SNOW)
+            _describe(repeat_btn, {"all": "반복: 전체", "one": "반복: 한 곡"}.get(mode, "반복: 끔"))
+        mute_btn = getattr(ctrl, "mute_btn", None)
+        if mute_btn is not None:
+            muted = bool(getattr(ctrl, "muted", False))
+            _icon(mute_btn, "speaker.slash.fill" if muted else "speaker.wave.2.fill", INK if muted else SNOW)
+            _describe(mute_btn, "음소거 풀기" if muted else "음소거")
+            _pill(mute_btn, LIME if muted else CARD, INK if muted else SNOW)
+        bar = getattr(ctrl, "volume_bar", None)
+        if bar is not None and not getattr(ctrl, "voluming", False):
+            bar.setDoubleValue_(clamp_volume(getattr(ctrl, "volume", 1.0)))
+        fit_btn = getattr(ctrl, "fit_btn", None)
+        if fit_btn is not None:
+            mode = play_fit(getattr(ctrl, "fit", "auto"))
+            fit_btn.setTitle_(fit_label(mode))
+            _pill(fit_btn, LIME if mode != "auto" else CARD, INK if mode != "auto" else SNOW)
+        crop_btn = getattr(ctrl, "crop_btn", None)
+        if crop_btn is not None:
+            mode = play_crop_choice(getattr(ctrl, "crop", "auto"))
+            crop_btn.setTitle_(crop_label(mode))
+            _pill(crop_btn, LIME if mode != "auto" else CARD, INK if mode != "auto" else SNOW)
+
+
+    def _save_prefs(ctrl) -> None:
+        player_prefs_save(
+            PLAYER_PATH,
+            {
+                "repeat": getattr(ctrl, "repeat", "off"),
+                "shuffle": bool(getattr(ctrl, "shuffle", False)),
+                "volume": clamp_volume(getattr(ctrl, "volume", 1.0)),
+                "muted": bool(getattr(ctrl, "muted", False)),
+                "overlay": clamp_volume(getattr(ctrl, "overlay", 1.0)),
+                "fit": play_fit(getattr(ctrl, "fit", "auto")),
+                "crop": play_crop_choice(getattr(ctrl, "crop", "auto")),
+            },
+        )
+
+
+    def _commit_audio(ctrl) -> None:
+        _save_prefs(ctrl)
+        request_live_volume(audio_gain(getattr(ctrl, "volume", 1.0), getattr(ctrl, "muted", False)))
+        _gui_mode_draw(ctrl)
+
+    def _commit_overlay(ctrl) -> None:
+        _save_prefs(ctrl)
+        request_live_overlay(clamp_volume(getattr(ctrl, "overlay", 1.0)))
 
     def _gui_playhead_draw(ctrl) -> None:
         bar = getattr(ctrl, "seek_bar", None)
@@ -1570,13 +2117,18 @@ def main() -> int:
             ctrl.was_playing = True
             ctrl.saw_picture = True
             return
-        if playing and not picture:
+        from ghostdeck import play as playmod
+        proc = playmod.playing()
+        opening = (proc or deck_session_active()) and not getattr(ctrl, "saw_picture", False)
+        if (opening or proc) and not picture:
             return
-        if (
-            getattr(ctrl, "was_playing", False)
-            and getattr(ctrl, "saw_picture", False)
-            and not getattr(ctrl, "user_stopped", False)
-            and not ctrl.busy
+        if should_auto_next(
+            playing=proc,
+            session_active=deck_session_active(),
+            was_playing=getattr(ctrl, "was_playing", False),
+            saw_picture=getattr(ctrl, "saw_picture", False),
+            user_stopped=getattr(ctrl, "user_stopped", False),
+            busy=bool(getattr(ctrl, "busy", False)),
         ):
             nxt = playlist_next(
                 getattr(ctrl, "playlist", []),
@@ -1614,10 +2166,6 @@ def main() -> int:
             _gui_kick(ctrl, "play", source)
             return True
 
-        def hitTest_(self, _point):
-            return None
-
-    class Ghost(NSView):
         def hitTest_(self, _point):
             return None
 
@@ -1666,7 +2214,7 @@ def main() -> int:
 
         def hitTest_(self, point):
             h = self.bounds().size.height
-            if point.y > h - 210:
+            if point.y > h - QUEUE_CHROME:
                 return None
             return objc.super(QueueDrop, self).hitTest_(point)
 
@@ -1681,6 +2229,12 @@ def main() -> int:
             prefs = player_prefs_load()
             self.repeat = prefs["repeat"]
             self.shuffle = prefs["shuffle"]
+            self.volume = prefs["volume"]
+            self.muted = prefs["muted"]
+            self.overlay = prefs.get("overlay", 1.0)
+            self.fit = prefs.get("fit", "auto")
+            self.crop = prefs.get("crop", "auto")
+            self.voluming = False
             self.was_playing = False
             self.user_stopped = False
             self.epoch = 0
@@ -1691,21 +2245,21 @@ def main() -> int:
             self.duration_busy = False
             self.seeking = False
             self.played_start = 0.0
-            # Dark shell: phone column + frosted queue.
+            # Mobile YouTube pane + console queue.
             PAD = 20
             PHONE_W = 392
             SIDE_W = 372
             SIDE_GAP = 18
             W = PAD + PHONE_W + SIDE_GAP + SIDE_W + PAD
             H = 820
-            FOOT = 26
+            FOOT = 28
             TOP = 36
-            BAR = 38
+            BAR = 36
             GAP = 8
             PHONE_X, PHONE_Y = PAD, FOOT
-            PHONE_H = H - FOOT - TOP - BAR - GAP
-            CHROME_Y = PHONE_Y + PHONE_H + GAP
-            QUEUE_H = PHONE_H + GAP + BAR
+            TOOL_Y = H - TOP - BAR
+            PHONE_H = TOOL_Y - GAP - FOOT
+            QUEUE_H = PHONE_H
             SIDE_X = PAD + PHONE_W + SIDE_GAP
             stick_top = NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin
             stick_bot = NSViewMinXMargin | NSViewMaxYMargin
@@ -1750,6 +2304,10 @@ def main() -> int:
                 )
             )
             config.setWebsiteDataStore_(WKWebsiteDataStore.dataStoreForIdentifier_(uid))
+            try:
+                config.setMediaTypesRequiringUserActionForPlayback_(3)
+            except Exception:
+                pass
             config.preferences().setJavaScriptCanOpenWindowsAutomatically_(True)
             ucc = WKUserContentController.alloc().init()
             ucc.addScriptMessageHandler_name_(self, "ghostdeck")
@@ -1767,7 +2325,7 @@ def main() -> int:
 
             shell = NSView.alloc().initWithFrame_(NSMakeRect(PHONE_X, PHONE_Y, PHONE_W, PHONE_H))
             shell.setWantsLayer_(True)
-            shell.layer().setCornerRadius_(28.0)
+            shell.layer().setCornerRadius_(8.0)
             shell.layer().setMasksToBounds_(True)
             shell.layer().setBorderWidth_(1.0)
             shell.layer().setBorderColor_(HAIR.CGColor())
@@ -1784,20 +2342,9 @@ def main() -> int:
             self.web.loadRequest_(
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
-            notch = Ghost.alloc().initWithFrame_(NSMakeRect((PHONE_W - 108) / 2, PHONE_H - 16, 108, 5))
-            notch.setWantsLayer_(True)
-            notch.layer().setCornerRadius_(2.5)
-            notch.layer().setBackgroundColor_(_rgb(0, 0, 0, 0.45).CGColor())
-            notch.setAutoresizingMask_(NSViewMinYMargin)
-            shell.addSubview_(notch)
-            home = Ghost.alloc().initWithFrame_(NSMakeRect((PHONE_W - 118) / 2, 8, 118, 4))
-            home.setWantsLayer_(True)
-            home.layer().setCornerRadius_(2.0)
-            home.layer().setBackgroundColor_(_rgb(1, 1, 1, 0.28).CGColor())
-            shell.addSubview_(home)
 
             def nav_btn(x, title, symbol, action):
-                btn = NSButton.alloc().initWithFrame_(NSMakeRect(PHONE_X + x, CHROME_Y + 5, 28, 28))
+                btn = NSButton.alloc().initWithFrame_(NSMakeRect(PAD + x, TOOL_Y + 4, 28, 28))
                 img = _symbol(symbol)
                 if img is not None:
                     btn.setImage_(img)
@@ -1814,26 +2361,35 @@ def main() -> int:
                 view.addSubview_(btn)
                 return btn
 
-            back = nav_btn(8, "‹", "chevron.left", "back:")
-            back.setKeyEquivalent_("[")
-            back.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
-            fwd = nav_btn(42, "›", "chevron.right", "forward:")
-            fwd.setKeyEquivalent_("]")
-            fwd.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            # Shortcuts live in the menu bar (`_gui_install_menu`), not on the buttons.
+            back = nav_btn(0, "‹", "chevron.left", "back:")
+            _describe(back, "뒤로 (⌘[)")
+            fwd = nav_btn(36, "›", "chevron.right", "forward:")
+            _describe(fwd, "앞으로 (⌘])")
             self.file_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(PHONE_X + 76, CHROME_Y + 5, 44, 28)
+                NSMakeRect(PAD + 72, TOOL_Y + 4, 44, 28)
             )
             self.file_btn.setTitle_("파일")
             self.file_btn.setFont_(NSFont.boldSystemFontOfSize_(11))
             _pill(self.file_btn, CARD, SNOW)
             self.file_btn.setTarget_(self)
             self.file_btn.setAction_("openFile:")
-            self.file_btn.setKeyEquivalent_("o")
-            self.file_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            _describe(self.file_btn, "영상 파일을 골라 덱에서 재생 (⌘O)")
             self.file_btn.setAutoresizingMask_(NSViewMinYMargin)
             view.addSubview_(self.file_btn)
+            self.reconnect_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(PAD + 124, TOOL_Y + 4, 44, 28)
+            )
+            self.reconnect_btn.setTitle_("연결")
+            self.reconnect_btn.setFont_(NSFont.boldSystemFontOfSize_(11))
+            _pill(self.reconnect_btn, CARD, SNOW)
+            self.reconnect_btn.setTarget_(self)
+            self.reconnect_btn.setAction_("reconnect:")
+            _describe(self.reconnect_btn, "케이블을 다시 꽂은 뒤 덱을 다시 잡습니다")
+            self.reconnect_btn.setAutoresizingMask_(NSViewMinYMargin)
+            view.addSubview_(self.reconnect_btn)
             self.url_field = NSTextField.alloc().initWithFrame_(
-                NSMakeRect(PHONE_X + 128, CHROME_Y + 5, PHONE_W - 136, 28)
+                NSMakeRect(PAD + 176, TOOL_Y + 4, W - PAD - 176 - PAD, 28)
             )
             self.url_field.setStringValue_("https://www.youtube.com")
             self.url_field.setBezeled_(False)
@@ -1847,7 +2403,8 @@ def main() -> int:
             self.url_field.setFocusRingType_(1)
             self.url_field.setTarget_(self)
             self.url_field.setAction_("go:")
-            self.url_field.setAutoresizingMask_(NSViewMinYMargin)
+            _describe(self.url_field, "주소 또는 영상 파일 경로 (⌘L)")
+            self.url_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
             view.addSubview_(self.url_field)
 
             frost = NSVisualEffectView.alloc().initWithFrame_(
@@ -1857,7 +2414,7 @@ def main() -> int:
             frost.setBlendingMode_(0)
             frost.setState_(1)
             frost.setWantsLayer_(True)
-            frost.layer().setCornerRadius_(22.0)
+            frost.layer().setCornerRadius_(10.0)
             frost.layer().setMasksToBounds_(True)
             frost.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
             view.addSubview_(frost)
@@ -1867,57 +2424,70 @@ def main() -> int:
             pane.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             frost.addSubview_(pane)
 
+            INSET = 16
+            t6 = console_row(6, SIDE_W)
+            t4 = console_row(4, SIDE_W)
+            TW = t6[0][1]
+            FW = t4[0][1]
             heading = _label(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 36, SIDE_W - 36, 14),
+                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 36, SIDE_W - INSET * 2, 14),
                 "NOW", 10, True, LIME, stick_top,
             )
             self.now_head = heading
             view.addSubview_(heading)
             self.now_title = _label(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 62, SIDE_W - 36, 22),
+                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 62, SIDE_W - INSET * 2, 22),
                 "재생 중인 영상이 없습니다", 15, True, SNOW, stick_top,
             )
             view.addSubview_(self.now_title)
             self.now_channel = _label(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 80, SIDE_W - 36, 16),
+                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 80, SIDE_W - INSET * 2, 16),
                 "페이지에서 추가하거나 파일을 놓으십시오", 11, False, GHOST, stick_top,
             )
             view.addSubview_(self.now_channel)
 
-            def tbtn(x, w, title, action, fill=CARD, ink=SNOW):
+            def tbtn(x, w, title, action, fill=CARD, ink=SNOW, symbol=""):
                 btn = NSButton.alloc().initWithFrame_(
                     NSMakeRect(x, PHONE_Y + QUEUE_H - 120, w, 32)
                 )
                 btn.setTitle_(title)
-                btn.setFont_(NSFont.boldSystemFontOfSize_(12))
+                btn.setFont_(NSFont.boldSystemFontOfSize_(11))
                 _pill(btn, fill, ink)
+                if symbol:
+                    _icon(btn, symbol, ink)
                 btn.setTarget_(self)
                 btn.setAction_(action)
                 btn.setAutoresizingMask_(stick_top)
                 view.addSubview_(btn)
                 return btn
 
-            self.prev_btn = tbtn(SIDE_X + 18, 32, "⏮", "prevTrack:")
-            self.play_btn = tbtn(SIDE_X + 54, 100, "▶  재생", "play:", LIME, INK)
+            self.prev_btn = tbtn(SIDE_X + t6[0][0], TW, "⏮", "prevTrack:", symbol="backward.end.fill")
+            self.play_btn = tbtn(SIDE_X + t6[1][0], TW, "▶", "play:", LIME, INK, "play.fill")
             self.play_btn.setKeyEquivalent_("\r")
-            self.stop_btn = tbtn(SIDE_X + 158, 52, "■", "stop:")
-            self.stop_btn.setKeyEquivalent_("\x1b")
-            self.next_btn = tbtn(SIDE_X + 214, 32, "⏭", "nextTrack:")
-            self.shuffle_btn = tbtn(SIDE_X + 250, 44, "셔플", "toggleShuffle:")
-            self.repeat_btn = tbtn(SIDE_X + 298, 52, "반복", "cycleRepeat:")
+            # Esc is not ■: it is the "cancel editing" key in the URL field and in web inputs,
+            # and as a window key equivalent it stopped the deck from there. ⌘. is in the menu.
+            self.stop_btn = tbtn(SIDE_X + t6[2][0], TW, "■", "stop:", symbol="stop.fill")
+            self.next_btn = tbtn(SIDE_X + t6[3][0], TW, "⏭", "nextTrack:", symbol="forward.end.fill")
+            self.shuffle_btn = tbtn(SIDE_X + t6[4][0], TW, "셔플", "toggleShuffle:", symbol="shuffle")
+            self.repeat_btn = tbtn(SIDE_X + t6[5][0], TW, "반복", "cycleRepeat:", symbol="repeat")
+            _describe(self.prev_btn, "이전 곡")
+            _describe(self.play_btn, "덱에서 재생 / 일시정지 (↩)")
+            _describe(self.stop_btn, "덱 재생 멈춤 (⌘.)")
+            _describe(self.next_btn, "다음 곡")
+            _describe(self.shuffle_btn, "셔플 켜기/끄기")
             self.elapsed_lab = _label(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 146, 64, 14),
+                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 146, 64, 14),
                 "0:00", 10, False, GHOST, stick_top,
             )
             view.addSubview_(self.elapsed_lab)
             self.remain_lab = _label(
-                NSMakeRect(SIDE_X + SIDE_W - 82, PHONE_Y + QUEUE_H - 146, 64, 14),
+                NSMakeRect(SIDE_X + SIDE_W - INSET - 64, PHONE_Y + QUEUE_H - 146, 64, 14),
                 "--:--", 10, False, GHOST, stick_top,
             )
             self.remain_lab.setAlignment_(2)
             view.addSubview_(self.remain_lab)
             self.seek_bar = SeekSlider.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 168, SIDE_W - 36, 18)
+                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 168, SIDE_W - INSET * 2, 18)
             )
             self.seek_bar.setMinValue_(0.0)
             self.seek_bar.setMaxValue_(1.0)
@@ -1928,35 +2498,85 @@ def main() -> int:
             self.seek_bar.ctrl = self
             self.seek_bar.setAction_("seek:")
             self.seek_bar.setAutoresizingMask_(stick_top)
+            _describe(self.seek_bar, "덱 재생 위치 옮기기")
             view.addSubview_(self.seek_bar)
 
+            MIX_Y = PHONE_Y + QUEUE_H - 196
+            self.mute_btn = tbtn(SIDE_X + t6[0][0], TW, "음소거", "toggleMute:", symbol="speaker.wave.2.fill")
+            self.mute_btn.setFrame_(NSMakeRect(SIDE_X + t6[0][0], MIX_Y, TW, 28))
+            vol_x = SIDE_X + t6[1][0]
+            ov_w = 117
+            lab_w = 32
+            vol_w = 117
+            self.volume_bar = NSSlider.alloc().initWithFrame_(
+                NSMakeRect(vol_x, MIX_Y + 3, vol_w, 22)
+            )
+            self.volume_bar.setMinValue_(0.0)
+            self.volume_bar.setMaxValue_(1.0)
+            self.volume_bar.setDoubleValue_(self.volume)
+            self.volume_bar.setContinuous_(True)
+            self.volume_bar.setTarget_(self)
+            self.volume_bar.setAction_("setVolume:")
+            self.volume_bar.setAutoresizingMask_(stick_top)
+            _describe(self.volume_bar, "덱 소리 크기")
+            view.addSubview_(self.volume_bar)
+            lab_x = vol_x + vol_w + 8
+            self.overlay_lab = _label(
+                NSMakeRect(lab_x, MIX_Y + 6, lab_w, 16),
+                overlay_label(), 10, True, GHOST, stick_top,
+            )
+            view.addSubview_(self.overlay_lab)
+            self.overlay_bar = NSSlider.alloc().initWithFrame_(
+                NSMakeRect(lab_x + lab_w + 8, MIX_Y + 3, ov_w, 22)
+            )
+            self.overlay_bar.setMinValue_(0.0)
+            self.overlay_bar.setMaxValue_(1.0)
+            self.overlay_bar.setDoubleValue_(self.overlay)
+            self.overlay_bar.setContinuous_(True)
+            self.overlay_bar.setTarget_(self)
+            self.overlay_bar.setAction_("setOverlay:")
+            self.overlay_bar.setAutoresizingMask_(stick_top)
+            _describe(self.overlay_bar, "영상 위 Studio 버튼 불투명도 (오른쪽이 진함)")
+            _describe(self.overlay_lab, "영상 위 Studio 버튼 불투명도")
+            view.addSubview_(self.overlay_bar)
+            DECK_Y = PHONE_Y + QUEUE_H - 232
+            self.studio_btn = tbtn(SIDE_X + t4[0][0], FW, "스튜디오", "studio:")
+            self.studio_btn.setFrame_(NSMakeRect(SIDE_X + t4[0][0], DECK_Y, FW, 28))
+            self.bridge_btn = tbtn(SIDE_X + t4[1][0], FW, "브리지", "bridge:")
+            self.bridge_btn.setFrame_(NSMakeRect(SIDE_X + t4[1][0], DECK_Y, FW, 28))
+            self.fit_btn = tbtn(SIDE_X + t4[2][0], FW, fit_label(self.fit), "cycleFit:")
+            self.fit_btn.setFrame_(NSMakeRect(SIDE_X + t4[2][0], DECK_Y, FW, 28))
+            self.crop_btn = tbtn(SIDE_X + t4[3][0], FW, crop_label(self.crop), "cycleCrop:")
+            self.crop_btn.setFrame_(NSMakeRect(SIDE_X + t4[3][0], DECK_Y, FW, 28))
+            _describe(self.studio_btn, "Studio 복사본과 브리지를 켭니다. 키가 없을 때 누르십시오")
+            _describe(self.bridge_btn, "브리지만 켭니다. Studio 없이 영상만 보냅니다")
+            _describe(self.fit_btn, "다음 재생부터: 자동 → 맞춤(레터박스) → 채움(잘라내기)")
+            _describe(self.crop_btn, "다음 재생부터: 검은 여백 자동 제거 / 원본 유지")
+            if not studio_installed():
+                self.studio_btn.setEnabled_(False)
+                _describe(self.studio_btn, "Ulanzi Studio가 설치되어 있지 않습니다. 브리지를 쓰십시오")
             self.queue_head = _label(
-                NSMakeRect(SIDE_X + 18, PHONE_Y + QUEUE_H - 188, SIDE_W - 36, 14),
+                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 258, SIDE_W - INSET * 2, 14),
                 "대기열", 10, True, GHOST, stick_top,
             )
             view.addSubview_(self.queue_head)
-
             BTN_H = 28
             table_y = PHONE_Y + 46
-            table_h = max(80, (PHONE_Y + QUEUE_H - 200) - table_y)
+            table_h = max(80, (PHONE_Y + QUEUE_H - QUEUE_CHROME) - table_y)
             scroll = NSScrollView.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + 10, table_y, SIDE_W - 20, table_h)
+                NSMakeRect(SIDE_X + INSET, table_y, SIDE_W - INSET * 2, table_h)
             )
             scroll.setHasVerticalScroller_(True)
             scroll.setBorderType_(0)
             scroll.setDrawsBackground_(False)
             scroll.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
             self.playlist_table = NSTableView.alloc().initWithFrame_(scroll.contentView().bounds())
-            title_col = NSTableColumn.alloc().initWithIdentifier_("title")
-            title_col.setWidth_(SIDE_W - 140)
-            title_col.setEditable_(False)
-            chan_col = NSTableColumn.alloc().initWithIdentifier_("channel")
-            chan_col.setWidth_(100)
-            chan_col.setEditable_(False)
-            self.playlist_table.addTableColumn_(title_col)
-            self.playlist_table.addTableColumn_(chan_col)
+            track_col = NSTableColumn.alloc().initWithIdentifier_("track")
+            track_col.setWidth_(SIDE_W - INSET * 2)
+            track_col.setEditable_(False)
+            self.playlist_table.addTableColumn_(track_col)
             self.playlist_table.setHeaderView_(None)
-            self.playlist_table.setRowHeight_(40)
+            self.playlist_table.setRowHeight_(44)
             self.playlist_table.setUsesAlternatingRowBackgroundColors_(False)
             self.playlist_table.setBackgroundColor_(NSColor.clearColor())
             try:
@@ -1967,6 +2587,8 @@ def main() -> int:
                 pass
             self.playlist_table.setDataSource_(self)
             self.playlist_table.setDelegate_(self)
+            # Empty selection is allowed so nothing is selected until the user or the deck picks a
+            # row; a forced row 0 made ▶ play the queue head instead of the track just stopped.
             self.playlist_table.setAllowsEmptySelection_(True)
             self.playlist_table.setAllowsMultipleSelection_(False)
             self.playlist_table.setTarget_(self)
@@ -1988,51 +2610,48 @@ def main() -> int:
             scroll.setDocumentView_(self.playlist_table)
             view.addSubview_(scroll)
 
-            def qbtn(x, w, title, action):
+            def qbtn(x, w, title, action, symbol=""):
                 btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, PHONE_Y + 12, w, BTN_H))
                 btn.setTitle_(title)
                 btn.setFont_(NSFont.boldSystemFontOfSize_(11))
                 _pill(btn, CARD, SNOW)
+                if symbol:
+                    _icon(btn, symbol, SNOW)
                 btn.setTarget_(self)
                 btn.setAction_(action)
                 btn.setAutoresizingMask_(stick_bot)
                 view.addSubview_(btn)
                 return btn
 
-            self.add_btn = qbtn(SIDE_X + 12, 72, "＋ 넣기", "addToPlaylist:")
-            self.row_play_btn = qbtn(SIDE_X + 90, 52, "재생", "playSelected:")
-            self.up_btn = qbtn(SIDE_X + 148, 32, "↑", "moveUp:")
-            self.down_btn = qbtn(SIDE_X + 186, 32, "↓", "moveDown:")
-            self.del_btn = qbtn(SIDE_X + SIDE_W - 64, 52, "삭제", "removeSelected:")
+            self.add_btn = qbtn(SIDE_X + t4[0][0], FW, "＋", "addToPlaylist:", "plus")
+            self.up_btn = qbtn(SIDE_X + t4[1][0], FW, "↑", "moveUp:", "chevron.up")
+            self.down_btn = qbtn(SIDE_X + t4[2][0], FW, "↓", "moveDown:", "chevron.down")
+            self.del_btn = qbtn(SIDE_X + t4[3][0], FW, "삭제", "removeSelected:", "trash")
             _gui_playlist_draw(self)
 
-            reload_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
-            reload_btn.setKeyEquivalent_("r")
-            reload_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
-            reload_btn.setTarget_(self)
-            reload_btn.setAction_("reload:")
-            view.addSubview_(reload_btn)
-            focus_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
-            focus_btn.setKeyEquivalent_("l")
-            focus_btn.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
-            focus_btn.setTarget_(self)
-            focus_btn.setAction_("focusUrl:")
-            view.addSubview_(focus_btn)
 
             self.dot = _label(NSMakeRect(PAD, 6, 14, 16), "●", 10, False, LIME, NSViewMaxYMargin)
             view.addSubview_(self.dot)
+            self.spinner = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(PAD, 7, 14, 14))
+            self.spinner.setStyle_(1)  # NSProgressIndicatorStyleSpinning
+            self.spinner.setControlSize_(1)  # NSControlSizeSmall
+            self.spinner.setDisplayedWhenStopped_(False)
+            self.spinner.setIndeterminate_(True)
+            self.spinner.setAutoresizingMask_(NSViewMaxYMargin)
+            view.addSubview_(self.spinner)
             self.status = _label(
-                NSMakeRect(PAD + 16, 6, 280, 16), "상태 확인 중…", 10, False, GHOST,
+                NSMakeRect(PAD + 16, 6, 320, 16), "상태 확인 중…", 10, False, GHOST,
                 NSViewMaxYMargin,
             )
             view.addSubview_(self.status)
             self.note = _label(
-                NSMakeRect(PAD + 300, 6, W - PAD - 310, 16),
+                NSMakeRect(PAD + 340, 6, W - PAD - 350, 16),
                 "유튜브를 열고 덱 재생. 대기열은 오른쪽.",
                 10, False, GHOST, NSViewWidthSizable | NSViewMaxYMargin,
             )
             view.addSubview_(self.note)
 
+            _gui_install_menu(self)
             self.window.makeKeyAndOrderFront_(None)
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 2.0, self, "poll:", None, True
@@ -2043,8 +2662,29 @@ def main() -> int:
             AppHelper.callAfter(lambda: _gui_kick(self, "status", ""))
             return self
 
+        def validateMenuItem_(self, item):
+            action = item.action()
+            if action in ("reconnect:", "bridge:", "openFile:"):
+                return not self.busy
+            if action == "studio:":
+                return not self.busy and studio_installed()
+            if action == "back:":
+                return bool(self.web.canGoBack())
+            if action == "forward:":
+                return bool(self.web.canGoForward())
+            return True
+
         def back_(self, _sender):
             self.web.goBack_(None)
+
+        def reconnect_(self, _sender):
+            _gui_kick(self, "reconnect", "")
+
+        def studio_(self, _sender):
+            _gui_kick(self, "studio", "")
+
+        def bridge_(self, _sender):
+            _gui_kick(self, "bridge", "")
 
         def forward_(self, _sender):
             self.web.goForward_(None)
@@ -2095,6 +2735,14 @@ def main() -> int:
             if deck_has_picture():
                 self.stop_(_sender)
                 return
+            from ghostdeck import play as playmod
+            if opening_session(
+                playing=playmod.playing(),
+                has_picture=False,
+                session_active=deck_session_active(),
+            ):
+                self.note.setStringValue_(play_success_note(False))
+                return
             items = getattr(self, "playlist", [])
             row = -1
             table = getattr(self, "playlist_table", None)
@@ -2106,10 +2754,11 @@ def main() -> int:
             )
             if source:
                 start = 0.0
-                crop = "auto"
+                crop = play_crop_choice(getattr(self, "crop", "auto"))
                 if playlist_identity(source) == playlist_identity(getattr(self, "resume_source", "")):
                     start = play_offset(getattr(self, "resume_pos", 0.0))
-                    crop = deck_crop() or "auto"
+                    if crop == "auto":
+                        crop = deck_crop() or "auto"
                 self.resume_pos = 0.0
                 self.user_stopped = False
                 _gui_kick(self, "play", source, start=start, crop=crop)
@@ -2131,8 +2780,7 @@ def main() -> int:
                 ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
 
             self.web.evaluateJavaScript_completionHandler_(
-                "document.querySelectorAll('video').forEach(function(v){ if (v.paused) v.play().catch(function(){}); });"
-                " (window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href)",
+                "(window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href)",
                 after,
             )
 
@@ -2170,10 +2818,41 @@ def main() -> int:
             self.hold_pos = at
             self.hold_until = time.monotonic() + 2.0
             if deck_has_picture() and request_live_seek(at):
-                self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
+                self.note.setStringValue_(seek_note(at, True))
                 return
-            _gui_kick(self, "play", source, start=at, crop=deck_crop() or "auto")
-            self.note.setStringValue_(f"{format_clock(at)}부터 재생합니다.")
+            crop = play_crop_choice(getattr(self, "crop", "auto"))
+            if crop == "auto":
+                crop = deck_crop() or "auto"
+            _gui_kick(self, "play", source, start=at, crop=crop)
+            self.note.setStringValue_(seek_note(at, False))
+
+        def setVolume_(self, sender):
+            self.volume = clamp_volume(sender.doubleValue())
+            if self.volume > 0:
+                self.muted = False
+            _commit_audio(self)
+
+        def toggleMute_(self, _sender):
+            self.muted = not bool(getattr(self, "muted", False))
+            _commit_audio(self)
+
+        def setOverlay_(self, sender):
+            self.overlay = clamp_volume(sender.doubleValue())
+            _commit_overlay(self)
+
+        def cycleFit_(self, _sender):
+            modes = list(_FIT_MODES)
+            cur = play_fit(getattr(self, "fit", "auto"))
+            self.fit = modes[(modes.index(cur) + 1) % len(modes)]
+            _save_prefs(self)
+            _gui_mode_draw(self)
+
+        def cycleCrop_(self, _sender):
+            modes = list(_CROP_MODES)
+            cur = play_crop_choice(getattr(self, "crop", "auto"))
+            self.crop = modes[(modes.index(cur) + 1) % len(modes)]
+            _save_prefs(self)
+            _gui_mode_draw(self)
         def prevTrack_(self, _sender):
             now = deck_now_playing() or getattr(self, "seen_watch", "")
             nxt = playlist_prev(
@@ -2204,33 +2883,37 @@ def main() -> int:
 
         def toggleShuffle_(self, _sender):
             self.shuffle = not bool(getattr(self, "shuffle", False))
-            player_prefs_save(
-                PLAYER_PATH, {"repeat": getattr(self, "repeat", "off"), "shuffle": self.shuffle}
-            )
+            _save_prefs(self)
             _gui_mode_draw(self)
 
         def cycleRepeat_(self, _sender):
             modes = list(_REPEAT_MODES)
             cur = getattr(self, "repeat", "off")
             self.repeat = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else "off"
-            player_prefs_save(
-                PLAYER_PATH, {"repeat": self.repeat, "shuffle": getattr(self, "shuffle", False)}
-            )
+            _save_prefs(self)
             _gui_mode_draw(self)
 
         def numberOfRowsInTableView_(self, _table):
             return len(getattr(self, "playlist", []))
 
-        def tableView_objectValueForTableColumn_row_(self, _table, col, row):
+        def tableView_objectValueForTableColumn_row_(self, _table, _col, row):
             items = getattr(self, "playlist", [])
             if row < 0 or row >= len(items):
                 return ""
-            item = items[row]
-            ident = str(col.identifier()) if col is not None else "title"
-            if ident == "channel":
-                return playlist_subtitle(item)
-            title = playlist_title(item)
-            return ("▶ " + title) if playlist_source(item) == deck_now_playing() else title
+            return playlist_label(items[row])
+
+        def tableView_willDisplayCell_forTableColumn_row_(self, _table, cell, _col, row):
+            items = getattr(self, "playlist", [])
+            if row < 0 or row >= len(items):
+                return
+            on = playlist_playing(
+                items[row], deck_now_playing(), getattr(self, "seen_watch", ""),
+            )
+            try:
+                cell.setTextColor_(LIME if on else SNOW)
+                cell.setFont_(NSFont.boldSystemFontOfSize_(12) if on else NSFont.systemFontOfSize_(12))
+            except Exception:
+                pass
 
         def tableView_shouldEditTableColumn_row_(self, _table, _col, _row):
             return False
@@ -2307,15 +2990,21 @@ def main() -> int:
             )
 
         def playSelected_(self, _sender):
-            row = int(self.playlist_table.selectedRow())
             items = getattr(self, "playlist", [])
-            if row < 0 or row >= len(items):
+            table = self.playlist_table
+            row = playlist_click_row(table.clickedRow(), table.selectedRow(), len(items))
+            if row < 0:
                 self.note.setStringValue_("재생할 항목을 고르십시오.")
                 return
             source = playlist_source(items[row])
-            if source and source == deck_now_playing() and deck_has_picture():
-                self.user_stopped = True
-                _gui_kick(self, "stop", "")
+            from ghostdeck import play as playmod
+            same = playlist_identity(source) == playlist_identity(deck_now_playing())
+            if opening_session(
+                playing=playmod.playing(),
+                has_picture=deck_has_picture(),
+                session_active=deck_session_active(),
+            ) and same:
+                self.note.setStringValue_(play_success_note(False))
                 return
             self.user_stopped = False
             _gui_kick(self, "play", source)
@@ -2347,10 +3036,7 @@ def main() -> int:
             if kind == "queue":
                 _gui_queue_href(self, href)
                 return
-            if kind == "play":
-                source = should_start_play(getattr(self, "seen_watch", ""), href, src)
-                if source:
-                    _gui_kick(self, "play", source, start=start)
+            if kind == "play" or kind == "nav":
                 return
             _gui_follow(self, href, start=start)
 

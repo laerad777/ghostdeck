@@ -30,6 +30,7 @@ HIDSHIM_SRC = ROOT / "reference" / "hidshim.c"
 SHIM = COPY / "Contents/Frameworks/libhidapi.0.dylib"
 REAL = COPY / "Contents/Frameworks/libhidapi.0.real.dylib"
 EXE = COPY / "Contents/MacOS/UlanziDeck"
+OFFICIAL_EXE = ORIGINAL / "Contents/MacOS/UlanziDeck"
 
 _BUILD_TOOLS = ("ditto", "xcrun", "clang", "install_name_tool", "codesign")
 
@@ -43,6 +44,9 @@ _PROBE_TIMEOUT = 0.4
 # `studio` can fix the failure it just saw. Shared rather than duplicated so the two cannot drift:
 # a reworded refusal would otherwise silently stop the window from recovering.
 BRIDGE_DOWN = "the hidshim bridge is not running"
+# The refusal for a host without the official app. `studio` can never work there, so the GUI and
+# `reconnect` match on this phrase to fall back to the bridge alone instead of reporting it.
+STUDIO_MISSING = "install official Studio at"
 
 # A deck that has just re-enumerated through ADB answers device commands late, the HID-to-ADB
 # switch report itself is flaky, and the bridge exits on the first rejected device command, so
@@ -149,6 +153,66 @@ def _quit_copy(*, timeout: float = 15.0) -> None:
     raise RuntimeError("hidshim Studio copy did not stop")
 
 
+def _official_pids() -> list[int]:
+    """PIDs whose argv[0] is the official Studio executable, never the hidshim copy."""
+    if not ORIGINAL.is_dir() or not OFFICIAL_EXE.is_file():
+        return []
+    marker = str(OFFICIAL_EXE.resolve())
+    try:
+        listed = subprocess.check_output(
+            ["ps", "-ww", "-axo", "pid=,command="],
+            text=True,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return []
+    pids = []
+    for line in listed.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if not pid.isdigit():
+            continue
+        command = command.strip()
+        if command == marker or command.startswith(f"{marker} "):
+            pids.append(int(pid))
+    return pids
+
+
+def _quit_official(*, timeout: float = 15.0) -> None:
+    """Official Studio holds HID iface 0, so the hidshim copy cannot switch the deck to ADB."""
+    pids = _official_pids()
+    if not pids:
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _official_pids():
+            return
+        time.sleep(0.25)
+    raise RuntimeError("official Studio did not stop")
+
+
+def _device_proxy_live() -> bool:
+    """True when the host adb server has a tcp forward — the device proxy, not just the unix socket."""
+    return bool(adb.forward_list().strip())
+
+
+def _wait_device_proxy(*, timeout: float = 25.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _socket_live() and _bridge_owner_live() and _device_proxy_live():
+            return
+        time.sleep(0.3)
+    raise RuntimeError(BRIDGE_DOWN + " (device proxy has no adb forward)")
+
+
+def _open_copy() -> None:
+    subprocess.run(["/usr/bin/open", str(COPY)], check=True, timeout=15)
+
+
 def bridge_up() -> None:
     """Bring up the bridge alone -- no Studio copy, no build, no official app.
 
@@ -205,13 +269,49 @@ def launch() -> None:
     ensure_copy()
     devicebuild.ensure()
     _ensure_bridge()
+    settle = time.monotonic() + 2.0
+    while time.monotonic() < settle:
+        if not _socket_live() or not _bridge_owner_live():
+            raise RuntimeError(
+                BRIDGE_DOWN + " (bridge died before Studio opened)"
+            )
+        time.sleep(0.2)
     subprocess.run(["/usr/bin/open", str(COPY)], check=True, timeout=15)
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
-        if running():
+        if running() and _socket_live() and _bridge_owner_live():
             return
         time.sleep(0.25)
+    if running() and not _socket_live():
+        raise RuntimeError(BRIDGE_DOWN + " after Studio opened")
     raise RuntimeError("hidshim Studio copy did not stay running")
+
+
+def reconnect(*, wait: float = 12.0) -> None:
+    """After a replug: restart the host adb server, wait for the deck, relaunch Studio.
+
+    A copy that survived unplug still holds a dead HID handle, and the next play
+    then times out on video OPEN. Always quit the copy first. Does not switch
+    HID to ADB — that is play.
+    """
+    adb.restart_server()
+    found = usb.detect()
+    deadline = time.monotonic() + wait
+    while (found or {}).get("mode") not in ("hid", "adb") and time.monotonic() < deadline:
+        time.sleep(0.4)
+        found = usb.detect()
+    if (found or {}).get("mode") not in ("hid", "adb"):
+        raise RuntimeError("덱이 USB에 없습니다. 케이블을 꽂은 다음 다시 연결하십시오")
+    if running():
+        _quit_copy()
+    _quit_official()
+    _stop_our_bridge()
+    try:
+        launch()
+    except RuntimeError as error:
+        if STUDIO_MISSING not in str(error):
+            raise
+        bridge_up()
 
 
 def ensure_copy() -> None:
@@ -219,7 +319,7 @@ def ensure_copy() -> None:
         return
     _require_build_tools()
     if not ORIGINAL.is_dir():
-        raise RuntimeError(f"install official Studio at {ORIGINAL}")
+        raise RuntimeError(f"{STUDIO_MISSING} {ORIGINAL}")
     if not HIDSHIM_SRC.is_file():
         raise RuntimeError(f"missing hidshim source: {HIDSHIM_SRC}")
     COPY.parent.mkdir(parents=True, exist_ok=True)
@@ -476,26 +576,36 @@ def _spawn_bridge(serial: str, log) -> subprocess.Popen:
     env = os.environ.copy()
     previous = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(VENDOR) if not previous else str(VENDOR) + os.pathsep + previous
+    # Detach from the caller: a CLI/GUI/tool parent exiting must not take the
+    # bridge with it. The wrapper double-forks, then execs the real argv.
+    wrapper = (
+        "import os, sys\n"
+        "if os.fork():\n"
+        "    os._exit(0)\n"
+        "os.setsid()\n"
+        "if os.fork():\n"
+        "    os._exit(0)\n"
+        "os.execvpe(sys.argv[1], sys.argv[1:], os.environ)\n"
+    )
+    argv = [
+        sys.executable,
+        "-B",
+        "-u",
+        str(BRIDGE),
+        "--adb",
+        adb.require_adb(),
+        "--serial",
+        serial,
+        "--state-file",
+        str(BRIDGE_STATE),
+        "--hid-vid",
+        f"{HID_VID:04x}",
+        "--hid-pid",
+        f"{HID_PID:04x}",
+    ]
     return subprocess.Popen(
-        [
-            sys.executable,
-            "-B",
-            "-u",
-            str(BRIDGE),
-            "--adb",
-            adb.require_adb(),
-            "--serial",
-            serial,
-            "--state-file",
-            str(BRIDGE_STATE),
-            # The bridge runs with only `vendor/` on PYTHONPATH, so it cannot import the host
-            # package that owns these ids; passing them is what keeps one source of truth without
-            # coupling the two processes.
-            "--hid-vid",
-            f"{HID_VID:04x}",
-            "--hid-pid",
-            f"{HID_PID:04x}",
-        ],
+        [sys.executable, "-c", wrapper, *argv],
+        stdin=subprocess.DEVNULL,
         stdout=log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -513,6 +623,49 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
     except subprocess.TimeoutExpired:
         child.kill()
         child.wait(timeout=timeout)
+
+
+def _owned_bridge_pid() -> int | None:
+    """The pid of a live bridge we spawned, or None. Never a stranger."""
+    try:
+        record = json.loads(BRIDGE_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    argv = _pid_argv(pid)
+    if argv and str(BRIDGE) in argv:
+        return pid
+    return None
+
+
+def _stop_our_bridge(*, timeout: float = 8.0) -> None:
+    """SIGTERM only a live bridge we own. A stranger's listener is left alone."""
+    pid = _owned_bridge_pid()
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_argv(pid):
+            break
+        time.sleep(0.2)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if _socket_state()[0] != _ENDPOINT_LIVE:
+            return
+        time.sleep(0.2)
 
 
 def require_bridge_or_start_it() -> None:
@@ -652,9 +805,9 @@ def _ensure_bridge() -> None:
             child = _spawn_bridge(serial, log)
             deadline = time.monotonic() + BRIDGE_WAIT
             while time.monotonic() < deadline:
-                if _socket_live():
+                if _socket_live() and _bridge_owner_live():
                     return
-                if child.poll() is not None:
+                if child.poll() is not None and child.returncode != 0:
                     reason = f"hidshim bridge exited with status {child.returncode}"
                     break
                 time.sleep(0.2)

@@ -107,12 +107,12 @@ def test_cli_help_parses():
     result = _run("--help")
     assert result.returncode == 0, result.stderr
     out = result.stdout + result.stderr
-    for name in ("play", "stop", "status", "detect", "studio", "build", "gui"):
+    for name in ("play", "stop", "status", "detect", "studio", "build", "gui", "reconnect"):
         assert name in out
     assert "quit" not in out
     script = _run_script(PACKAGE / "cli.py", "-h")
     assert script.returncode == 0, script.stderr
-    for name in ("play", "stop", "status", "detect", "studio", "build", "gui"):
+    for name in ("play", "stop", "status", "detect", "studio", "build", "gui", "reconnect"):
         assert name in script.stdout + script.stderr
 
 
@@ -124,7 +124,7 @@ def test_detect_source_has_no_hardcoded_serial():
 
 
 def test_public_tree_has_no_lab_identity():
-    skip = {".pyc", ".png"}
+    skip = {".pyc", ".png", ".icns"}
     # `build`/`dist` are setuptools output: they hold stale COPIES of the tracked package
     # sources, so scanning them adds no signal and only noise (the same reason `.egg-info`
     # is skipped). They are gitignored; a leak in real source is still caught.

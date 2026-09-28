@@ -30,7 +30,7 @@ _RECOVERY_HINT = "power-cycle or replug the deck (ghostdeck cannot recover it fr
 # is exactly what a user needs when `play` cannot run -- refusing it for a missing checkout would
 # take away the one command that undoes a hijacked deck. `detect`/`status` are host-side diagnostics
 # that read state only, and they stay informative in an installed copy.
-_NEEDS_TREE = ("play", "studio", "bridge", "build")
+_NEEDS_TREE = ("play", "studio", "bridge", "build", "reconnect")
 
 
 def _describe(error: BaseException) -> str:
@@ -58,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     # most hosts want; this exists so video playback does not depend on the app being installed, and
     # so a headless/CI run can bring up the transport without a GUI.
     sub.add_parser("bridge")
+    sub.add_parser("reconnect")
     sub.add_parser("build")
     sub.add_parser("gui")
     p_play = sub.add_parser("play")
@@ -66,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     p_play.add_argument("--start", type=float, default=0)
     p_play.add_argument("--crop", default="auto")
     p_play.add_argument("--no-loop", action="store_true")
+    p_play.add_argument("--volume", type=float, default=1.0)
+    p_play.add_argument("--mute", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.cmd in _NEEDS_TREE:
@@ -83,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
                 start=args.start,
                 loop=not args.no_loop,
                 crop=args.crop,
+                volume=0.0 if args.mute else args.volume,
             )
             return 0
         if args.cmd == "stop":
@@ -93,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "bridge":
             studio.bridge_up()
+            return 0
+        if args.cmd == "reconnect":
+            studio.reconnect()
             return 0
         if args.cmd == "build":
             studio.ensure_copy()
@@ -197,11 +204,14 @@ def _status() -> int:
     if not dependency:
         state, detail = _transport_problem(mode)
     if state:
-        # `usb=adb` alone read as healthy. The mode is real, so it is kept and annotated.
-        mode = f"{mode} ({state})"
+        # `usb=adb` alone read as healthy. The mode is real, so it is kept, and the unusable
+        # transport is its own `transport=` field: the line is `key=value` tokens split on spaces,
+        # so an annotation like `usb=adb (offline)` was dropped by every reader of the line.
         print(f"{detail}; {_RECOVERY_HINT}", file=sys.stderr)
+    transport = f"transport={state} " if state else ""
     print(
         f"usb={mode} "
+        f"{transport}"
         f"shim={'up' if studio.running() else 'down'} "
         f"copy={'yes' if studio.copy_exists() else 'no'} "
         f"playing={'yes' if playmod.playing() else 'no'}"

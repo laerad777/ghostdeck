@@ -95,8 +95,8 @@ ghostdeck gui             # 브라우저. 열린 영상 또는 파일을 덱에�
 | `ghostdeck play FILE\|URL` | 실행 중인 브리지로 재생합니다. 브리지가 없으면 거부하지만, 공식 앱이 없는 호스트에서는 직접 브리지를 띄웁니다. |
 | `ghostdeck stop` | 플레이어를 중지합니다. 브리지가 꺼져 있으면 스톡 UI를 복원하고 `/tmp/ghostdeck-*`를 지웁니다. 브리지가 살아 있으면 덱은 ADB로 남겨 Studio 키를 유지합니다. |
 | `ghostdeck detect` | 시리얼, VID/PID, USB 모드. 덱이 없으면 실패. |
-| `ghostdeck status` | USB 모드, 심 복사본, 재생 여부. |
-| `ghostdeck gui` | 작은 브라우저. 열린 영상 또는 로컬 파일(파일 / 드롭 / Cmd-O)을 덱에서 재생. 같은 유튜브 영상의 광고는 처음부터 다시 돌리지 않습니다. 호스트 플레이어가 아닙니다. |
+| `ghostdeck status` | 한 줄: `usb=… [transport=…] shim=… copy=… playing=…`. `transport=`는 덱이 붙어 있지만 adb 전송이 명령을 실행하지 못할 때만 나옵니다. |
+| `ghostdeck gui` | 작은 브라우저. 열린 영상 또는 로컬 파일(파일 / 드롭 / Cmd-O)을 덱에서 재생. 같은 유튜브 영상의 광고는 처음부터 다시 돌리지 않습니다. 호스트 플레이어가 아닙니다. 공식 앱이 없으면 브리지만으로 재생합니다. 단축키는 메뉴 막대에 있습니다(↩ 재생, ⌘. 정지). `macos/Ghostdeck.app`은 Finder에서 열고, 시작하지 못하면 알림을 띄웁니다. stderr는 `~/.ghostdeck/gui.log`에 남습니다. |
 
 `play`는 런처입니다. 플레이어가 짧은 유예 시간을 넘기면 바로 돌아옵니다.
 루프는 `stop`까지 계속됩니다.

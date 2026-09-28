@@ -93,8 +93,8 @@ bridge that copy's shim sees no device.
 | `ghostdeck play FILE\|URL` | Play through the running bridge. Refuses if the bridge is down, unless the official app is absent -- then it starts the bridge itself. |
 | `ghostdeck stop` | Stop the player. If the bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is up, leave the deck in ADB so Studio keys keep working. |
 | `ghostdeck detect` | Serial, VID/PID, USB mode. Fails if no deck. |
-| `ghostdeck status` | USB mode, shim copy, playing. |
-| `ghostdeck gui` | A small browser. Play the open video or a local file (파일 / drop / Cmd-O) on the deck. Ads on the same YouTube id do not restart. Not a host player. |
+| `ghostdeck status` | One line: `usb=… [transport=…] shim=… copy=… playing=…`. `transport=` appears only when the deck is attached but its adb transport will not run a command. |
+| `ghostdeck gui` | A small browser. Play the open video or a local file (파일 / drop / Cmd-O) on the deck. Ads on the same YouTube id do not restart. Not a host player. Without the official app it plays through the bridge alone. Shortcuts are in the menu bar (↩ play, ⌘. stop). `macos/Ghostdeck.app` opens it from Finder and shows an alert when it cannot start; its stderr goes to `~/.ghostdeck/gui.log`. |
 
 `play` is a launcher: it returns after the player has survived a short grace
 window. The player keeps looping until `stop`.

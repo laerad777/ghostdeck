@@ -37,6 +37,21 @@ from ghostdeck.app import (
     playlist_next,
     playlist_prev,
     repeat_label,
+    play_fit,
+    play_crop_choice,
+    fit_label,
+    crop_label,
+    overlay_label,
+    play_crop_argv,
+    playlist_click_row,
+    playlist_playing,
+    console_row,
+    QUEUE_CHROME,
+    play_failure_note,
+    play_success_note,
+    should_auto_next,
+    opening_session,
+    seek_note,
     player_prefs_load,
     player_prefs_save,
     playlist_label,
@@ -50,6 +65,10 @@ from ghostdeck.app import (
     deck_playhead,
     deck_crop,
     request_live_seek,
+    request_live_volume,
+    request_live_overlay,
+    clamp_volume,
+    audio_gain,
     wrap_playhead,
     format_clock,
     source_duration,
@@ -67,6 +86,10 @@ from ghostdeck.app import (
     should_start_play,
     play_offset,
     parse_watch_payload,
+    failure_note,
+    message_head,
+    playlist_index,
+    recovery_action,
 )
 
 
@@ -104,10 +127,11 @@ def test_shim_is_up_reads_the_status_line():
 
 def test_the_window_shows_a_readable_state_instead_of_the_raw_status_line():
     """The window is what someone watches a video through, so `usb=adb shim=up …` is not the text."""
-    assert status_text("usb=adb shim=up copy=yes playing=yes") == "덱 ADB · 재생 중"
-    assert status_text("usb=adb shim=up copy=yes playing=no") == "덱 ADB · 멈춤"
-    assert status_text("usb=hid shim=down copy=yes playing=no") == "덱 HID · 멈춤 · 브리지 꺼짐"
-    assert status_text("usb=none shim=down copy=no playing=no") == "덱 없음 · 멈춤 · 브리지 꺼짐"
+    assert status_text("usb=adb shim=up copy=yes playing=yes") == "덱 ADB · 키 연결됨 · 재생 중"
+    assert status_text("usb=adb shim=up copy=yes playing=yes", has_picture=False) == "덱 ADB · 키 연결됨 · 여는 중"
+    assert status_text("usb=adb shim=up copy=yes playing=no") == "덱 ADB · 키 연결됨 · 멈춤"
+    assert status_text("usb=hid shim=down copy=yes playing=no") == "덱 HID · 키 없음 · 멈춤"
+    assert status_text("usb=none shim=down copy=no playing=no") == "덱 없음 · 키 없음 · 멈춤 · 연결을 누르십시오"
 
 
 def test_a_bridge_that_is_up_is_not_worth_saying_in_the_window():
@@ -115,10 +139,53 @@ def test_a_bridge_that_is_up_is_not_worth_saying_in_the_window():
     assert "브리지" not in status_text("usb=adb shim=up copy=yes playing=no")
 
 
-def test_an_annotated_transport_mode_is_still_read_as_its_mode():
-    """`status` appends `(offline)` to a wedged transport; the window must not lose the mode."""
-    assert status_text("usb=adb (offline) shim=up copy=yes playing=no") == "덱 ADB · 멈춤"
-    assert status_text("usb=unknown shim=down copy=yes playing=no") == "덱 알 수 없음 · 멈춤 · 브리지 꺼짐"
+def test_a_wedged_transport_is_shown_as_the_physical_fix():
+    """`usb=adb (offline)` used to split on the space and render as a healthy `덱 ADB`.
+
+    `status` now prints the wedged state as its own `transport=` field, and the window shows the
+    only remedy that works (replug) instead of keys and play state that cannot matter.
+    """
+    line = "usb=adb transport=offline shim=up copy=yes playing=no"
+    assert parse_status_fields(line)["transport"] == "offline"
+    text = status_text(line)
+    assert "offline" in text and "뽑았다" in text, text
+    assert "키 연결됨" not in text
+    assert recovery_action(line) == ""
+    assert status_text("usb=unknown shim=down copy=yes playing=no") == "덱 알 수 없음 · 키 없음 · 멈춤"
+
+
+def test_status_line_from_the_cli_round_trips_through_the_window(monkeypatch, capsys):
+    """The CLI writes the line and the window reads it; drive both, not a hand-written string."""
+    from ghostdeck import cli, play, studio, usb
+
+    monkeypatch.setattr(usb, "detect", lambda: {"serial": "S", "vid": 1, "pid": 2, "mode": "adb"})
+    monkeypatch.setattr(play, "deck_transport", lambda **_k: ("S", "offline", []))
+    monkeypatch.setattr(studio, "running", lambda: False)
+    monkeypatch.setattr(studio, "copy_exists", lambda: True)
+    monkeypatch.setattr(play, "playing", lambda: False)
+    cli._status()
+    out = capsys.readouterr().out
+    assert parse_status_fields(out) == {
+        "usb": "adb", "transport": "offline", "shim": "down", "copy": "yes", "playing": "no",
+    }
+    assert "뽑았다" in status_text(out)
+
+
+def test_recovery_action_names_the_one_button_that_helps():
+    assert recovery_action("usb=none shim=down copy=no playing=no") == "reconnect"
+    assert recovery_action("usb=adb shim=down copy=yes playing=no") == "studio"
+    assert recovery_action("usb=hid shim=down copy=yes playing=no") == "studio"
+    assert recovery_action("usb=adb shim=up copy=yes playing=no") == ""
+    # No official app: `studio` cannot help, and shim=down is simply how that host runs.
+    assert recovery_action("usb=adb shim=down copy=no playing=no", has_studio=False) == ""
+    assert recovery_action("usb=unknown shim=down copy=no playing=no") == ""
+    assert recovery_action("") == ""
+
+
+def test_a_host_without_studio_says_why_there_are_no_keys():
+    line = "usb=adb shim=down copy=no playing=no"
+    assert status_text(line, has_studio=False) == "덱 ADB · Studio 없음 · 멈춤"
+    assert status_text(line) == "덱 ADB · 키 없음 · 멈춤"
 
 
 def test_unknown_status_text_never_renders_as_a_wrong_state():
@@ -251,6 +318,49 @@ def test_request_live_seek_writes_the_player_file(tmp_path):
     assert path.read_text(encoding="utf-8").strip() == "41.250"
 
 
+def test_request_live_volume_writes_the_player_file(tmp_path):
+    path = tmp_path / "volume"
+    assert request_live_volume(0.25, path=path) is True
+    assert path.read_text(encoding="utf-8").strip() == "0.2500"
+
+
+def test_request_live_overlay_writes_the_player_file(tmp_path):
+    path = tmp_path / "overlay"
+    assert request_live_overlay(0.4, path=path) is True
+    assert path.read_text(encoding="utf-8").strip() == "0.4000"
+
+
+def test_request_live_overlay_pushes_alpha_to_the_deck(monkeypatch, tmp_path):
+    seen: list[float] = []
+    monkeypatch.setattr("ghostdeck.app._push_studio_alpha", lambda gain: seen.append(gain))
+    path = tmp_path / "overlay"
+    assert request_live_overlay(0.25, path=path) is True
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and not seen:
+        time.sleep(0.01)
+    assert seen == [0.25]
+
+def test_audio_gain_mutes_without_losing_the_slider():
+    assert clamp_volume(1.4) == 1.0
+    assert clamp_volume(-0.2) == 0.0
+    assert clamp_volume("nope") == 1.0
+    assert audio_gain(0.4, False) == 0.4
+    assert audio_gain(0.4, True) == 0.0
+
+
+def test_gui_play_passes_volume():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv[:1] == ["status"]:
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        return CommandResult(argv, 0, "", "")
+
+    DeckRemote(run).play("/tmp/clip.mp4", volume=0.25)
+    assert calls[-1] == ["play", "/tmp/clip.mp4", "--volume", "0.2500"]
+
+
 def test_deck_crop_reads_a_letterbox_rect(tmp_path):
     path = tmp_path / "host.json"
     path.write_text('{"crop":"1920:804:0:138","phase":"active"}\n', encoding="utf-8")
@@ -366,7 +476,7 @@ def test_play_does_not_retry_when_starting_the_bridge_fails():
         if argv[0] == "status":
             return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
         if argv[0] == "studio":
-            return CommandResult(argv, 1, "", "official Studio.app is missing")
+            return CommandResult(argv, 1, "", "hidshim Studio copy did not stay running")
         return CommandResult(argv, 1, "", studio.BRIDGE_DOWN + " (none)")
 
     results = DeckRemote(run).play("/tmp/clip.mp4")
@@ -382,13 +492,93 @@ def test_play_does_not_call_play_if_studio_fails():
         if argv == ["status"]:
             return CommandResult(argv, 0, "usb=adb shim=down copy=no playing=no\n", "")
         if argv == ["studio"]:
-            return CommandResult(argv, 1, "", "official Studio.app is missing")
+            return CommandResult(argv, 1, "", "hidshim Studio copy did not stay running")
         raise AssertionError(f"unexpected {argv}")
 
     results = DeckRemote(run).play("/tmp/clip.mp4")
     assert calls == [["status"], ["studio"]]
     assert results[-1].code == 1
-    assert "Studio.app" in results[-1].detail
+    assert "did not stay running" in results[-1].detail
+
+
+def test_play_falls_back_to_the_bridge_when_studio_is_not_installed():
+    """No official app: `studio` can never work, but the bridge alone still plays video."""
+    from ghostdeck import studio
+
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv == ["status"]:
+            return CommandResult(argv, 0, "usb=adb shim=down copy=no playing=no\n", "")
+        if argv == ["studio"]:
+            return CommandResult(argv, 1, "", f"{studio.STUDIO_MISSING} /Applications/Ulanzi Studio.app\n")
+        return CommandResult(argv, 0, "", "")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [["status"], ["studio"], ["bridge"], ["play", "/tmp/clip.mp4"]]
+    assert results[-1].code == 0
+
+
+def test_bridge_fallback_failure_is_reported_without_playing():
+    from ghostdeck import studio
+
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv == ["status"]:
+            return CommandResult(argv, 0, "usb=adb shim=down copy=no playing=no\n", "")
+        if argv == ["studio"]:
+            return CommandResult(argv, 1, "", f"{studio.STUDIO_MISSING} /Applications/Ulanzi Studio.app\n")
+        if argv == ["bridge"]:
+            return CommandResult(argv, 1, "", "hidshim bridge socket did not come up\n")
+        raise AssertionError(f"unexpected {argv}")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [["status"], ["studio"], ["bridge"]]
+    assert results[-1].argv == ["bridge"] and results[-1].code == 1
+
+
+def test_a_bridge_refusal_on_a_studio_less_host_retries_through_the_bridge():
+    from ghostdeck import studio
+
+    calls: list[list[str]] = []
+    plays = 0
+
+    def run(argv):
+        nonlocal plays
+        calls.append(list(argv))
+        if argv[0] == "status":
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        if argv[0] == "studio":
+            return CommandResult(argv, 1, "", f"{studio.STUDIO_MISSING} /x\n")
+        if argv[0] == "bridge":
+            return CommandResult(argv, 0, "", "")
+        plays += 1
+        return CommandResult(argv, 1, "", studio.BRIDGE_DOWN + " (none)") if plays == 1 else CommandResult(argv, 0, "", "")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert calls == [
+        ["status"], ["play", "/tmp/clip.mp4"], ["studio"], ["bridge"], ["play", "/tmp/clip.mp4"],
+    ]
+    assert results[-1].code == 0
+
+
+def test_detail_keeps_the_reason_of_a_multi_line_error():
+    """The agent-missing error ends in an indented URL; the headline is the reason, not the URL."""
+    stderr = (
+        "d200-color-agent is not built.\n"
+        "  Download the ARMv7 Linux build:\n"
+        "    https://example.invalid/d200-color-agent\n"
+    )
+    result = CommandResult(["play"], 1, "", stderr)
+    assert result.detail == "d200-color-agent is not built."
+    assert "에이전트" in play_failure_note(result.detail)
+    # A warning printed before the final one-line error does not win.
+    assert message_head("warning: something\nno D200 on USB\n") == "no D200 on USB"
+    assert message_head("") == ""
+    assert CommandResult(["x"], 3, "", "").detail == "exit 3"
 
 
 def test_play_refuses_an_empty_path_without_touching_the_cli():
@@ -422,6 +612,79 @@ def test_stop_is_only_stop():
     result = DeckRemote(run).stop()
     assert calls == [["stop"]]
     assert result.argv == ["stop"]
+
+
+def test_reconnect_runs_the_cli():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        return CommandResult(argv, 0, "", "")
+
+    result = DeckRemote(run).reconnect()
+    assert calls == [["reconnect"]]
+    assert result.argv == ["reconnect"]
+
+
+def test_studio_and_bridge_run_the_cli():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        return CommandResult(argv, 0, "", "")
+
+    remote = DeckRemote(run)
+    assert remote.studio().argv == ["studio"]
+    assert remote.bridge().argv == ["bridge"]
+    assert calls == [["studio"], ["bridge"]]
+
+
+def test_gui_play_passes_fit():
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(list(argv))
+        if argv[:1] == ["status"]:
+            return CommandResult(argv, 0, "usb=adb shim=up copy=yes playing=no\n", "")
+        return CommandResult(argv, 0, "", "")
+
+    DeckRemote(run).play("/tmp/clip.mp4", fit="cover")
+    assert calls[-1] == ["play", "/tmp/clip.mp4", "--fit", "cover"]
+
+
+def test_play_fit_and_crop_choice_clamp():
+    assert play_fit("pad") == "pad"
+    assert play_fit("nope") == "auto"
+    assert play_crop_choice("none") == "none"
+    assert play_crop_choice("1920:804:0:138") == "auto"
+
+
+def test_reconnect_restarts_adb_quits_the_copy_and_launches_studio(monkeypatch):
+    from ghostdeck import studio, usb
+
+    seen: list[str] = []
+    monkeypatch.setattr(studio.adb, "restart_server", lambda: seen.append("adb"))
+    monkeypatch.setattr(usb, "detect", lambda: {"serial": "X", "vid": 1, "pid": 2, "mode": "hid"})
+    monkeypatch.setattr(studio, "running", lambda: True)
+    monkeypatch.setattr(studio, "_quit_copy", lambda: seen.append("quit"))
+    monkeypatch.setattr(studio, "_stop_our_bridge", lambda: seen.append("bridge"))
+    monkeypatch.setattr(studio, "launch", lambda: seen.append("launch"))
+    studio.reconnect(wait=0)
+    assert seen == ["adb", "quit", "bridge", "launch"]
+
+
+def test_reconnect_refuses_when_the_deck_is_missing(monkeypatch):
+    from ghostdeck import studio, usb
+
+    monkeypatch.setattr(studio.adb, "restart_server", lambda: None)
+    monkeypatch.setattr(usb, "detect", lambda: {"serial": None, "vid": None, "pid": None, "mode": "none"})
+    raised = None
+    try:
+        studio.reconnect(wait=0)
+    except RuntimeError as error:
+        raised = error
+    assert raised is not None
+    assert "USB" in str(raised)
 
 
 def test_media_path_candidate_accepts_local_files_and_file_urls():
@@ -467,18 +730,13 @@ def test_play_request_falls_back_to_a_copied_file():
     )
 
 
-def test_leaving_a_youtube_video_stops_the_deck():
+def test_browsing_does_not_start_or_stop_the_deck():
     watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    assert page_follow_action(watch, "https://www.youtube.com/") == ("", "stop")
+    assert page_follow_action(watch, "https://www.youtube.com/") == (watch, "")
     assert page_follow_action(watch, watch) == (watch, "")
-
-
-def test_a_local_file_is_not_stopped_by_sitting_on_youtube():
-    """The window stays on youtube.com while a dropped file plays; that is not 'left the video'."""
     path = "/tmp/clip.mp4"
     assert page_follow_action(path, "https://www.youtube.com/") == (path, "")
-    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    assert page_follow_action(path, watch) == (watch, watch)
+    assert page_follow_action(path, watch) == (path, "")
 
 
 def test_playlist_label_is_a_name_not_a_path():
@@ -599,6 +857,9 @@ def test_youtube_overlay_queues_without_playing():
     assert "ghostdeck-queue" in text
     assert "post('queue')" in text
     assert 'kind == "queue"' in text
+    assert "function silence(v)" in text
+    assert "post('play')" not in text
+    assert 'kind == "play" or kind == "nav"' in text
 
 
 def test_youtube_playlist_page_is_not_a_single_watch():
@@ -842,8 +1103,62 @@ def test_playlist_next_respects_repeat_and_shuffle():
 def test_player_prefs_roundtrip(tmp_path):
     path = tmp_path / "player.json"
     player_prefs_save(path, {"repeat": "one", "shuffle": True})
-    assert player_prefs_load(path) == {"repeat": "one", "shuffle": True}
-    assert player_prefs_load(tmp_path / "gone.json") == {"repeat": "off", "shuffle": False}
+    assert player_prefs_load(path) == {
+        "repeat": "one",
+        "shuffle": True,
+        "volume": 1.0,
+        "muted": False,
+        "overlay": 1.0,
+        "fit": "auto",
+        "crop": "auto",
+    }
+    player_prefs_save(path, {"repeat": "off", "shuffle": False, "volume": 0.3, "muted": True})
+    assert player_prefs_load(path) == {
+        "repeat": "off",
+        "shuffle": False,
+        "volume": 0.3,
+        "muted": True,
+        "overlay": 1.0,
+        "fit": "auto",
+        "crop": "auto",
+    }
+    assert player_prefs_load(tmp_path / "gone.json") == {
+        "repeat": "off",
+        "shuffle": False,
+        "volume": 1.0,
+        "muted": False,
+        "overlay": 1.0,
+        "fit": "auto",
+        "crop": "auto",
+    }
+def test_the_stopped_track_is_the_row_play_resumes():
+    """■ on track 3 then ▶ played track 0: the table forced row 0 selected, and selection wins.
+
+    The selection now follows the deck (`playlist_index`) and the table allows it to be empty.
+    """
+    items = playlist_normalize([playlist_entry(f"/tmp/t{i}.mp4") for i in range(4)])
+    stopped = "/tmp/t3.mp4"
+    row = playlist_index(items, stopped)
+    assert row == 3
+    assert queue_play_source(items, row, "", stopped) == stopped
+    assert queue_play_source(items, -1, "", stopped) == stopped
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert playlist_index(playlist_add([], watch), "https://youtu.be/dQw4w9WgXcQ") == 0
+    assert playlist_index(items, "/tmp/other.mp4") == -1
+    assert playlist_index(items, "") == -1
+    text = Path(__file__).resolve().parents[1].joinpath("src/ghostdeck/app.py").read_text(encoding="utf-8")
+    assert "setAllowsEmptySelection_(False)" not in text
+
+
+def test_esc_is_not_a_stop_shortcut_and_the_app_has_a_menu_bar():
+    """Esc on ■ stopped the deck while editing the URL; without a main menu ⌘Q/⌘V had no route."""
+    text = Path(__file__).resolve().parents[1].joinpath("src/ghostdeck/app.py").read_text(encoding="utf-8")
+    assert 'setKeyEquivalent_("\\x1b")' not in text
+    assert "NSApp.setMainMenu_(bar)" in text
+    for action in ('"paste:"', '"copy:"', '"selectAll:"', '"terminate:"', '"stop:", "."'):
+        assert action in text, action
+
+
 def test_queue_play_source_prefers_selection_then_now_then_head():
     items = playlist_add(playlist_add([], "/tmp/a.mp4"), "/tmp/b.mp4")
     assert queue_play_source(items, 1) == "/tmp/b.mp4"
@@ -851,3 +1166,157 @@ def test_queue_play_source_prefers_selection_then_now_then_head():
     assert queue_play_source(items, -1, seen="/tmp/b.mp4") == "/tmp/b.mp4"
     assert queue_play_source(items, -1) == "/tmp/a.mp4"
     assert queue_play_source([], -1) == ""
+
+def test_status_text_one_product():
+    line = status_text("usb=adb shim=up copy=yes playing=no")
+    assert "키 연결됨" in line
+    assert "공식" not in line
+    assert "Studio" not in line
+    assert status_text("usb=adb shim=down copy=yes playing=no") == "덱 ADB · 키 없음 · 멈춤"
+
+
+def test_play_success_note_waits_for_picture():
+    assert "재생 중" not in play_success_note(False)
+    assert "첫 프레임" in play_success_note(False)
+    assert play_success_note(True).startswith("덱에서 재생 중입니다")
+
+
+def test_open_failure_is_korean():
+    note = play_failure_note("RuntimeError: video OPEN failed with code 1")
+    assert note == "덱이 아직 이전 영상을 안 놓았습니다."
+    assert "RuntimeError" not in note
+    assert play_failure_note("player exited with status 1 before it started; nothing is playing") == (
+        "재생을 시작하지 못했습니다."
+    )
+    assert play_failure_note("") == "재생을 시작하지 못했습니다."
+
+
+def test_the_refusals_a_user_actually_hits_are_korean_and_actionable():
+    """Driven from the CLI's own messages, so a reworded refusal shows up here as English."""
+    from ghostdeck import studio
+
+    cases = {
+        "no D200 on USB": "연결",
+        "timed out": "연결",
+        f"{studio.STUDIO_MISSING} {studio.ORIGINAL}": "브리지",
+        f"{studio.BRIDGE_DOWN} (absent), and the player reaches the deck through it": "스튜디오",
+        "ffmpeg not on PATH: install it (brew install ffmpeg)": "brew install ffmpeg",
+        "yt-dlp not on PATH: install it (brew install yt-dlp)": "brew install yt-dlp",
+        "hidapi is not installed (pip install hidapi)": "pip install",
+        "the deck (S) is attached in ADB mode but its adb transport is offline, so it": "뽑았다",
+        "D200 is not enumerating through ADB: no bridge serial": "연결",
+        "hidshim bridge socket did not come up": "연결",
+        f"a listener holds {studio.SOCKET} but no live {studio.BRIDGE.name} of ours owns it": "브리지 소켓",
+        "d200-color-agent is not built.": "README",
+    }
+    for raw, hint in cases.items():
+        note = failure_note(raw)
+        assert note != raw, f"left in English: {raw}"
+        assert hint in note, (raw, note)
+        assert failure_note(f"RuntimeError: {raw}") == note
+    # A reason the table does not know is shown rather than hidden behind a generic line.
+    assert failure_note("something new") == "something new"
+    assert failure_note("") == "실패했습니다."
+
+
+def test_real_cli_refusals_map_to_korean(monkeypatch, tmp_path):
+    """Raise the actual RuntimeErrors, not copies of their text."""
+    from ghostdeck import play, studio
+
+    monkeypatch.setattr(studio, "ORIGINAL", tmp_path / "no-studio.app")
+    monkeypatch.setattr(studio, "COPY", tmp_path / "no-copy.app")
+    monkeypatch.setattr(studio, "_require_build_tools", lambda: None)
+    try:
+        studio.ensure_copy()
+    except RuntimeError as error:
+        assert "브리지" in failure_note(str(error))
+    else:
+        raise AssertionError("ensure_copy did not refuse a missing Studio")
+    monkeypatch.setattr(play.shutil, "which", lambda _tool: None)
+    try:
+        play._require_tools("https://youtu.be/x")
+    except RuntimeError as error:
+        assert "brew install ffmpeg" in failure_note(str(error))
+    else:
+        raise AssertionError("_require_tools did not refuse")
+
+
+def test_auto_next_skips_live_session():
+    assert should_auto_next(
+        playing=True, session_active=False, was_playing=True, saw_picture=True,
+        user_stopped=False, busy=False,
+    ) is False
+    assert should_auto_next(
+        playing=False, session_active=True, was_playing=True, saw_picture=True,
+        user_stopped=False, busy=False,
+    ) is True
+    assert should_auto_next(
+        playing=False, session_active=True, was_playing=False, saw_picture=False,
+        user_stopped=False, busy=False,
+    ) is False
+    assert should_auto_next(
+        playing=False, session_active=False, was_playing=True, saw_picture=True,
+        user_stopped=False, busy=False,
+    ) is True
+    assert opening_session(playing=True, has_picture=False, session_active=True) is True
+    assert opening_session(playing=False, has_picture=True, session_active=False) is False
+
+
+def test_fit_crop_labels_name_every_mode_distinctly():
+    """Each press cycles the mode; the label must say which mode is now selected."""
+    fits = [fit_label(mode) for mode in ("auto", "pad", "cover")]
+    assert len(set(fits)) == 3 and all(label.startswith("화면") for label in fits)
+    crops = [crop_label(mode) for mode in ("auto", "none")]
+    assert len(set(crops)) == 2 and all(label.startswith("여백") for label in crops)
+    assert fit_label("nope") == fit_label("auto")
+    assert overlay_label() == "버튼"
+    assert seek_note(65, True) == "1:05부터 다시 재생합니다."
+    assert seek_note(65, False) == "1:05부터 다시 재생합니다."
+
+def test_product_console_drops_the_phone_notch():
+    text = Path(__file__).resolve().parents[1].joinpath("src/ghostdeck/app.py").read_text(encoding="utf-8")
+    assert "PHONE_H - 16" not in text
+    assert "setCornerRadius_(28.0)" not in text
+    assert "class Ghost" not in text
+    assert QUEUE_CHROME == 270
+    assert "h - QUEUE_CHROME" in text
+    assert "MIX_Y" in text
+    assert "DECK_Y" in text
+    assert "PHONE_W = 392" in text
+    assert "CHROME_Y" not in text
+    assert "row_play_btn" not in text
+    assert "play.fill" in text
+    assert "TOOL_Y" in text
+
+def test_playlist_click_row_prefers_clicked():
+    assert playlist_click_row(2, -1, 3) == 2
+    assert playlist_click_row(-1, 1, 3) == 1
+    assert playlist_click_row(-1, -1, 3) == -1
+    assert playlist_click_row(9, 0, 3) == 0
+
+
+def test_youtube_auto_crop_skips_http_detect():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert play_crop_argv(watch, "auto") == "none"
+    assert play_crop_argv("/tmp/clip.mp4", "auto") == "auto"
+    assert play_crop_argv(watch, "none") == "none"
+
+def test_playlist_row_is_channel_title_without_play_glyph():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    item = playlist_entry(watch, "IRIS OUT", "Kenshi Yonezu")
+    assert playlist_label(item) == "Kenshi Yonezu · IRIS OUT"
+    assert playlist_playing(item, watch)
+    assert playlist_playing(item, "", watch)
+    assert not playlist_playing(item, "https://www.youtube.com/watch?v=other")
+    text = Path(__file__).resolve().parents[1].joinpath("src/ghostdeck/app.py").read_text(encoding="utf-8")
+    assert '"▶ " + title' not in text
+    assert 'initWithIdentifier_("track")' in text
+
+def test_console_row_shares_one_inset():
+    six = console_row(6)
+    four = console_row(4)
+    assert six[0] == (16, 50)
+    assert six[-1][0] + six[-1][1] == 356
+    assert four[0] == (16, 79)
+    assert four[-1][0] + four[-1][1] == 356
+    assert four[0][0] == six[0][0]
