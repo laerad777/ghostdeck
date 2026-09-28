@@ -32,6 +32,10 @@ SERIAL = __import__("os").environ.get("GHOSTDECK_SERIAL") or ""
 MAX_JPEG_BYTES = wire.MAX_JPEG
 HOST_STATE = Path("/tmp/d200-color-host.json")
 SEEK_PATH = Path("/tmp/d200-color-seek")
+VOLUME_PATH = Path("/tmp/d200-color-volume")
+OVERLAY_PATH = Path("/tmp/d200-color-overlay")
+CURRENT_OVERLAY = 1.0
+CURRENT_VOLUME = 1.0
 BRIDGE_SOCKET = Path("/tmp/d200-adb-bridge.sock")
 # Keep FRAME records under 12KiB; 14387-byte records stalled at upHave=12288.
 FRAME_JPEG_CHUNK = 12288 - wire.HEADER_SIZE - 16
@@ -42,6 +46,11 @@ class SeekRequested(Exception):
     def __init__(self, start):
         super().__init__(start)
         self.start = float(start)
+
+class VolumeRequested(Exception):
+    def __init__(self, gain):
+        super().__init__(gain)
+        self.gain = float(gain)
 
 
 def take_seek_request(path=SEEK_PATH):
@@ -60,6 +69,75 @@ def take_seek_request(path=SEEK_PATH):
     if not math.isfinite(value) or value < 0:
         return None
     return value
+
+
+def clamp_volume(value):
+    try:
+        gain = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(gain):
+        return 1.0
+    if gain < 0:
+        return 0.0
+    if gain > 1:
+        return 1.0
+    return gain
+
+
+def take_volume_request(path=VOLUME_PATH):
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return clamp_volume(raw)
+
+
+def take_overlay_request(path=OVERLAY_PATH):
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return clamp_volume(raw)
+
+
+def push_studio_alpha(gain):
+    n = int(round(clamp_volume(gain) * 255))
+    try:
+        run(ADB, "shell", f"echo {n} >/tmp/d200-studio-alpha", check=False)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+
+
+def apply_encoder_volume(encoder, gain):
+    """Remember the live gain. The speaker ffmpeg has no sendcmd graph."""
+    global CURRENT_VOLUME
+    CURRENT_VOLUME = clamp_volume(gain)
+
+
+def speaker_playhead(start, started_ns, now_ns, rate=1.0):
+    try:
+        start = float(start)
+        started_ns = float(started_ns)
+        now_ns = float(now_ns)
+        rate = float(rate)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(start) or start < 0:
+        start = 0.0
+    if not math.isfinite(rate) or rate <= 0:
+        rate = 1.0
+    if not math.isfinite(started_ns) or not math.isfinite(now_ns) or now_ns < started_ns:
+        return start
+    return start + (now_ns - started_ns) / 1e9 * rate
 
 
 
@@ -240,8 +318,8 @@ def probe_duration(source):
 def parse_fps(value, source):
     if value == "source":
         fps = probe_source_fps(source)
-        if fps > 60:
-            fps = Fraction(60, 1)
+        if fps > 30:
+            fps = Fraction(30, 1)
     else:
         try:
             fps = Fraction(value)
@@ -262,9 +340,9 @@ def drain_bounded(stream, storage, limit=64 * 1024):
         if len(storage) > limit:
             del storage[:-limit]
 class FramePump:
-    """Drain JPEG stdout. Keep only the newest frames so video cannot lag audio."""
+    """Drain JPEG stdout in order. Drop oldest only when the queue is full."""
 
-    def __init__(self, raw, max_frames=2):
+    def __init__(self, raw, max_frames=8):
         self._q = queue.Queue(maxsize=max_frames)
         self._raw = raw
         threading.Thread(target=self._run, daemon=True).start()
@@ -312,18 +390,7 @@ class FramePump:
             self._offer(None)
 
     def get(self, timeout=0.05):
-        item = self._q.get(timeout=timeout)
-        if item is None:
-            return None
-        while True:
-            try:
-                nxt = self._q.get_nowait()
-            except queue.Empty:
-                return item
-            if nxt is None:
-                self._q.put(None)
-                return item
-            item = nxt
+        return self._q.get(timeout=timeout)
 
 
 
@@ -565,12 +632,19 @@ class VideoStream:
         while not self.state.ready:
             self.wait(deadline)
 
-    def produce(self, source, encoder, loop=False):
+    def produce(self, source, encoder, loop=False, speaker=None):
         """Never request a fill-sized buffered read; pause the framer at each JPEG."""
         pump = source
         while True:
             check_cancel(self.cancel)
             wanted = take_seek_request()
+            volume = take_volume_request()
+            if volume is not None:
+                apply_encoder_volume(speaker, volume)
+                raise VolumeRequested(volume)
+            overlay = take_overlay_request()
+            if overlay is not None:
+                push_studio_alpha(overlay)
             if wanted is not None:
                 raise SeekRequested(wanted)
             while self.state.received - self.state.consumed >= wire.WINDOW_FRAMES:
@@ -638,9 +712,24 @@ def stop_encoder(encoder, *, harsh: bool = False):
             except subprocess.TimeoutExpired:
                 encoder.kill()
                 encoder.wait(timeout=2)
-    for stream in (encoder.stdout, encoder.stderr):
+    for stream in (encoder.stdin, encoder.stdout, encoder.stderr):
         if stream:
             stream.close()
+
+
+def spawn_speaker(audio_cmd):
+    if not audio_cmd:
+        return None
+    return subprocess.Popen(
+        audio_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
+    )
+
+
+def spawn_av(command, audio_cmd):
+    encoder = subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+    )
+    return encoder, spawn_speaker(audio_cmd)
 
 
 def initial_status():
@@ -714,37 +803,26 @@ def source_has_audio(source):
     return bool((result.stdout or "").strip())
 
 
+def audio_filter(args):
+    """Host PCM. Large regular frames so AudioToolbox's two buffers do not underrun."""
+    gain = clamp_volume(getattr(args, "volume", 1.0))
+    return f"volume@vol={gain:.4f},aresample=48000,asetnsamples=n=8192:p=1"
+
+
 def build_encoder_command(args, video, audio, filters):
-    """One realtime ffmpeg: JPEG on stdout, AudioToolbox as a second output."""
+    """JPEG only. Host audio is a second realtime ffmpeg so JPEG credit cannot underrun it."""
     command = ["ffmpeg", "-v", "error", "-nostdin"]
     _input_flags(command, video, args, realtime=True)
-    separate = bool(audio) and audio != video
-    if separate:
-        _input_flags(command, audio, args, realtime=True)
     if args.duration:
         command.extend(["-t", str(args.duration)])
     command.extend([
-        "-max_interleave_delta", "0",
-        "-max_muxing_queue_size", "1024",
         "-map", "0:v:0",
         "-vf", filters,
         "-q:v", str(args.quality),
         "-pix_fmt", "yuvj420p",
         "-f", "image2pipe", "pipe:1",
+        "-an",
     ])
-    if audio:
-        command.extend([
-            "-map", "1:a:0" if separate else "0:a:0",
-            "-filter:a", "aresample=48000",
-            "-ar", "48000",
-            "-ac", "2",
-            "-c:a", "pcm_s16le",
-            "-f", "audiotoolbox", "dummy",
-        ])
-        if separate:
-            command.append("-shortest")
-    else:
-        command.append("-an")
     return command
 
 
@@ -752,13 +830,13 @@ def build_audio_command(args, audio):
     """Realtime AudioToolbox. Independent of the JPEG credit stall."""
     if not audio:
         return None
-    command = ["ffmpeg", "-v", "error", "-nostdin"]
+    command = ["ffmpeg", "-v", "error"]
     _input_flags(command, audio, args, realtime=True)
     if args.duration:
         command.extend(["-t", str(args.duration)])
     command.extend([
         "-vn",
-        "-filter:a", "aresample=48000",
+        "-filter:a", audio_filter(args),
         "-ar", "48000",
         "-ac", "2",
         "-c:a", "pcm_s16le",
@@ -768,13 +846,13 @@ def build_audio_command(args, audio):
 
 
 def _input_flags(command, url, args, realtime=False):
+    command.extend(["-thread_queue_size", "512"])
     if str(url).startswith(("http://", "https://")):
         command.extend([
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_on_network_error", "1",
             "-reconnect_delay_max", "2",
-            "-thread_queue_size", "512",
         ])
     if realtime:
         command.append("-re")
@@ -804,7 +882,9 @@ def main():
     parser.add_argument("--crop", default="auto")
     parser.add_argument("--fit", choices=("auto", "pad", "cover"), default="auto")
     parser.add_argument("--no-audio", action="store_true")
+    parser.add_argument("--volume", type=float, default=1.0)
     args = parser.parse_args()
+    args.volume = clamp_volume(args.volume)
     if args.pause_stock_ui or args.studio_overlay or args.hardware_scale:
         raise SystemExit("stock zkgui remains authoritative; overlay/hardware-scale/pause-stock-ui are unsupported")
     if args.image_resolution != "native":
@@ -903,8 +983,13 @@ def main():
                             fpsNumerator=fps.numerator, fpsDenominator=fps.denominator)
         answer = json_exchange(client, open_request, deadline, cancel)
         if should_retry_unproven_open(answer):
+            try:
+                client.close()
+            except OSError:
+                pass
             time.sleep(OPEN_RETRY_WAIT)
             deadline = time.monotonic() + 10
+            client = connect_bridge(BRIDGE_SOCKET, deadline, cancel)
             answer = json_exchange(client, open_request, deadline, cancel)
         if not answer["accepted"]:
             open_rejected = True
@@ -929,7 +1014,8 @@ def main():
         state["diagnostics"] = diagnostics.snapshot()
         state = publish_video_state(state, state_path=HOST_STATE)
         check_cancel(cancel)
-        encoder = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        audio_cmd = build_audio_command(args, audio)
+        encoder, speaker = spawn_av(command, audio_cmd)
         stderr_tail = bytearray()
         stderr_thread = threading.Thread(target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True)
         stderr_thread.start()
@@ -953,14 +1039,27 @@ def main():
         threading.Thread(target=playhead_loop, daemon=True).start()
         while True:
             try:
-                total = stream.produce(pump, encoder, loop=args.loop)
+                total = stream.produce(pump, encoder, loop=args.loop, speaker=speaker)
                 break
+            except VolumeRequested as vol:
+                args.volume = clamp_volume(vol.gain)
+                apply_encoder_volume(None, args.volume)
+                stop_encoder(speaker, harsh=True)
+                speaker = None
+                if args.volume > 0 and audio:
+                    saved_start = args.start
+                    args.start = speaker_playhead(
+                        saved_start, diagnostics.started, diagnostics.clock(), args.playback_rate,
+                    )
+                    speaker = spawn_speaker(build_audio_command(args, audio))
+                    args.start = saved_start
             except SeekRequested as seek:
                 args.start = seek.start
                 state["start"] = seek.start
                 diagnostics.started = diagnostics.clock()
                 diagnostics.milestones["firstConsumedReceipt"] = None
                 state["playheadAt"] = time.time()
+                stop_encoder(speaker, harsh=True)
                 stop_encoder(encoder, harsh=True)
                 if args.input.startswith(("http://", "https://")):
                     grabbed = pending_http[0]
@@ -973,10 +1072,10 @@ def main():
                     if args.no_audio:
                         audio = None
                     threading.Thread(target=prefetch_http, daemon=True).start()
+                args.volume = CURRENT_VOLUME
                 command = build_encoder_command(args, source, audio, filters)
-                encoder = subprocess.Popen(
-                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-                )
+                audio_cmd = build_audio_command(args, audio)
+                encoder, speaker = spawn_av(command, audio_cmd)
                 stderr_tail = bytearray()
                 stderr_thread = threading.Thread(
                     target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True,

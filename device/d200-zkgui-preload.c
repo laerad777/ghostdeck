@@ -12,11 +12,14 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/un.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*close_fn)(int);
+typedef void *(*mmap_fn)(void *, size_t, int, int, int, off_t);
+typedef int (*munmap_fn)(void *, size_t);
 typedef int (*set_string_fn)(const char *, const char *);
 
 struct color_key {
@@ -34,6 +37,11 @@ static open_fn real_open64_fn;
 static open_fn real___open_2_fn;
 static open_fn real___open64_2_fn;
 static close_fn real_close_fn;
+static mmap_fn real_mmap_fn;
+static munmap_fn real_munmap_fn;
+static int app_fb_fd = -1;
+static unsigned char *fb_shadow;
+static size_t fb_shadow_len;
 static set_string_fn real_set_string_fn;
 /* Private proxy-to-preload handoff, consumed at load time, not a user option. */
 static int usb_diagnostic_fd = -1;
@@ -43,6 +51,88 @@ static int framebuffer_fd = -1;
 static int framebuffer_configured;
 static int framebuffer_teardown;
 static struct color_key original_color_key;
+static unsigned char studio_alpha_applied = 255;
+static int studio_alpha_thread_started;
+static pthread_t studio_alpha_thread;
+static unsigned char *fb_pixels;
+static size_t fb_pixels_len;
+
+#define FB_W 540
+#define FB_H 960
+#define FB_BUFFERS 2
+#define FB_STRIDE (FB_W * 4)
+
+#define FB_SET_GOP_ALPHA 0x40064665UL
+#define STUDIO_ALPHA_PATH "/tmp/d200-studio-alpha"
+
+static int framebuffer_handle_valid(int fd);
+
+static unsigned char read_studio_alpha(void)
+{
+    unsigned char alpha = 255;
+    int n = 0;
+    FILE *alpha_file;
+    alpha_file = fopen(STUDIO_ALPHA_PATH, "r");
+    if (alpha_file != NULL) {
+        if (fscanf(alpha_file, "%d", &n) == 1) {
+            if (n < 0) n = 0;
+            if (n > 255) n = 255;
+            alpha = (unsigned char)n;
+        }
+        fclose(alpha_file);
+    }
+    return alpha;
+}
+
+static void apply_studio_alpha(int control_fd, unsigned char alpha)
+{
+    unsigned char alpha_buf[6];
+    memset(alpha_buf, 0, sizeof(alpha_buf));
+    alpha_buf[0] = 1;
+    alpha_buf[1] = 1;
+    alpha_buf[2] = 255;
+    alpha_buf[3] = 255;
+    if (control_fd >= 0) {
+        (void)ioctl(control_fd, FB_SET_GOP_ALPHA, alpha_buf);
+    }
+    if (fb_pixels != NULL) {
+        unsigned char *src = fb_shadow != NULL ? fb_shadow : fb_pixels;
+        unsigned char *dst = fb_pixels;
+        size_t n = fb_pixels_len / 4;
+        size_t i;
+        if (fb_shadow != NULL && fb_shadow_len / 4 < n)
+            n = fb_shadow_len / 4;
+        for (i = 0; i < n; i++) {
+            unsigned char *in = src + i * 4;
+            unsigned char *out = dst + i * 4;
+            out[0] = in[0];
+            out[1] = in[1];
+            out[2] = in[2];
+            out[3] = (in[0] | in[1] | in[2]) ? alpha : in[3];
+        }
+    }
+}
+
+static void *studio_alpha_loop(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        unsigned char alpha;
+        int fd;
+        usleep(8000);
+        alpha = read_studio_alpha();
+        pthread_mutex_lock(&framebuffer_lock);
+        if (framebuffer_teardown || framebuffer_fd < 0 || !framebuffer_configured) {
+            pthread_mutex_unlock(&framebuffer_lock);
+            return NULL;
+        }
+        fd = framebuffer_fd;
+        pthread_mutex_unlock(&framebuffer_lock);
+        apply_studio_alpha(-1, alpha);
+        studio_alpha_applied = alpha;
+        continue;
+    }
+}
 
 static void resolve_symbols(void)
 {
@@ -50,6 +140,8 @@ static void resolve_symbols(void)
     real_open64_fn = (open_fn)dlsym(RTLD_NEXT, "open64");
     real___open_2_fn = (open_fn)dlsym(RTLD_NEXT, "__open_2");
     real___open64_2_fn = (open_fn)dlsym(RTLD_NEXT, "__open64_2");
+    real_mmap_fn = (mmap_fn)dlsym(RTLD_NEXT, "mmap");
+    real_munmap_fn = (munmap_fn)dlsym(RTLD_NEXT, "munmap");
     real_close_fn = (close_fn)dlsym(RTLD_NEXT, "close");
     real_set_string_fn = (set_string_fn)dlsym(
         RTLD_NEXT, "_ZN16SystemProperties9setStringEPKcS1_");
@@ -122,8 +214,23 @@ static void configure_framebuffer(const char *path, int fd)
             goto out;
         }
         framebuffer_fd = control_fd;
+        fb_pixels_len = (size_t)FB_STRIDE * FB_H * FB_BUFFERS;
+        fb_pixels = real_mmap_fn != NULL
+            ? real_mmap_fn(NULL, fb_pixels_len, PROT_READ | PROT_WRITE, MAP_SHARED, control_fd, 0)
+            : MAP_FAILED;
+        if (fb_pixels == MAP_FAILED)
+            fb_pixels = NULL;
         /* Keep the rollback obligation even if SET reports failure. */
         framebuffer_configured = 1;
+        studio_alpha_applied = read_studio_alpha();
+        apply_studio_alpha(control_fd, studio_alpha_applied);
+        app_fb_fd = fd;
+        if (!studio_alpha_thread_started) {
+            if (pthread_create(&studio_alpha_thread, NULL, studio_alpha_loop, NULL) == 0) {
+                pthread_detach(studio_alpha_thread);
+                studio_alpha_thread_started = 1;
+            }
+        }
         if (ioctl(control_fd, FB_SET_COLOR_KEY, &black) < 0 &&
             ioctl(control_fd, FB_SET_COLOR_KEY, &original_color_key) == 0) {
             framebuffer_configured = 0;
@@ -336,6 +443,7 @@ static int intercept_open(open_fn fallback, const char *path, int flags, mode_t 
     return fd;
 }
 
+
 int open(const char *path, int flags, ...)
 {
     va_list ap;
@@ -476,4 +584,15 @@ int close(int fd)
 __attribute__((destructor)) static void restore_framebuffer_on_exit(void)
 {
     restore_framebuffer();
+    if (fb_pixels != NULL) {
+        if (real_munmap_fn != NULL)
+            real_munmap_fn(fb_pixels, fb_pixels_len);
+        else
+            munmap(fb_pixels, fb_pixels_len);
+        fb_pixels = NULL;
+    }
+    if (fb_shadow != NULL && real_munmap_fn != NULL) {
+        real_munmap_fn(fb_shadow, fb_shadow_len);
+        fb_shadow = NULL;
+    }
 }

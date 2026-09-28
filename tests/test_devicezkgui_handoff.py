@@ -669,6 +669,11 @@ def test_every_name_the_preload_reads_is_a_name_the_proxy_sets():
         "the proxy must clear LD_PRELOAD before setting its own, and must not let the interposer "
         "load into the colour agent's child"
     )
+    assert "studio_alpha_loop" in preload_text
+    assert "0x40064665UL" in preload_text
+    assert "p[3] = alpha" in preload_text or "out[3] =" in preload_text
+    assert "fb_shadow" in preload_text
+    assert 'fopen(STUDIO_ALPHA_PATH, "r")' in preload_text
 
 
 

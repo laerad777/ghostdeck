@@ -779,10 +779,6 @@ class DeviceProxy:
             try:
                 send_all(self.transport_socket, frame, timeout=timeout)
             except (BrokenPipeError, OSError, ValueError) as exc:
-                with self.condition:
-                    self.error = str(exc)
-                    self.closed = True
-                    self.condition.notify_all()
                 try:
                     self.transport_socket.shutdown(socket.SHUT_RDWR)
                 except OSError:
@@ -1402,8 +1398,18 @@ class DeviceProxy:
             except TimeoutError:
                 time.sleep(0.2)
                 continue
-            except (RuntimeError, TimeoutError):
-                return
+            except (RuntimeError, OSError):
+                try:
+                    sock = self.transport_socket
+                    if sock is not None:
+                        sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                child = self.process
+                if child is not None and child.poll() is not None:
+                    self._reap_proxy_process()
+                time.sleep(0.2)
+                continue
             time.sleep(1)
 
     def rotate_transport(self):
@@ -1639,14 +1645,24 @@ class DeviceProxy:
                     request, 1,
                     error='another video session is already opening on this bridge')
             if self.video is not None and self.video.status['cleanup'] != 'proven':
-                return video_response(
-                    request, 1,
-                    error=('the previous video session has not proven it released the deck '
-                           '(cleanup: ' + self.video.status['cleanup'] + '); refusing to open a '
-                           'second session onto a boundary the bridge cannot prove is clean'))
+                if getattr(self.video, 'relaying', False):
+                    return video_response(
+                        request, 1,
+                        error=('the previous video session has not proven it released the deck '
+                               '(cleanup: ' + self.video.status['cleanup'] + '); refusing to open a '
+                               'second session onto a boundary the bridge cannot prove is clean'))
+                stale = self.video
+                self.video = None
+            else:
+                stale = None
             if self.video is not None and self.video.session == session:
                 return video_response(request, 4)
             self.video_opening = True
+        if stale is not None:
+            try:
+                stale.interrupt()
+            except Exception:
+                pass
         owner = None
         attempted = False
 
@@ -1661,7 +1677,10 @@ class DeviceProxy:
                 fps_n=request['fpsNumerator'], fps_d=request['fpsDenominator'],
             )
             if fields['result_code']:
-                return video_response(request, fields['result_code'])
+                extra = {}
+                if fields['result_code'] == 1:
+                    extra['error'] = 'the deck is busy with another video session'
+                return video_response(request, fields['result_code'], **extra)
             owner = VideoSession(self, request, fields, deadline)
             with self.condition:
                 self.video = owner
@@ -1924,6 +1943,7 @@ class VideoSession:
         self.status = dict(state=2, rendererReady=False, framesReceived=0,
                            framesConsumed=0, eosTotal=None, terminalCode=0,
                            cleanup='pending', cancelPhase='none')
+        self.relaying = False
 
     @classmethod
     def unresolved(cls, proxy, request, deadline):
@@ -2343,6 +2363,7 @@ class VideoSession:
 
     def relay(self, local):
         terminal = False
+        self.relaying = True
         try:
             with self.condition:
                 self.local_socket = local
@@ -2393,6 +2414,7 @@ class VideoSession:
                 if self.status['cleanup'] != 'proven':
                     self.status.update(cleanup='unproven')
         finally:
+            self.relaying = False
             self.interrupt()
             if self.native_socket is not None:
                 with self.failure_context('cleanup'):

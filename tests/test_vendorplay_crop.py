@@ -116,25 +116,69 @@ def test_take_seek_request_reads_and_clears_the_file(tmp_path):
     assert play.take_seek_request(path) == 33.5
     assert not path.exists()
     assert play.take_seek_request(path) is None
-def test_host_audio_is_in_the_same_realtime_ffmpeg():
+
+
+def test_take_volume_request_reads_and_clears_the_file(tmp_path):
+    play = _play()
+    path = tmp_path / "volume"
+    path.write_text("0.25\n", encoding="utf-8")
+    assert play.take_volume_request(path) == 0.25
+    assert not path.exists()
+    assert play.take_volume_request(path) is None
+    overlay = tmp_path / "overlay"
+    overlay.write_text("0.4000\n", encoding="utf-8")
+    assert play.take_overlay_request(overlay) == 0.4
+    assert not overlay.exists()
+    assert play.clamp_volume(2) == 1.0
+    assert play.clamp_volume(-1) == 0.0
+def test_host_audio_is_a_separate_realtime_ffmpeg():
     play = _play()
     args = type("Args", (), {"loop": False, "start": 12.5, "duration": 0, "quality": 12})()
     command = play.build_encoder_command(
         args, "https://v.example/video", "https://v.example/audio", "fps=30,scale=960:540",
     )
-    assert command.count("-i") == 2
-    assert command.count("-re") == 2
-    assert "audiotoolbox" in command
-    joined = " ".join(command)
+    assert command.count("-i") == 1
+    assert "-re" in command
+    assert "-an" in command
+    assert "audiotoolbox" not in command
+    audio_cmd = play.build_audio_command(args, "https://v.example/audio")
+    assert "-re" in audio_cmd
+    assert "audiotoolbox" in audio_cmd
+    assert "image2pipe" not in audio_cmd
+    joined = " ".join(audio_cmd)
     assert "async=1" not in joined
-    assert "-max_interleave_delta" in command
-    assert "aresample=48000" in command
-    assert "-an" not in command
-    assert "12.5" in command
+    assert "aresample=48000" in joined
+    assert "asetnsamples=n=8192" in joined
+    assert "volume@vol=" in joined
+    quiet = type("Args", (), {"loop": False, "start": 0, "duration": 0, "quality": 12, "volume": 0.25})()
+    quiet_cmd = play.build_audio_command(quiet, "/tmp/clip.mp4")
+    assert "volume@vol=0.2500" in " ".join(quiet_cmd)
     silent = play.build_encoder_command(args, "/tmp/clip.mp4", None, "fps=30,scale=960:540")
     assert "-an" in silent
     assert "audiotoolbox" not in silent
     assert "-re" in silent
+
+def test_live_volume_restarts_the_speaker_not_sendcmd():
+    play = _play()
+    text = PLAY.read_text(encoding="utf-8")
+    assert "raise VolumeRequested(volume)" in text
+    assert "c vol volume" not in text
+    assert play.speaker_playhead(10, 1_000_000_000, 3_000_000_000, 1.0) == 12.0
+    assert play.speaker_playhead(0, 5, 1, 1.0) == 0.0
+    args = type("Args", (), {"loop": False, "start": 0, "duration": 0, "quality": 12, "volume": 0.0})()
+    silent = play.build_audio_command(args, "/tmp/clip.mp4")
+    assert "volume@vol=0.0000" in " ".join(silent)
+    assert play.spawn_speaker(None) is None
+
+def test_frame_pump_does_not_skip_queued_jpegs():
+    play = _play()
+    text = PLAY.read_text(encoding="utf-8")
+    assert "Keep only the newest frames" not in text
+    assert "max_frames=8" in text
+    play.probe_source_fps = lambda _source: Fraction(60, 1)
+    assert play.parse_fps("source", "clip") == Fraction(30, 1)
+    play.probe_source_fps = lambda _source: Fraction(24, 1)
+    assert play.parse_fps("source", "clip") == Fraction(24, 1)
 def test_http_loop_restarts_instead_of_stream_loop():
     play = _play()
     args = type("Args", (), {"loop": True, "start": 0, "duration": 0, "quality": 12})()
@@ -142,9 +186,11 @@ def test_http_loop_restarts_instead_of_stream_loop():
         args, "https://v.example/video", "https://v.example/audio", "fps=30,scale=960:540",
     )
     assert "-stream_loop" not in command
-    assert "-shortest" in command
-    assert "audiotoolbox" in command
+    assert "audiotoolbox" not in command
+    assert "-an" in command
+    audio_cmd = play.build_audio_command(args, "https://v.example/audio")
+    assert "audiotoolbox" in audio_cmd
     local = play.build_encoder_command(args, "/tmp/clip.mp4", "/tmp/clip.mp4", "fps=30,scale=960:540")
     assert "-stream_loop" not in local
     assert local.count("-i") == 1
-    assert "audiotoolbox" in local
+    assert "-an" in local

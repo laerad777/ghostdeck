@@ -130,6 +130,7 @@ def disconnect_after_streaming(proxy):
     owner.observed_failure_reason = wire.DISCONNECTED
     with owner.condition:
         owner.status.update(state=wire.STREAMING, cleanup='unproven')
+    owner.relaying = True
     return owner
 
 
@@ -309,6 +310,18 @@ def test_a_proven_predecessor_still_admits_the_next_session(tmp_path):
     answer = proxy.video_open(successor)
 
     assert answer['accepted'] is True, "a proven predecessor must not block the next session"
+    assert proxy.video is not first
+    assert proxy.video.session == successor['session']
+
+
+def test_an_unproven_idle_predecessor_admits_the_next_session(tmp_path):
+    """A dead host player leaves cleanup unproven with no relay. The next play must start."""
+    proxy = make_proxy(tmp_path)
+    first = disconnect_after_streaming(proxy)
+    first.relaying = False
+    successor = open_request(2)
+    answer = proxy.video_open(successor)
+    assert answer['accepted'] is True
     assert proxy.video is not first
     assert proxy.video.session == successor['session']
 

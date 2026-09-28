@@ -7,6 +7,7 @@ patch stay on this module -- the split files read them from here at call time.
 from __future__ import annotations
 
 import os
+import math
 import json
 import shutil
 import subprocess
@@ -68,6 +69,8 @@ from ghostdeck.playwait import (
 # a successful start (A-103). The window is a grace period, not a health check: it is long enough to
 # catch an interpreter that starts and exits, and short enough to stay invisible to the user.
 _PLAY_GRACE = 1.0
+_OPEN_WAIT = 20.0
+_CLAIM_WAIT = 0.6
 
 _TOOL_HINTS = {
     "ffmpeg": "brew install ffmpeg",
@@ -115,6 +118,16 @@ def abandon_host_session(path: Path | None = None) -> None:
         return
 
 
+def _host_claim(pid: int):
+    try:
+        data = json.loads(_HOST_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(data, dict) or data.get("pid") != pid:
+        return None
+    return data
+
+
 def _host_session_active() -> bool:
     try:
         data = json.loads(_HOST_STATE.read_text(encoding="utf-8"))
@@ -138,7 +151,7 @@ def play_crop(crop: str) -> str:
             return crop
     return "auto"
 
-def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = True, crop: str = "auto") -> None:
+def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = True, crop: str = "auto", volume: float = 1.0) -> None:
     _require_tools(source)
     adb.require_adb()
     # Before any device work: an unusable SOURCE must fail cheaply and name the user's own input,
@@ -208,6 +221,17 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         argv.append("--loop")
     if start > 0:
         argv.extend(["--start", f"{start:.3f}"])
+    try:
+        gain = float(volume)
+    except (TypeError, ValueError):
+        gain = 1.0
+    if not math.isfinite(gain):
+        gain = 1.0
+    if gain < 0:
+        gain = 0.0
+    if gain > 1:
+        gain = 1.0
+    argv.extend(["--volume", f"{gain:.4f}"])
     proc = subprocess.Popen(
         argv,
         start_new_session=True,
@@ -224,6 +248,28 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         raise RuntimeError(
             f"player exited with status {returncode} before it started; nothing is playing"
         )
+    claim_deadline = time.monotonic() + _CLAIM_WAIT
+    open_deadline = time.monotonic() + _OPEN_WAIT
+    saw_self = False
+    while time.monotonic() < open_deadline:
+        returncode = proc.poll()
+        if returncode is not None:
+            raise RuntimeError(
+                f"player exited with status {returncode} before it started; nothing is playing"
+            )
+        host = _host_claim(proc.pid)
+        if host is not None:
+            saw_self = True
+            video = host.get("video") if isinstance(host.get("video"), dict) else {}
+            if video.get("epoch") == 1 and video.get("capability"):
+                break
+            if str(host.get("phase") or "") == "terminal":
+                raise RuntimeError("video OPEN failed; nothing is playing")
+        elif saw_self:
+            raise RuntimeError("video OPEN failed; nothing is playing")
+        elif time.monotonic() >= claim_deadline:
+            break
+        time.sleep(0.1)
     data = gdstate.update(play_pid=proc.pid)
     if data.get("play_pid") != proc.pid:
         # A-104: fail loudly rather than silently reporting a session that was never recorded.
