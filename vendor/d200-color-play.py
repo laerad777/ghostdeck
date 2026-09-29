@@ -47,6 +47,35 @@ class SeekRequested(Exception):
         super().__init__(start)
         self.start = float(start)
 
+class SourceEndedEarly(Exception):
+    """An HTTP source stopped before the source's own end: resume from the playhead, not from 0."""
+
+
+# An encoder whose playhead stops further than this short of the known duration did not reach the
+# end: it lost the origin. A clean end on a long HTTP source lands within a frame or two of it.
+EARLY_END_MARGIN = 5.0
+MAX_RESUMES_PER_10_MIN = 3
+
+
+def ended_early(source, duration, playhead):
+    """True when an HTTP encoder exited cleanly well before the source's known end.
+
+    ffmpeg exits 0 when its reconnect budget runs out, so an origin that went away mid-stream looks
+    exactly like the end of the video. A googlevideo URL is signed for 6 hours, and a long video also
+    rides out more network blips, so without this a 2h+ stream could silently stop (or, with loop on,
+    jump back to 0) partway through. Files and unknown durations are never treated as early.
+    """
+    if not str(source).startswith(("http://", "https://")):
+        return False
+    try:
+        duration, playhead = float(duration), float(playhead)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(duration) and math.isfinite(playhead)) or duration <= 0:
+        return False
+    return playhead < duration - EARLY_END_MARGIN
+
+
 class VolumeRequested(Exception):
     def __init__(self, gain):
         super().__init__(gain)
@@ -647,8 +676,12 @@ class VideoStream:
         while not self.state.ready:
             self.wait(deadline)
 
-    def produce(self, source, encoder, loop=False, speaker=None):
-        """Never request a fill-sized buffered read; pause the framer at each JPEG."""
+    def produce(self, source, encoder, loop=False, speaker=None, early_end=None):
+        """Never request a fill-sized buffered read; pause the framer at each JPEG.
+
+        `early_end()` is asked once the encoder exits cleanly: True means it lost an HTTP origin
+        before the source's end, so the caller resumes from the playhead instead of finishing.
+        """
         pump = source
         while True:
             check_cancel(self.cancel)
@@ -684,6 +717,8 @@ class VideoStream:
                         self.receive_available()
                 if encoder.returncode:
                     raise RuntimeError("ffmpeg encoder failed")
+                if early_end is not None and early_end():
+                    raise SourceEndedEarly()
                 if loop:
                     raise SeekRequested(0.0)
                 self.send(wire.EOS, struct.pack('>Q', self.state.received), self.progress_deadline)
@@ -871,8 +906,12 @@ def _input_flags(command, url, args, realtime=False):
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_on_network_error", "1",
-            "-reconnect_delay_max", "2",
         ])
+    if str(url).startswith(("http://", "https://")):
+        # The default 2s cap gave up on an origin that stayed away longer: measured, a 20s outage
+        # decoded 18s of a 60s stream and ffmpeg still exited 0. 30s per attempt and a 120s total
+        # budget ride out a Wi-Fi roam; an outage longer than that resumes via `ended_early`.
+        command.extend(["-reconnect_delay_max", "30", "-reconnect_delay_total_max", "120"])
     if realtime:
         command.append("-re")
     if args.start:
@@ -1056,10 +1095,57 @@ def main():
                 cancel.wait(0.2)
 
         threading.Thread(target=playhead_loop, daemon=True).start()
+
+        def playhead():
+            return speaker_playhead(args.start, diagnostics.started, diagnostics.clock(), args.playback_rate)
+
+        resumes = []
+
+        def early_end():
+            if not ended_early(args.input, state.get("duration"), playhead()):
+                return False
+            # A source that keeps dropping at once (a revoked video, no network at all) must end the
+            # session rather than spin: at most 3 resumes in any 10 minutes.
+            now = time.monotonic()
+            resumes[:] = [at for at in resumes if now - at < 600]
+            if len(resumes) >= MAX_RESUMES_PER_10_MIN:
+                return False
+            resumes.append(now)
+            return True
+
         while True:
             try:
-                total = stream.produce(pump, encoder, loop=args.loop, speaker=speaker)
+                total = stream.produce(pump, encoder, loop=args.loop, speaker=speaker, early_end=early_end)
                 break
+            except SourceEndedEarly:
+                # Same recovery as a seek to where the picture stopped, and the seek path already
+                # re-resolves yt-dlp, so an expired signed URL is replaced as well.
+                resume = playhead()
+                emit_diagnostic(sys.stderr, dict(event="hostSourceResumed", atSeconds=round(resume, 3),
+                                                 durationSeconds=state.get("duration")))
+                pending_http[0] = None
+                seek = SeekRequested(resume)
+                args.start = seek.start
+                state["start"] = seek.start
+                diagnostics.started = diagnostics.clock()
+                diagnostics.milestones["firstConsumedReceipt"] = None
+                state["playheadAt"] = time.time()
+                stop_encoder(speaker, harsh=True)
+                stop_encoder(encoder, harsh=True)
+                video, audio = resolve_media_urls(args.input)
+                source = video
+                if args.no_audio:
+                    audio = None
+                args.volume = CURRENT_VOLUME
+                command = build_encoder_command(args, source, audio, filters)
+                encoder, speaker = spawn_av(command, build_audio_command(args, audio))
+                stderr_tail = bytearray()
+                stderr_thread = threading.Thread(
+                    target=drain_bounded, args=(encoder.stderr, stderr_tail), daemon=True,
+                )
+                stderr_thread.start()
+                pump = FramePump(encoder.stdout)
+                publish_diagnostics()
             except VolumeRequested as vol:
                 args.volume = clamp_volume(vol.gain)
                 apply_encoder_volume(None, args.volume)

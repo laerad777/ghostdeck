@@ -11,6 +11,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAY = ROOT / "vendor" / "d200-color-play.py"
+# One test imports the host package; without this it passed only when another file had added it first.
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def _play():
@@ -175,6 +177,72 @@ class _Speaker:
 
     def written(self):
         return self.stdin.getvalue().decode()
+
+
+def test_an_http_source_that_stops_early_is_resumed_not_finished():
+    """ffmpeg exits 0 when it loses the origin, so a long stream's drop looked like its end."""
+    play = _play()
+    url = "https://rr1---sn-x.googlevideo.com/videoplayback?expire=1"
+    assert play.ended_early(url, 7200.0, 3600.0) is True, "stopped at 1h of a 2h video"
+    assert play.ended_early(url, 7200.0, 7199.0) is False, "a clean end lands within a frame or two"
+    assert play.ended_early(url, 7200.0, 7200.0 - play.EARLY_END_MARGIN) is False
+    assert play.ended_early(url, 0.0, 30.0) is False, "unknown duration is never early"
+    assert play.ended_early(url, None, 30.0) is False
+    assert play.ended_early(url, float("nan"), 30.0) is False
+    assert play.ended_early("/tmp/clip.mp4", 7200.0, 30.0) is False, "files do not lose an origin"
+
+
+def test_produce_resumes_on_an_early_clean_exit():
+    """The encoder exited 0 before the end: `produce` raises SourceEndedEarly instead of EOS/loop."""
+    import queue
+    import threading
+
+    play = _play()
+    stream = play.VideoStream.__new__(play.VideoStream)
+    stream.cancel = threading.Event()
+    stream.state = type("S", (), {"received": 0, "consumed": 0})()
+    stream.progress_deadline = float("inf")
+    stream.client = None
+
+    class Pump:
+        def get(self, timeout):
+            raise queue.Empty
+
+    class Done:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    play.take_seek_request = lambda: None
+    play.take_volume_request = lambda: None
+    play.take_overlay_request = lambda: None
+    try:
+        stream.produce(Pump(), Done(), loop=True, early_end=lambda: True)
+    except play.SourceEndedEarly:
+        pass
+    else:
+        raise AssertionError("an early clean exit was treated as the end")
+    try:
+        stream.produce(Pump(), Done(), loop=True, early_end=lambda: False)
+    except play.SeekRequested as seek:
+        assert seek.start == 0.0, "a real end with loop on still restarts from 0"
+    else:
+        raise AssertionError("loop did not restart")
+
+
+def test_http_inputs_ride_out_a_long_origin_outage():
+    """`-reconnect_delay_max 2` gave up on a 20s outage and decoded 18s of a 60s stream (exit 0)."""
+    play = _play()
+    args = type("Args", (), {"loop": False, "start": 0, "duration": 0, "quality": 12, "volume": 1.0})()
+    for command in (play.build_audio_command(args, "https://v.example/a"),
+                    play.build_encoder_command(args, "https://v.example/v", None, "fps=30")):
+        joined = " ".join(command)
+        assert "-reconnect_delay_max 30" in joined, joined
+        assert "-reconnect_delay_total_max 120" in joined, joined
+        assert "-reconnect_delay_max 2 " not in joined + " "
+    local = " ".join(play.build_audio_command(args, "/tmp/clip.mp4"))
+    assert "reconnect" not in local
 
 
 def test_live_volume_changes_the_running_speaker_in_place():
