@@ -584,6 +584,7 @@ _FAILURE_NOTES = (
     ("did not enumerate through adb", "덱이 ADB로 전환되지 않았습니다. 연결을 누르십시오."),
     ("no adb device reachable", "덱이 보이지 않습니다. 케이블을 꽂고 연결을 누르십시오."),
     (studio.STUDIO_MISSING.lower(), "Ulanzi Studio가 없습니다. 브리지를 누르면 키 없이 재생됩니다."),
+    ("back in hid mode", "브리지가 덱을 놓쳤습니다. 스튜디오를 누르면 새로 띄웁니다."),
     (studio.BRIDGE_DOWN.lower(), "브리지가 꺼져 있습니다. 스튜디오를 누르십시오."),
     (f"no live {studio.BRIDGE.name} of ours", "다른 프로세스가 브리지 소켓을 잡고 있습니다."),
     ("bridge socket did not come up", "브리지를 띄우지 못했습니다. 연결을 누른 다음 다시 시도하십시오."),

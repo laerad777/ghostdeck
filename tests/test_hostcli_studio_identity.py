@@ -242,33 +242,93 @@ def test_launch_refuses_a_listener_that_is_not_our_bridge(scratch, monkeypatch):
         listener.close()
 
 
-def test_bridge_owner_live_requires_a_live_record_with_our_bridge_argv(tmp_path, monkeypatch):
-    """Ownership needs a live pid whose argv names our bridge script — a recycled pid cannot pass."""
+_LISTENER = """
+import socket, sys, time
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+listener.listen(64)
+print("listening", flush=True)
+time.sleep(60)
+"""
+
+
+def _listener_process(path, *extra_argv):
+    """A separate process that binds `path`; `extra_argv` is what `ps` then shows after it."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", _LISTENER, str(path), *extra_argv],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout.readline().strip() == "listening"
+    return child
+
+
+def test_bridge_ownership_is_the_socket_listener_not_a_tmp_record(scratch, monkeypatch):
+    """Ownership is the kernel's socket peer and its argv; no file on disk can grant or revoke it.
+
+    The /tmp record was the old source. macOS `tmp_cleaner` deleted it under a bridge that had run
+    for 10 days, and our own bridge was then refused as a stranger on our own socket.
+    """
     from ghostdeck import studio
 
-    state = tmp_path / "state.pid"
-    monkeypatch.setattr(studio, "BRIDGE_STATE", state)
+    sock = scratch / "b.sock"
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    monkeypatch.setattr(studio, "BRIDGE_STATE", scratch / "absent-state.pid")
+    assert studio._owned_bridge_pid() is None  # nothing listening
 
-    assert studio._bridge_owner_live() is False  # nothing recorded
-
-    for junk in ("not json", "[]", '{"pid": true}', '{"pid": 0}', '{"pid": -1}', '{"pid": "5"}'):
-        state.write_text(junk, encoding="utf-8")
-        assert studio._bridge_owner_live() is False, junk
-
-    # A pid that is not running, however plausible the record looks.
-    state.write_text('{"pid": 999999}', encoding="utf-8")
-    assert studio._bridge_owner_live() is False
-
-    # Our own test process IS alive but its argv is not the bridge script, so it is not the owner.
-    state.write_text(f'{{"pid": {os.getpid()}}}', encoding="utf-8")
-    assert studio._bridge_owner_live() is False
-
-    # Now a live process whose argv really is the bridge script: the owner.
-    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", str(studio.BRIDGE)])
+    ours = _listener_process(sock, str(studio.BRIDGE))
     try:
-        time.sleep(0.4)
-        state.write_text(f'{{"pid": {owner.pid}}}', encoding="utf-8")
+        assert studio._socket_owner_pid() == ours.pid
+        # No record exists, and the bridge is still ours: the record was never the authority.
+        assert not studio.BRIDGE_STATE.exists()
+        assert studio._owned_bridge_pid() == ours.pid
         assert studio._bridge_owner_live() is True
+        # A record naming some other process cannot move ownership either.
+        studio.BRIDGE_STATE.write_text(f'{{"pid": {os.getpid()}}}', encoding="utf-8")
+        assert studio._owned_bridge_pid() == ours.pid
     finally:
-        owner.kill()
-        owner.wait()
+        ours.kill()
+        ours.wait()
+    sock.unlink()
+
+    stranger = _listener_process(sock)
+    try:
+        assert studio._socket_owner_pid() == stranger.pid
+        assert studio._bridge_owner_live() is False, "a listener whose argv is not our bridge"
+        refusal = str(studio._stranger_refusal("use"))
+        assert f"pid {stranger.pid}" in refusal, refusal
+        assert "\n" not in refusal
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+def test_a_bridge_that_lost_the_deck_is_replaced_not_reused(scratch, monkeypatch):
+    """Our bridge on the socket with the deck back in HID is dead inside: it is stopped, and only it."""
+    from ghostdeck import studio
+
+    stopped = []
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    monkeypatch.setattr(studio, "_stop_our_bridge", lambda: stopped.append(1))
+
+    monkeypatch.setattr(studio.usb, "detect", lambda: {"serial": "S", "mode": "hid"})
+    studio._replace_lost_bridge()
+    assert stopped == [1]
+
+    stopped.clear()
+    for healthy in ({"serial": "S", "mode": "adb"}, {"serial": None, "mode": "none"}, None):
+        monkeypatch.setattr(studio.usb, "detect", lambda healthy=healthy: healthy)
+        studio._replace_lost_bridge()
+    assert stopped == [], "only a deck back in HID proves the bridge lost it"
+
+    def broken():
+        raise OSError("no USB backend")
+
+    monkeypatch.setattr(studio.usb, "detect", broken)
+    studio._replace_lost_bridge()
+    assert stopped == [], "an unanswerable USB layer is not evidence"
+
+    monkeypatch.setattr(studio.usb, "detect", lambda: {"serial": "S", "mode": "hid"})
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: False)
+    studio._replace_lost_bridge()
+    assert stopped == [], "a stranger's listener is never stopped"

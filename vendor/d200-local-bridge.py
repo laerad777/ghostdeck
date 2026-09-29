@@ -743,6 +743,12 @@ class DeviceProxy:
     def _read_frame(self, deadline=None):
         stream = self.reader_stream
         generation = self.connection_generation
+        if stream is None:
+            # A failed revive leaves no stream behind. That is a closed stream, and saying so keeps
+            # the reader in its revive loop; `stream.read` raised AttributeError instead, which no
+            # handler catches, so the reader thread died and the bridge went on accepting clients
+            # with no device behind it until someone killed it (observed: 10 days, pid 4799).
+            raise EOFError('device proxy stream closed')
         header = self._read_exact(stream, 16, deadline)
         if header[:4] != b'D2PX' or header[4] != 1:
             raise ProtocolError('invalid device frame header')

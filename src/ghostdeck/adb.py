@@ -151,24 +151,6 @@ def restart_server(*, timeout: float = _SERVER_TIMEOUT) -> None:
     return
 
 
-def forward_list(*, timeout: float = 5.0) -> str:
-    """Host adb forwards. Does not send a command to the deck."""
-    binary = adb_bin()
-    try:
-        result = subprocess.run(
-            [binary, "forward", "--list"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if result.returncode != 0:
-        return ""
-    return result.stdout or ""
-
-
 def serial_from_devices() -> str | None:
     result = run(["devices", "-l"], capture_output=True, text=True, timeout=30)
     for line in (result.stdout or "").splitlines():

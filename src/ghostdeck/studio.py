@@ -8,6 +8,7 @@ import plistlib
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -18,8 +19,10 @@ from ghostdeck import HID_PID, HID_VID, adb, devicebuild, tree, usb
 ORIGINAL = Path("/Applications/Ulanzi Studio.app")
 COPY = Path.home() / "Applications" / "Ulanzi Studio ADB.app"
 SOCKET = Path("/tmp/d200-adb-bridge.sock")
-# The bridge's own state file. `_spawn_bridge` has always passed this path and, until A-133, nothing
-# ever read it back; it is the only on-disk record of which process is serving SOCKET.
+# The bridge's own record (pid + stop endpoint), written by `--state-file`. Ownership is NOT read
+# from it: macOS `tmp_cleaner` deletes /tmp files untouched for 3 days, and a bridge that had run
+# for 10 days lost its record and was refused as a stranger on our own socket. `_owned_bridge_pid`
+# asks the kernel who holds SOCKET instead.
 BRIDGE_STATE = Path("/tmp/d200-local-bridge.pid")
 # Documented in README.md: `ghostdeck studio` appends the bridge's stdout/stderr here.
 BRIDGE_LOG = Path("/tmp/d200-local-bridge.log")
@@ -195,20 +198,6 @@ def _quit_official(*, timeout: float = 15.0) -> None:
     raise RuntimeError("official Studio did not stop")
 
 
-def _device_proxy_live() -> bool:
-    """True when the host adb server has a tcp forward — the device proxy, not just the unix socket."""
-    return bool(adb.forward_list().strip())
-
-
-def _wait_device_proxy(*, timeout: float = 25.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _socket_live() and _bridge_owner_live() and _device_proxy_live():
-            return
-        time.sleep(0.3)
-    raise RuntimeError(BRIDGE_DOWN + " (device proxy has no adb forward)")
-
-
 def _open_copy() -> None:
     subprocess.run(["/usr/bin/open", str(COPY)], check=True, timeout=15)
 
@@ -232,11 +221,9 @@ def bridge_up() -> None:
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         raise _undeterminable_endpoint(reason)
     if endpoint == _ENDPOINT_LIVE and not _bridge_owner_live():
-        raise RuntimeError(
-            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to use "
-            f"an unidentified bridge. Stop that process, or remove {SOCKET} if it is a leftover, and "
-            f"retry"
-        )
+        raise _stranger_refusal("use")
+    if endpoint == _ENDPOINT_LIVE:
+        _replace_lost_bridge()
     _ensure_bridge()
 
 
@@ -248,14 +235,17 @@ def launch() -> None:
         raise _undeterminable_endpoint(reason)
     if endpoint == _ENDPOINT_LIVE and not _bridge_owner_live():
         # A-133: something is listening on our predictable socket path, and it is not the bridge we
-        # spawn (no live record of it in BRIDGE_STATE). Opening Studio here would point the shim at a
+        # spawn (the kernel names a listener that is not our bridge script). Opening Studio here would point the shim at a
         # stranger's socket and silently report success. Refuse instead — and note that the A-114
         # property is untouched: nothing is unlinked, and no second bridge is spawned over it.
-        raise RuntimeError(
-            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to open "
-            f"Studio against an unidentified bridge. Stop that process, or remove {SOCKET} if it is "
-            f"a leftover, and retry"
-        )
+        raise _stranger_refusal("open Studio against")
+    if endpoint == _ENDPOINT_LIVE:
+        # Ours, but possibly dead inside: replace it rather than open Studio against it. Re-probe so
+        # a replaced bridge takes the `dead` branch below and the copy is relaunched onto the new one.
+        _replace_lost_bridge()
+        endpoint, reason = _socket_state()
+        if endpoint == _ENDPOINT_UNDETERMINABLE:
+            raise _undeterminable_endpoint(reason)
     if endpoint == _ENDPOINT_DEAD or (copy_exists() and _shim_is_stale()):
         # Studio holds HID interface 0 while it runs, so the HID-to-ADB switch needs
         # the copy stopped first; a restarted bridge also leaves an already running
@@ -422,35 +412,103 @@ def _pid_argv(pid: int) -> str:
     return ""
 
 
-def _bridge_owner_live() -> bool:
-    """True only when OUR bridge is alive and therefore serving SOCKET (A-133).
+def _peer_pid(connection) -> int | None:
+    """The pid on the far end of a connected AF_UNIX socket, or None when the kernel will not say.
+
+    The same two reads as `_peer_pid` in vendor/d200-local-bridge.py (that process runs with only
+    `vendor/` on its path, so the two cannot share code): Darwin `LOCAL_PEERPID` at `SOL_LOCAL`, whose
+    numbers live in `sys/un.h` rather than Python's `socket`, and Linux `SO_PEERCRED`.
+    """
+    if sys.platform == "darwin":
+        sol_local, local_peerpid = 0, 0x002
+        try:
+            raw = connection.getsockopt(sol_local, local_peerpid, struct.calcsize("i"))
+            pid = struct.unpack("i", raw)[0]
+        except (OSError, struct.error):
+            return None
+        return pid if pid > 0 else None
+    option = getattr(socket, "SO_PEERCRED", None)
+    if type(option) is not int:
+        return None
+    try:
+        raw = connection.getsockopt(socket.SOL_SOCKET, option, struct.calcsize("3i"))
+        pid = struct.unpack("3i", raw)[0]
+    except (OSError, struct.error):
+        return None
+    return pid if pid > 0 else None
+
+
+def _socket_owner_pid() -> int | None:
+    """The pid of the process listening on SOCKET, as the kernel reports it, or None."""
+    probe = None
+    try:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(_PROBE_TIMEOUT)
+        probe.connect(str(SOCKET))
+        return _peer_pid(probe)
+    except OSError:
+        return None
+    finally:
+        if probe is not None:
+            probe.close()
+
+
+def _owned_bridge_pid() -> int | None:
+    """The pid of the bridge serving SOCKET when that bridge is ours, else None (A-133).
 
     `_socket_state()` cannot tell our bridge from any other listener: a successful `connect()` is all
     it has, and that verdict is deliberately ownership-agnostic because it exists to answer "may this
-    path be unlinked?" (A-114), not "who owns it?". Every listener therefore looked like our bridge,
-    so `launch()` opened Studio against a stranger.
+    path be unlinked?" (A-114), not "who owns it?".
 
-    Ownership comes from the bridge's own `--state-file`, which `_spawn_bridge` has always passed and
-    nothing read until now: it records the bridge's pid. The pid must be alive AND its argv must name
-    our bridge script — the same argv discipline `play._player_identity` and `_copy_pids` use, so a
-    recycled pid cannot satisfy it, and a live bridge that refused to bind (it exits with
-    `bridge_socket_in_use` when another listener holds the path) is not live at all.
+    Ownership is the process the kernel names as the socket's listener, and its argv must name this
+    checkout's bridge script -- the same argv discipline `play._player_identity` and `_copy_pids`
+    use, so a recycled pid cannot satisfy it. Nothing on disk is consulted. The previous source was
+    the bridge's `/tmp` state record, and a record is only a claim: it can be deleted under a live
+    bridge (`tmp_cleaner`, observed) or name a pid that does not hold the socket at all.
+    """
+    pid = _socket_owner_pid()
+    if pid is None:
+        return None
+    argv = _pid_argv(pid)
+    return pid if argv and str(BRIDGE) in argv else None
 
-    Residual, stated rather than hidden: a bridge started by hand WITHOUT `--state-file` writes no
-    record, so this returns False and `launch()` refuses. That is the safe direction (refusing beats
-    opening Studio against an unidentified socket) and the message says what to do about it.
+
+def _bridge_owner_live() -> bool:
+    """True only when the listener on SOCKET is a bridge of ours (see `_owned_bridge_pid`)."""
+    return _owned_bridge_pid() is not None
+
+
+def _bridge_lost_deck() -> bool:
+    """True when the deck is back in HID mode although a bridge of ours holds SOCKET.
+
+    Call only once the listener is known to be ours. A running bridge keeps the deck in ADB (its
+    preload suppresses zkgui's switch back to HID), so a deck that enumerates as HID under it means
+    the bridge lost the deck: its revive failed and it kept accepting clients with nothing behind
+    them (observed: pid 4799 for 10 days, `adb devices` empty, every play refused). An absent deck or
+    a USB backend that cannot answer is not this case; the checks after this one report those.
     """
     try:
-        record = json.loads(BRIDGE_STATE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        found = usb.detect()
+    except Exception:
         return False
-    if not isinstance(record, dict):
-        return False
-    pid = record.get("pid")
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    argv = _pid_argv(pid)
-    return bool(argv) and str(BRIDGE) in argv
+    return (found or {}).get("mode") == "hid"
+
+
+def _replace_lost_bridge() -> None:
+    """Stop our bridge when it has lost the deck, so the caller brings a working one up."""
+    if _bridge_owner_live() and _bridge_lost_deck():
+        print(f"{BRIDGE.name} lost the deck (it is back in HID mode); replacing it", file=sys.stderr)
+        _stop_our_bridge()
+
+
+def _stranger_refusal(action: str) -> RuntimeError:
+    """The one-line refusal for a live listener that is not our bridge, naming its pid if known."""
+    pid = _socket_owner_pid()
+    holder = f"a listener (pid {pid})" if pid is not None else "a listener"
+    return RuntimeError(
+        f"{holder} holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to {action} "
+        f"an unidentified bridge. Stop that process, or remove {SOCKET} if it is a leftover, and retry"
+    )
 
 
 def _socket_state() -> tuple[str, str]:
@@ -625,23 +683,6 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
         child.wait(timeout=timeout)
 
 
-def _owned_bridge_pid() -> int | None:
-    """The pid of a live bridge we spawned, or None. Never a stranger."""
-    try:
-        record = json.loads(BRIDGE_STATE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(record, dict):
-        return None
-    pid = record.get("pid")
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return None
-    argv = _pid_argv(pid)
-    if argv and str(BRIDGE) in argv:
-        return pid
-    return None
-
-
 def _stop_our_bridge(*, timeout: float = 8.0) -> None:
     """SIGTERM only a live bridge we own. A stranger's listener is left alone."""
     pid = _owned_bridge_pid()
@@ -696,13 +737,12 @@ def require_bridge_or_start_it() -> None:
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         raise _undeterminable_endpoint(reason)
     if endpoint == _ENDPOINT_LIVE:
-        if _bridge_owner_live():
+        if not _bridge_owner_live():
+            raise _stranger_refusal("use")
+        if not _bridge_lost_deck():
             return
-        raise RuntimeError(
-            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to use "
-            f"an unidentified bridge. Stop that process, or remove {SOCKET} if it is a leftover, and "
-            f"retry"
-        )
+        # Ours but it lost the deck. On this host `play` owns the bridge, so it replaces it.
+        _stop_our_bridge()
     # No Studio and no bridge: this is the one path where `play` owns the process it starts.
     bridge_up()
 
@@ -731,12 +771,16 @@ def require_bridge() -> None:
     """
     endpoint, probe_reason = _socket_state()
     if endpoint == _ENDPOINT_LIVE:
-        if _bridge_owner_live():
+        if not _bridge_owner_live():
+            raise _stranger_refusal("start the player against")
+        if not _bridge_lost_deck():
             return
+        # `play` must not start or stop a bridge on a Studio host, so it says the bridge is down. The
+        # phrase is `BRIDGE_DOWN`, which is what makes the window run `studio`, and `launch()`
+        # replaces the lost bridge.
         raise RuntimeError(
-            f"a listener holds {SOCKET} but no live {BRIDGE.name} of ours owns it; refusing to start "
-            f"the player against an unidentified bridge. Stop that process, or remove {SOCKET} if it "
-            f"is a leftover, and retry"
+            f"{BRIDGE_DOWN} for the deck (it is back in HID mode): run `ghostdeck studio` to replace "
+            f"the bridge, then re-run `ghostdeck play`"
         )
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         raise _undeterminable_endpoint(probe_reason)

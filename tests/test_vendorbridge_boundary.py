@@ -293,6 +293,39 @@ def test_a_second_close_after_a_full_teardown_emits_nothing_new(tmp_path, capfd)
     assert second == []
 
 
+def test_a_failed_revive_does_not_kill_the_reader(tmp_path, capfd, monkeypatch):
+    """A revive that fails leaves `reader_stream` at None, and the next read must retry, not crash.
+
+    Observed on the attached deck: `stream.read` raised AttributeError on that None, no handler
+    caught it, the reader thread died, and the bridge kept its socket for 10 days with nothing behind
+    it. Here the first revive fails the way that one did and the second succeeds; the reader has to
+    survive the first to reach the second.
+    """
+    proxy = make_proxy(tmp_path)
+    attempts = []
+
+    def revive(self):
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise RuntimeError("could not create the session directory on the device")
+        with self.condition:
+            self.closed = True  # the second revive ends the test: the reader returns cleanly
+
+    monkeypatch.setattr(bridge.DeviceProxy, "_revive_transport", revive)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
+    with proxy.condition:
+        proxy.reader_stream = proxy.transport_socket = None
+    reader = threading.Thread(target=proxy._reader_loop, daemon=True)
+    reader.start()
+    reader.join(timeout=5)
+
+    assert reader.is_alive() is False, "the reader must finish once the transport is closed"
+    assert attempts == [0, 1], "the reader died after the first failed revive"
+    err = capfd.readouterr().err
+    assert "AttributeError" not in err, err
+    assert "transport_revive_failed" in err
+
+
 def test_teardown_never_revives_the_transport_it_is_closing(tmp_path, capfd, monkeypatch):
     """The reader used to race close() into a revive -- rebuilding the proxy and
     re-staging on the deck while the deck was being handed back to the stock UI.

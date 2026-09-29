@@ -111,6 +111,7 @@ def _stub_play_until_detect(monkeypatch):
     # socket: liveness and ownership are stubbed, so no test can see or bind a real bridge.
     monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    monkeypatch.setattr(studio, "_bridge_lost_deck", lambda: False)
 
 
 def test_start_play_blames_the_backend_not_the_device(monkeypatch):

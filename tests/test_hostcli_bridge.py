@@ -140,6 +140,11 @@ def _stub_device_chain(monkeypatch, spawned, *, endpoint=None, on_ready=None):
 
     monkeypatch.setattr(studio, "_device_ready", ready)
     monkeypatch.setattr(studio, "_spawn_bridge", spawn)
+    # Ownership is the kernel's socket peer and that peer's argv. A fake child binds in THIS process,
+    # whose argv is pytest, so ownership is modelled: the spawned child is our bridge while it listens.
+    monkeypatch.setattr(
+        studio, "_bridge_owner_live", lambda: any(child._listener is not None for child in spawned)
+    )
 
 
 # --- the contract: classify an endpoint by what a probe can actually prove -------------

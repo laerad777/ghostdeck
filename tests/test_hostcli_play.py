@@ -54,6 +54,7 @@ def deck_home(tmp_path, monkeypatch):
     monkeypatch.setattr(studio, "BRIDGE_STATE", tmp_path / "bridge.pid")
     monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    monkeypatch.setattr(studio, "_bridge_lost_deck", lambda: False)
     monkeypatch.setattr(play, "_HOST_STATE", tmp_path / "d200-color-host.json")
     # `play` chooses between `require_bridge` (refuse and name `ghostdeck studio`) and starting the
     # bridge itself, based on whether the official app is installed. That decision must be pinned, or
@@ -326,7 +327,18 @@ def test_require_bridge_accepts_only_a_live_bridge_of_ours(tmp_path, monkeypatch
     monkeypatch.setattr(studio, "SOCKET", tmp_path / "bridge.sock")
     monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    monkeypatch.setattr(studio, "_bridge_lost_deck", lambda: False)
     studio.require_bridge()  # our own live bridge: the only case that may proceed
+
+    # Ours, but the deck fell back to HID under it: the bridge lost the deck. `play` must not stop
+    # it on a Studio host, so it reports the bridge as down -- the phrase that makes the window run
+    # `studio`, which replaces it.
+    monkeypatch.setattr(studio, "_bridge_lost_deck", lambda: True)
+    with pytest.raises(RuntimeError) as excinfo:
+        studio.require_bridge()
+    assert studio.BRIDGE_DOWN in str(excinfo.value)
+    assert "ghostdeck studio" in str(excinfo.value)
+    monkeypatch.setattr(studio, "_bridge_lost_deck", lambda: False)
 
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: False)
     with pytest.raises(RuntimeError) as excinfo:

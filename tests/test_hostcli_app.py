@@ -1219,6 +1219,44 @@ def test_the_refusals_a_user_actually_hits_are_korean_and_actionable():
     assert failure_note("") == "실패했습니다."
 
 
+def test_a_bridge_that_lost_the_deck_recovers_through_studio(monkeypatch):
+    """The observed failure: our own bridge held the socket with the deck back in HID.
+
+    `require_bridge` names it as the bridge being down, so the window's existing recovery (`studio`
+    then retry) runs instead of a dead end, and the note says the bridge lost the deck.
+    """
+    from ghostdeck import studio
+
+    monkeypatch.setattr(studio, "_socket_state", lambda: (studio._ENDPOINT_LIVE, ""))
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    monkeypatch.setattr(studio, "_bridge_lost_deck", lambda: True)
+    try:
+        studio.require_bridge()
+    except RuntimeError as error:
+        refusal = str(error)
+    else:
+        raise AssertionError("a bridge that lost the deck was accepted")
+    assert bridge_down(refusal), refusal
+    assert "놓쳤습니다" in play_failure_note(refusal)
+
+    calls: list[list[str]] = []
+    plays = 0
+
+    def run(argv):
+        nonlocal plays
+        calls.append(list(argv))
+        if argv[0] == "status":
+            return CommandResult(argv, 0, "usb=hid shim=up copy=yes playing=no\n", "")
+        if argv[0] == "studio":
+            return CommandResult(argv, 0, "", "")
+        plays += 1
+        return CommandResult(argv, 1, "", refusal + "\n") if plays == 1 else CommandResult(argv, 0, "", "")
+
+    results = DeckRemote(run).play("/tmp/clip.mp4")
+    assert [call[0] for call in calls] == ["status", "play", "studio", "play"]
+    assert results[-1].code == 0
+
+
 def test_real_cli_refusals_map_to_korean(monkeypatch, tmp_path):
     """Raise the actual RuntimeErrors, not copies of their text."""
     from ghostdeck import play, studio
