@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -262,12 +263,18 @@ def dropped_play_source(filenames) -> str:
     return ""
 
 
-def playlist_entry(source: str, title: str = "", channel: str = "") -> dict[str, str]:
-    return {
+def playlist_entry(
+    source: str, title: str = "", channel: str = "", duration: float = 0.0,
+) -> dict:
+    entry = {
         "source": (source or "").strip(),
         "title": (title or "").strip(),
         "channel": (channel or "").strip(),
     }
+    length = parse_duration(duration)
+    if length > 0:
+        entry["duration"] = round(length, 3)
+    return entry
 
 
 def playlist_source(item) -> str:
@@ -283,7 +290,7 @@ def playlist_identity(source: str) -> str:
 
 
 
-def playlist_normalize(items) -> list[dict[str, str]]:
+def playlist_normalize(items) -> list[dict]:
     out = []
     seen: dict[str, int] = {}
     for item in items or []:
@@ -291,10 +298,12 @@ def playlist_normalize(items) -> list[dict[str, str]]:
             source = str(item.get("source") or "").strip()
             title = str(item.get("title") or "").strip()
             channel = str(item.get("channel") or "").strip()
+            duration = parse_duration(item.get("duration"))
         else:
             source = str(item).strip()
             title = ""
             channel = ""
+            duration = 0.0
         if not source:
             continue
         key = playlist_identity(source)
@@ -304,9 +313,11 @@ def playlist_normalize(items) -> list[dict[str, str]]:
                 existing["title"] = title
             if channel and not existing.get("channel"):
                 existing["channel"] = channel
+            if duration > 0 and not existing.get("duration"):
+                existing["duration"] = round(duration, 3)
             continue
         seen[key] = len(out)
-        out.append(playlist_entry(key, title, channel))
+        out.append(playlist_entry(key, title, channel, duration))
     return out
 
 
@@ -333,7 +344,7 @@ def playlist_label(item) -> str:
     return source if len(source) <= 48 else source[:45] + "..."
 
 
-def playlist_add(items, source: str, title: str = "", channel: str = "") -> list[dict[str, str]]:
+def playlist_add(items, source: str, title: str = "", channel: str = "", duration: float = 0.0) -> list[dict]:
     """Append a playable source. A source already in the queue is not added again."""
     source = playlist_identity((source or "").strip())
     out = playlist_normalize(items)
@@ -341,6 +352,7 @@ def playlist_add(items, source: str, title: str = "", channel: str = "") -> list
         return out
     title = (title or "").strip()
     channel = (channel or "").strip()
+    length = parse_duration(duration)
     for i, item in enumerate(out):
         if playlist_identity(playlist_source(item)) == source:
             merged = dict(item)
@@ -348,9 +360,11 @@ def playlist_add(items, source: str, title: str = "", channel: str = "") -> list
                 merged["title"] = title
             if channel and not merged.get("channel"):
                 merged["channel"] = channel
+            if length > 0 and not merged.get("duration"):
+                merged["duration"] = round(length, 3)
             out[i] = merged
             return out
-    return out + [playlist_entry(source, title, channel)]
+    return out + [playlist_entry(source, title, channel, length)]
 
 
 def playlist_extend(items, entries) -> list[dict[str, str]]:
@@ -390,6 +404,84 @@ def playlist_subtitle(item) -> str:
     if not isinstance(item, dict):
         item = playlist_entry(str(item or ""))
     return str(item.get("channel") or "").strip()
+
+
+def playlist_meta(item) -> str:
+    """The row's second line: channel and length, whichever are known."""
+    if not isinstance(item, dict):
+        item = playlist_entry(str(item or ""))
+    parts = []
+    channel = playlist_subtitle(item)
+    if channel:
+        parts.append(channel)
+    length = parse_duration(item.get("duration"))
+    if length > 0:
+        parts.append(format_clock(length))
+    if not parts and media_path_candidate(playlist_source(item)):
+        parts.append("로컬 파일")
+    return " · ".join(parts)
+
+
+def youtube_video_id(source: str) -> str:
+    """The 11-character video id of a YouTube watch source, or empty."""
+    watch = youtube_watch_url((source or "").strip())
+    if not watch:
+        return ""
+    vid = parse_qs(urlparse(watch).query).get("v", [""])[0]
+    return vid if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or "") else ""
+
+
+def thumbnail_url(source: str) -> str:
+    """A small still for a YouTube source (mqdefault: 320x180, always present), or empty."""
+    vid = youtube_video_id(source)
+    return f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else ""
+
+
+def thumbnail_cache_path(source: str, root: Path | None = None) -> Path:
+    """Where a source's still lives on disk. One file per source identity, so no duplicates."""
+    base = (root if root is not None else Path.home() / ".ghostdeck" / "thumbs")
+    key = hashlib.sha1(playlist_identity(source).encode("utf-8")).hexdigest()[:20]
+    return base / f"{key}.jpg"
+
+
+def fetch_thumbnail(source: str, root: Path | None = None, fetch=None, probe=None) -> Path | None:
+    """The cached still for `source`, fetching it once. None when there is no still to show.
+
+    YouTube: the i.ytimg.com still. A local file: one ffmpeg frame 10% in. Never HID, never the deck.
+    """
+    path = thumbnail_cache_path(source, root)
+    if path.is_file() and path.stat().st_size > 0:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".part")
+    url = thumbnail_url(source)
+    try:
+        if url:
+            opener = urlopen if fetch is None else fetch
+            with opener(Request(url, headers={"User-Agent": "ghostdeck/0.1"}), timeout=5) as resp:
+                data = resp.read(512 * 1024)
+            if not data:
+                return None
+            tmp.write_bytes(data)
+        else:
+            local = media_path_candidate(source)
+            if not local or not Path(local).is_file():
+                return None
+            length = source_duration(local, probe=probe)
+            runner = subprocess.run if probe is None else probe
+            runner(
+                ["ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, length * 0.1):.2f}", "-i", local,
+                 "-frames:v", "1", "-vf", "scale=320:-2", "-f", "mjpeg", str(tmp)],
+                capture_output=True, timeout=15, check=False,
+            )
+            if not tmp.is_file() or tmp.stat().st_size == 0:
+                return None
+        os.replace(tmp, path)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
 
 
 def playlist_move(items, src: int, dst: int) -> list[dict[str, str]]:
@@ -551,23 +643,92 @@ def fit_label(fit: str) -> str:
 def crop_label(crop: str) -> str:
     return "여백: 유지" if play_crop_choice(crop) == "none" else "여백: 자동"
 
-def overlay_label() -> str:
-    """The slider sets how opaque the Studio buttons are over the video; right is solid."""
-    return "버튼"
+QUEUE_ROW_H = 52
 
-QUEUE_CHROME = 270
 
-def console_row(count, width=372, inset=16, gap=8):
-    """Equal cells on the queue pane. Last cell ends at width - inset."""
-    inner = width - inset * 2
-    cell = (inner - gap * (count - 1)) // count
-    x = inset
-    cells = []
-    for _ in range(count):
-        cells.append((x, cell))
-        x += cell + gap
-    return cells
+@dataclass(frozen=True)
+class Layout:
+    """Where each region sits in a content view of `width` x `height` (AppKit: y grows up).
 
+    Top: the toolbar. Under it, the Now Playing card spans the full width: that is the thing being
+    controlled, so it leads. Below the card, the browser takes every spare pixel of width and the
+    queue keeps a fixed column, so resizing makes the page bigger instead of stretching buttons.
+    """
+
+    width: float
+    height: float
+    pad: float = 16
+    gap: float = 12
+    toolbar_h: float = 36
+    card_h: float = 156
+    footer_h: float = 30
+    title_h: float = 28
+    side_w: float = 360
+
+    @property
+    def toolbar_y(self) -> float:
+        return self.height - self.title_h - self.toolbar_h
+
+    @property
+    def card(self) -> tuple[float, float, float, float]:
+        y = self.toolbar_y - self.gap - self.card_h
+        return (self.pad, y, self.width - self.pad * 2, self.card_h)
+
+    @property
+    def body_y(self) -> float:
+        return self.footer_h
+
+    @property
+    def body_h(self) -> float:
+        return max(0.0, self.card[1] - self.gap - self.body_y)
+
+    @property
+    def queue(self) -> tuple[float, float, float, float]:
+        x = self.width - self.pad - self.side_w
+        return (x, self.body_y, self.side_w, self.body_h)
+
+    @property
+    def web(self) -> tuple[float, float, float, float]:
+        w = max(0.0, self.queue[0] - self.gap - self.pad)
+        return (self.pad, self.body_y, w, self.body_h)
+
+
+# The narrowest the window may get. Two constraints, the wider wins: browser (mobile page needs
+# ~320pt) + queue column, and the card's own row (thumbnail + transport + mute/volume/settings =
+# 756pt). Below this the controls would overlap, so the window refuses to shrink further.
+LAYOUT_MIN = (760, 640)
+LAYOUT_DEFAULT = (1000, 860)
+
+
+def now_state_label(has_picture: bool, has_source: bool, busy: bool) -> str:
+    """The small caps line above the title: what the deck is doing right now."""
+    if has_picture:
+        return "● 덱에서 재생 중"
+    if has_source and busy:
+        return "여는 중…"
+    if has_source:
+        return "멈춤"
+    return "대기 중"
+
+
+def seek_step(key: str, shift: bool = False) -> float:
+    """Seconds a key moves the deck's playhead. 0 for keys that do not seek."""
+    step = {"left": -5.0, "right": 5.0, "j": -10.0, "l": 10.0}.get(key, 0.0)
+    return step * (6 if shift and key in ("left", "right") else 1)
+
+
+def clamp_seek(position: float, delta: float, duration: float) -> float:
+    """The new playhead after a relative seek, kept inside [0, duration - 1]."""
+    target = max(0.0, float(position) + float(delta))
+    if duration > 0:
+        target = min(target, max(0.0, float(duration) - 1.0))
+    return target
+
+
+def volume_step(volume: float, key: str) -> float:
+    """Up/down arrows change the deck's gain by 10%."""
+    delta = {"up": 0.1, "down": -0.1}.get(key, 0.0)
+    return clamp_volume(round(float(volume) + delta, 2))
 
 # CLI refusal fragment (lower-cased) -> the Korean line the window shows. First match wins, so the
 # more specific phrase comes first. Each line names the next thing to do, not the internal cause.
@@ -1361,6 +1522,8 @@ def main() -> int:
             NSApp,
             NSAppearance,
             NSImage,
+            NSImageView,
+            NSTableCellView,
             NSVisualEffectView,
             NSWindowStyleMaskFullSizeContentView,
             NSApplication,
@@ -1385,6 +1548,11 @@ def main() -> int:
             NSTableColumn,
             NSTableView,
             NSBezelBorder,
+            NSEvent,
+            NSEventMaskKeyDown,
+            NSEventModifierFlagControl,
+            NSEventModifierFlagOption,
+            NSText,
             NSTextField,
             NSView,
             NSViewHeightSizable,
@@ -1683,6 +1851,8 @@ def main() -> int:
         item(deck_menu, "덱 다시 연결", "reconnect:")
         item(deck_menu, "스튜디오 켜기 (키 + 영상)", "studio:")
         item(deck_menu, "브리지만 켜기 (영상만)", "bridge:")
+        deck_menu.addItem_(NSMenuItem.separatorItem())
+        item(deck_menu, "덱 설정 보기/숨기기", "toggleSettings:", ",")
 
         window_menu = submenu(bar, "윈도우")
         item(window_menu, "최소화", "performMiniaturize:", "m", target=None)
@@ -1868,20 +2038,74 @@ def main() -> int:
         ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source)
         playlist_save(PLAYLIST_PATH, ctrl.playlist)
         _gui_playlist_draw(ctrl)
-        if playlist_find(ctrl.playlist, source).get("title"):
+        found = playlist_find(ctrl.playlist, source)
+        if found.get("title") and found.get("duration"):
             return
 
         def fill():
-            title, channel = source_identity(source)
+            title, channel = source_identity(source) if not found.get("title") else ("", "")
+            length = source_duration(source) if not found.get("duration") else 0.0
 
             def apply():
-                ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, title, channel)
+                ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, title, channel, length)
                 playlist_save(PLAYLIST_PATH, ctrl.playlist)
                 _gui_playlist_draw(ctrl)
 
             AppHelper.callAfter(apply)
 
         threading.Thread(target=fill, daemon=True).start()
+
+    def _gui_backfill_meta(ctrl) -> None:
+        """Fill missing lengths for rows saved before durations were stored. One worker, in order."""
+        missing = [playlist_source(item) for item in getattr(ctrl, "playlist", []) if not item.get("duration")]
+        if not missing:
+            return
+
+        def fill():
+            for source in missing:
+                length = source_duration(source)
+                if length <= 0:
+                    continue
+
+                def apply(source=source, length=length):
+                    ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, duration=length)
+                    playlist_save(PLAYLIST_PATH, ctrl.playlist)
+                    _gui_playlist_draw(ctrl)
+
+                AppHelper.callAfter(apply)
+
+        threading.Thread(target=fill, daemon=True).start()
+
+    _THUMBS: dict = {}
+    _THUMB_PENDING: set = set()
+
+    def _thumb_image(ctrl, source: str):
+        """The NSImage for a source's still, or None while it loads (the view redraws on arrival)."""
+        key = playlist_identity(source)
+        if not key:
+            return None
+        if key in _THUMBS:
+            return _THUMBS[key]
+        if key in _THUMB_PENDING:
+            return None
+        _THUMB_PENDING.add(key)
+
+        def load():
+            path = fetch_thumbnail(key)
+
+            def apply():
+                _THUMB_PENDING.discard(key)
+                image = NSImage.alloc().initWithContentsOfFile_(str(path)) if path else None
+                _THUMBS[key] = image
+                table = getattr(ctrl, "playlist_table", None)
+                if table is not None:
+                    table.reloadData()
+                _gui_now_draw(ctrl)
+
+            AppHelper.callAfter(apply)
+
+        threading.Thread(target=load, daemon=True).start()
+        return None
 
 
     def _gui_queue_href(ctrl, href: str) -> None:
@@ -1915,6 +2139,29 @@ def main() -> int:
         ctrl.note.setStringValue_("대기열에 넣었습니다.")
 
 
+    def _gui_settings_draw(ctrl, open_=None) -> None:
+        """Show or hide the deck-settings drawer at the top of the queue column.
+
+        Studio, bridge, fit, crop and the overlay slider are set once and forgotten, so they stay
+        folded away and the queue gets the room. Opening the drawer pushes the list down.
+        """
+        if open_ is not None:
+            ctrl.settings_open = bool(open_)
+        on = bool(getattr(ctrl, "settings_open", False))
+        for item in getattr(ctrl, "settings_views", []):
+            item.setHidden_(not on)
+        scroll = getattr(ctrl, "queue_scroll", None)
+        top = getattr(ctrl, "queue_top", None)
+        if scroll is not None and top is not None:
+            frame = scroll.frame()
+            ceiling = top - (getattr(ctrl, "settings_h", 0) if on else 0)
+            frame.size.height = max(60.0, ceiling - frame.origin.y)
+            scroll.setFrame_(frame)
+        button = getattr(ctrl, "settings_btn", None)
+        if button is not None:
+            _pill(button, LIME if on else CARD, INK if on else SNOW)
+            _icon(button, "slider.horizontal.3", INK if on else SNOW)
+
     def _gui_playlist_draw(ctrl) -> None:
         table = getattr(ctrl, "playlist_table", None)
         items = getattr(ctrl, "playlist", [])
@@ -1928,9 +2175,10 @@ def main() -> int:
         heading = getattr(ctrl, "queue_head", None)
         if heading is not None:
             n = len(items)
-            heading.setStringValue_(
-                f"대기열 · {n}곡" if n else "대기열 · 영상을 끌어다 놓으십시오"
-            )
+            heading.setStringValue_(f"대기열  {n}" if n else "대기열")
+        empty = getattr(ctrl, "queue_empty", None)
+        if empty is not None:
+            empty.setHidden_(bool(items))
         _gui_now_draw(ctrl)
         _gui_playhead_draw(ctrl)
         _gui_mode_draw(ctrl)
@@ -1944,18 +2192,23 @@ def main() -> int:
         found = playlist_find(items, source) if source else playlist_entry("")
         now_head = getattr(ctrl, "now_head", None)
         if now_head is not None:
-            now_head.setStringValue_("NOW · 재생 중" if deck_has_picture() else ("NOW · 여는 중" if source else "NOW"))
+            now_head.setStringValue_(now_state_label(deck_has_picture(), bool(source), bool(getattr(ctrl, "busy", False))))
         title = getattr(ctrl, "now_title", None)
         if title is not None:
             title.setStringValue_(playlist_title(found) if source else "재생 중인 영상이 없습니다")
         channel = getattr(ctrl, "now_channel", None)
         if channel is not None:
             channel.setStringValue_(
-                playlist_subtitle(found) if source else "페이지에서 추가하거나 파일을 놓으십시오"
+                (playlist_subtitle(found) or " ") if source
+                else "유튜브에서 영상을 열고 ▶ 를 누르거나, 파일을 끌어다 놓으십시오"
             )
-        field = getattr(ctrl, "now_field", None)
-        if field is not None:
-            field.setStringValue_(playlist_label(found) if source else "없음")
+        art = getattr(ctrl, "now_art", None)
+        if art is not None:
+            image = _thumb_image(ctrl, source) if source else None
+            art.setImage_(image)
+            glyph = getattr(ctrl, "now_glyph", None)
+            if glyph is not None:
+                glyph.setHidden_(image is not None)
         if getattr(ctrl, "shown_now", None) != source:
             ctrl.shown_now = source
             table = getattr(ctrl, "playlist_table", None)
@@ -2213,12 +2466,6 @@ def main() -> int:
                 self.ctrl.note.setStringValue_("대기열에 넣었습니다.")
             return added
 
-        def hitTest_(self, point):
-            h = self.bounds().size.height
-            if point.y > h - QUEUE_CHROME:
-                return None
-            return objc.super(QueueDrop, self).hitTest_(point)
-
     class Controller(NSObject):
         def init(self):
             self = objc.super(Controller, self).init()
@@ -2246,24 +2493,19 @@ def main() -> int:
             self.duration_busy = False
             self.seeking = False
             self.played_start = 0.0
-            # Mobile YouTube pane + console queue.
-            PAD = 20
-            PHONE_W = 392
-            SIDE_W = 372
-            SIDE_GAP = 18
-            W = PAD + PHONE_W + SIDE_GAP + SIDE_W + PAD
-            H = 820
-            FOOT = 28
-            TOP = 36
-            BAR = 36
-            GAP = 8
-            PHONE_X, PHONE_Y = PAD, FOOT
-            TOOL_Y = H - TOP - BAR
-            PHONE_H = TOOL_Y - GAP - FOOT
-            QUEUE_H = PHONE_H
-            SIDE_X = PAD + PHONE_W + SIDE_GAP
-            stick_top = NSViewMinXMargin | NSViewWidthSizable | NSViewMinYMargin
-            stick_bot = NSViewMinXMargin | NSViewMaxYMargin
+            # Toolbar, then a full-width Now Playing card, then browser | queue. See `Layout`.
+            L = Layout(*LAYOUT_DEFAULT)
+            W, H = L.width, L.height
+            PAD = L.pad
+            TOOL_Y = L.toolbar_y
+            CX, CY, CW, CH = L.card
+            QX, QY, QW, QH = L.queue
+            WX, WY, WW, WH = L.web
+            # Autoresizing, named by what each group should do when the window changes size.
+            top_left = NSViewMinYMargin
+            top_wide = NSViewWidthSizable | NSViewMinYMargin
+            top_right = NSViewMinXMargin | NSViewMinYMargin
+            right_col = NSViewMinXMargin | NSViewHeightSizable
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, W, H),
                 NSWindowStyleMaskTitled
@@ -2278,9 +2520,12 @@ def main() -> int:
             self.window.setTitlebarAppearsTransparent_(True)
             self.window.setTitleVisibility_(1)
             self.window.setReleasedWhenClosed_(False)
-            self.window.setMinSize_((760, 560))
+            self.window.setContentMinSize_(LAYOUT_MIN)
             self.window.setContentSize_((W, H))
             self.window.setBackgroundColor_(INK)
+            # Remember size and place across launches. The key lives in the shared `Python` defaults
+            # domain (the GUI has no bundle id of its own), so it is namespaced to this window.
+            self.window.setFrameAutosaveName_("ghostdeck.main")
             try:
                 self.window.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua"))
             except Exception:
@@ -2294,6 +2539,7 @@ def main() -> int:
             drop.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             view.addSubview_(drop)
 
+            # ---- browser -------------------------------------------------------------------
             config = WKWebViewConfiguration.alloc().init()
             from Foundation import NSUUID
             from WebKit import WKWebsiteDataStore
@@ -2324,16 +2570,17 @@ def main() -> int:
             if prefs is not None:
                 prefs.setPreferredContentMode_(0)
 
-            shell = NSView.alloc().initWithFrame_(NSMakeRect(PHONE_X, PHONE_Y, PHONE_W, PHONE_H))
+            shell = NSView.alloc().initWithFrame_(NSMakeRect(WX, WY, WW, WH))
             shell.setWantsLayer_(True)
-            shell.layer().setCornerRadius_(8.0)
+            shell.layer().setCornerRadius_(10.0)
             shell.layer().setMasksToBounds_(True)
             shell.layer().setBorderWidth_(1.0)
             shell.layer().setBorderColor_(HAIR.CGColor())
-            shell.setAutoresizingMask_(NSViewHeightSizable)
+            # The browser takes all the spare width: resizing the window makes the page bigger.
+            shell.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             view.addSubview_(shell)
             self.web = WKWebView.alloc().initWithFrame_configuration_(
-                NSMakeRect(0, 0, PHONE_W, PHONE_H),
+                NSMakeRect(0, 0, WW, WH),
                 config,
             )
             self.web.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
@@ -2344,53 +2591,34 @@ def main() -> int:
                 NSURLRequest.requestWithURL_(NSURL.URLWithString_("https://www.youtube.com"))
             )
 
-            def nav_btn(x, title, symbol, action):
-                btn = NSButton.alloc().initWithFrame_(NSMakeRect(PAD + x, TOOL_Y + 4, 28, 28))
-                img = _symbol(symbol)
-                if img is not None:
-                    btn.setImage_(img)
-                    btn.setBordered_(False)
-                    btn.setContentTintColor_(SNOW)
-                else:
-                    btn.setTitle_(title)
-                    btn.setBordered_(False)
-                    btn.setFont_(NSFont.systemFontOfSize_(15))
+            # ---- toolbar -------------------------------------------------------------------
+            def bar_btn(x, w, title, symbol, action, tip):
+                btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, TOOL_Y + 4, w, 28))
+                btn.setTitle_(title)
+                btn.setFont_(NSFont.boldSystemFontOfSize_(11))
                 _pill(btn, CARD, SNOW)
+                if symbol:
+                    _icon(btn, symbol, SNOW)
+                    if title:
+                        btn.setTitle_(title)
+                        btn.setImagePosition_(2)  # NSImageLeft: icon then label
                 btn.setTarget_(self)
                 btn.setAction_(action)
-                btn.setAutoresizingMask_(NSViewMinYMargin)
+                btn.setAutoresizingMask_(top_left)
+                _describe(btn, tip)
                 view.addSubview_(btn)
                 return btn
 
             # Shortcuts live in the menu bar (`_gui_install_menu`), not on the buttons.
-            back = nav_btn(0, "‹", "chevron.left", "back:")
-            _describe(back, "뒤로 (⌘[)")
-            fwd = nav_btn(36, "›", "chevron.right", "forward:")
-            _describe(fwd, "앞으로 (⌘])")
-            self.file_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(PAD + 72, TOOL_Y + 4, 44, 28)
-            )
-            self.file_btn.setTitle_("파일")
-            self.file_btn.setFont_(NSFont.boldSystemFontOfSize_(11))
-            _pill(self.file_btn, CARD, SNOW)
-            self.file_btn.setTarget_(self)
-            self.file_btn.setAction_("openFile:")
-            _describe(self.file_btn, "영상 파일을 골라 덱에서 재생 (⌘O)")
-            self.file_btn.setAutoresizingMask_(NSViewMinYMargin)
-            view.addSubview_(self.file_btn)
-            self.reconnect_btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(PAD + 124, TOOL_Y + 4, 44, 28)
-            )
-            self.reconnect_btn.setTitle_("연결")
-            self.reconnect_btn.setFont_(NSFont.boldSystemFontOfSize_(11))
-            _pill(self.reconnect_btn, CARD, SNOW)
-            self.reconnect_btn.setTarget_(self)
-            self.reconnect_btn.setAction_("reconnect:")
-            _describe(self.reconnect_btn, "케이블을 다시 꽂은 뒤 덱을 다시 잡습니다")
-            self.reconnect_btn.setAutoresizingMask_(NSViewMinYMargin)
-            view.addSubview_(self.reconnect_btn)
+            bar_btn(PAD, 28, "", "chevron.left", "back:", "뒤로 (⌘[)")
+            bar_btn(PAD + 34, 28, "", "chevron.right", "forward:", "앞으로 (⌘])")
+            bar_btn(PAD + 68, 28, "", "arrow.clockwise", "reload:", "새로 고침 (⌘R)")
+            url_x = PAD + 104
+            self.file_btn = bar_btn(W - PAD - 72, 72, " 파일", "folder", "openFile:",
+                                    "영상 파일을 골라 덱에서 재생 (⌘O)")
+            self.file_btn.setAutoresizingMask_(top_right)
             self.url_field = NSTextField.alloc().initWithFrame_(
-                NSMakeRect(PAD + 176, TOOL_Y + 4, W - PAD - 176 - PAD, 28)
+                NSMakeRect(url_x, TOOL_Y + 4, W - PAD - 72 - 8 - url_x, 28)
             )
             self.url_field.setStringValue_("https://www.youtube.com")
             self.url_field.setBezeled_(False)
@@ -2404,91 +2632,86 @@ def main() -> int:
             self.url_field.setFocusRingType_(1)
             self.url_field.setTarget_(self)
             self.url_field.setAction_("go:")
+            try:
+                self.url_field.setPlaceholderString_("주소, 유튜브 링크 또는 영상 파일 경로")
+            except Exception:
+                pass
             _describe(self.url_field, "주소 또는 영상 파일 경로 (⌘L)")
-            self.url_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+            self.url_field.setAutoresizingMask_(top_wide)
             view.addSubview_(self.url_field)
 
-            frost = NSVisualEffectView.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X, PHONE_Y, SIDE_W, QUEUE_H)
-            )
-            frost.setMaterial_(7)
-            frost.setBlendingMode_(0)
-            frost.setState_(1)
-            frost.setWantsLayer_(True)
-            frost.layer().setCornerRadius_(10.0)
-            frost.layer().setMasksToBounds_(True)
-            frost.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
-            view.addSubview_(frost)
-            pane = QueueDrop.alloc().initWithFrame_(frost.bounds())
-            pane.ctrl = self
-            pane.registerForDraggedTypes_([NSFilenamesPboardType])
-            pane.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-            frost.addSubview_(pane)
+            # ---- Now Playing card ----------------------------------------------------------
+            card = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(CX, CY, CW, CH))
+            card.setMaterial_(7)
+            card.setBlendingMode_(0)
+            card.setState_(1)
+            card.setWantsLayer_(True)
+            card.layer().setCornerRadius_(12.0)
+            card.layer().setMasksToBounds_(True)
+            card.setAutoresizingMask_(top_wide)
+            view.addSubview_(card)
 
-            INSET = 16
-            t6 = console_row(6, SIDE_W)
-            t4 = console_row(4, SIDE_W)
-            TW = t6[0][1]
-            FW = t4[0][1]
-            heading = _label(
-                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 36, SIDE_W - INSET * 2, 14),
-                "NOW", 10, True, LIME, stick_top,
+            # Thumbnail on the left, 16:9 and as tall as the card allows.
+            IN = 16
+            art_h = CH - IN * 2
+            art_w = round(art_h * 16 / 9)
+            AX, AY = CX + IN, CY + IN
+            self.now_art = NSImageView.alloc().initWithFrame_(NSMakeRect(AX, AY, art_w, art_h))
+            self.now_art.setImageScaling_(3)  # NSImageScaleProportionallyUpOrDown
+            self.now_art.setWantsLayer_(True)
+            self.now_art.layer().setCornerRadius_(8.0)
+            self.now_art.layer().setMasksToBounds_(True)
+            self.now_art.layer().setBackgroundColor_(CARD.CGColor())
+            self.now_art.setAutoresizingMask_(top_left)
+            _describe(self.now_art, "재생 중인 영상")
+            view.addSubview_(self.now_art)
+            # Placeholder glyph, centred on the (empty) thumbnail.
+            self.now_glyph = NSImageView.alloc().initWithFrame_(
+                NSMakeRect(AX + art_w / 2 - 16, AY + art_h / 2 - 16, 32, 32)
             )
-            self.now_head = heading
-            view.addSubview_(heading)
+            glyph = _symbol("play.rectangle")
+            if glyph is not None:
+                self.now_glyph.setImage_(glyph)
+                self.now_glyph.setContentTintColor_(GHOST)
+            self.now_glyph.setAutoresizingMask_(top_left)
+            view.addSubview_(self.now_glyph)
+
+            # Right column, top to bottom: state · title · channel, seek row, transport row.
+            # Stacked from the card's top edge down, each row's height and gap spelled out, so the
+            # rows cannot collide: 14 + 2 + 22 + 2 + 16 = 56 of text, 6 gap, 18 seek, 8 gap, 32 buttons.
+            TX = AX + art_w + 18                 # text/controls column
+            TR = CX + CW - IN                    # its right edge (tracks the card)
+            text_w = TR - TX
+            HEAD_Y = CY + CH - IN - 14
+            TITLE_Y = HEAD_Y - 2 - 22
+            CHAN_Y = TITLE_Y - 2 - 16
+            SEEK_Y = CHAN_Y - 6 - 18
+            ROW_Y = SEEK_Y - 8 - 32
+            self.now_head = _label(NSMakeRect(TX, HEAD_Y, text_w, 14), "대기 중", 10, True, LIME, top_wide)
+            view.addSubview_(self.now_head)
             self.now_title = _label(
-                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 62, SIDE_W - INSET * 2, 22),
-                "재생 중인 영상이 없습니다", 15, True, SNOW, stick_top,
+                NSMakeRect(TX, TITLE_Y, text_w, 22),
+                "재생 중인 영상이 없습니다", 16, True, SNOW, top_wide,
             )
+            self.now_title.cell().setLineBreakMode_(4)  # NSLineBreakByTruncatingTail
             view.addSubview_(self.now_title)
             self.now_channel = _label(
-                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 80, SIDE_W - INSET * 2, 16),
-                "페이지에서 추가하거나 파일을 놓으십시오", 11, False, GHOST, stick_top,
+                NSMakeRect(TX, CHAN_Y, text_w, 16),
+                "유튜브에서 영상을 열고 ▶ 를 누르거나, 파일을 끌어다 놓으십시오", 12, False, GHOST, top_wide,
             )
+            self.now_channel.cell().setLineBreakMode_(4)
             view.addSubview_(self.now_channel)
 
-            def tbtn(x, w, title, action, fill=CARD, ink=SNOW, symbol=""):
-                btn = NSButton.alloc().initWithFrame_(
-                    NSMakeRect(x, PHONE_Y + QUEUE_H - 120, w, 32)
-                )
-                btn.setTitle_(title)
-                btn.setFont_(NSFont.boldSystemFontOfSize_(11))
-                _pill(btn, fill, ink)
-                if symbol:
-                    _icon(btn, symbol, ink)
-                btn.setTarget_(self)
-                btn.setAction_(action)
-                btn.setAutoresizingMask_(stick_top)
-                view.addSubview_(btn)
-                return btn
-
-            self.prev_btn = tbtn(SIDE_X + t6[0][0], TW, "⏮", "prevTrack:", symbol="backward.end.fill")
-            self.play_btn = tbtn(SIDE_X + t6[1][0], TW, "▶", "play:", LIME, INK, "play.fill")
-            self.play_btn.setKeyEquivalent_("\r")
-            # Esc is not ■: it is the "cancel editing" key in the URL field and in web inputs,
-            # and as a window key equivalent it stopped the deck from there. ⌘. is in the menu.
-            self.stop_btn = tbtn(SIDE_X + t6[2][0], TW, "■", "stop:", symbol="stop.fill")
-            self.next_btn = tbtn(SIDE_X + t6[3][0], TW, "⏭", "nextTrack:", symbol="forward.end.fill")
-            self.shuffle_btn = tbtn(SIDE_X + t6[4][0], TW, "셔플", "toggleShuffle:", symbol="shuffle")
-            self.repeat_btn = tbtn(SIDE_X + t6[5][0], TW, "반복", "cycleRepeat:", symbol="repeat")
-            _describe(self.prev_btn, "이전 곡")
-            _describe(self.play_btn, "덱에서 재생 / 일시정지 (↩)")
-            _describe(self.stop_btn, "덱 재생 멈춤 (⌘.)")
-            _describe(self.next_btn, "다음 곡")
-            _describe(self.shuffle_btn, "셔플 켜기/끄기")
-            self.elapsed_lab = _label(
-                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 146, 64, 14),
-                "0:00", 10, False, GHOST, stick_top,
-            )
+            # Seek row: elapsed | bar | total. The bar tracks the card's width.
+            self.elapsed_lab = _label(NSMakeRect(TX, SEEK_Y + 1, 52, 16), "0:00", 11, False, GHOST, top_left)
+            self.elapsed_lab.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(11, 0))
             view.addSubview_(self.elapsed_lab)
-            self.remain_lab = _label(
-                NSMakeRect(SIDE_X + SIDE_W - INSET - 64, PHONE_Y + QUEUE_H - 146, 64, 14),
-                "--:--", 10, False, GHOST, stick_top,
-            )
+            self.remain_lab = _label(NSMakeRect(TR - 52, SEEK_Y + 1, 52, 16), "--:--", 11, False, GHOST, top_right)
+            self.remain_lab.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(11, 0))
             self.remain_lab.setAlignment_(2)
             view.addSubview_(self.remain_lab)
             self.seek_bar = SeekSlider.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 168, SIDE_W - INSET * 2, 18)
+                NSMakeRect(TX + 56, SEEK_Y, text_w - 112, 18)
             )
             self.seek_bar.setMinValue_(0.0)
             self.seek_bar.setMaxValue_(1.0)
@@ -2498,19 +2721,53 @@ def main() -> int:
             self.seek_bar.setTarget_(self)
             self.seek_bar.ctrl = self
             self.seek_bar.setAction_("seek:")
-            self.seek_bar.setAutoresizingMask_(stick_top)
-            _describe(self.seek_bar, "덱 재생 위치 옮기기")
+            self.seek_bar.setAutoresizingMask_(top_wide)
+            _describe(self.seek_bar, "덱 재생 위치 (←/→ 5초, ⇧ 30초)")
             view.addSubview_(self.seek_bar)
 
-            MIX_Y = PHONE_Y + QUEUE_H - 196
-            self.mute_btn = tbtn(SIDE_X + t6[0][0], TW, "음소거", "toggleMute:", symbol="speaker.wave.2.fill")
-            self.mute_btn.setFrame_(NSMakeRect(SIDE_X + t6[0][0], MIX_Y, TW, 28))
-            vol_x = SIDE_X + t6[1][0]
-            ov_w = 117
-            lab_w = 32
-            vol_w = 117
+            # Transport, left-aligned under the title. Play is the one big button.
+
+            def tbtn(x, w, title, action, fill=CARD, ink=SNOW, symbol="", h=32):
+                btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, ROW_Y, w, h))
+                btn.setTitle_(title)
+                btn.setFont_(NSFont.boldSystemFontOfSize_(11))
+                _pill(btn, fill, ink)
+                if symbol:
+                    _icon(btn, symbol, ink)
+                btn.setTarget_(self)
+                btn.setAction_(action)
+                btn.setAutoresizingMask_(top_left)
+                view.addSubview_(btn)
+                return btn
+
+            x = TX
+            self.prev_btn = tbtn(x, 36, "⏮", "prevTrack:", symbol="backward.end.fill"); x += 36 + 6
+            self.play_btn = tbtn(x, 56, "▶", "play:", LIME, INK, "play.fill"); x += 56 + 6
+            self.play_btn.setKeyEquivalent_("\r")
+            # Esc is not ■: it is the "cancel editing" key in the URL field and in web inputs,
+            # and as a window key equivalent it stopped the deck from there. ⌘. is in the menu.
+            self.stop_btn = tbtn(x, 36, "■", "stop:", symbol="stop.fill"); x += 36 + 6
+            self.next_btn = tbtn(x, 36, "⏭", "nextTrack:", symbol="forward.end.fill"); x += 36 + 16
+            self.shuffle_btn = tbtn(x, 36, "셔플", "toggleShuffle:", symbol="shuffle"); x += 36 + 6
+            self.repeat_btn = tbtn(x, 36, "반복", "cycleRepeat:", symbol="repeat"); x += 36 + 16
+            _describe(self.prev_btn, "이전 곡")
+            _describe(self.play_btn, "덱에서 재생 / 일시정지 (↩ 또는 스페이스)")
+            _describe(self.stop_btn, "덱 재생 멈춤 (⌘.)")
+            _describe(self.next_btn, "다음 곡")
+            _describe(self.shuffle_btn, "셔플 켜기/끄기")
+
+            # Volume on the right of the transport row; the settings disclosure at the far right.
+            self.settings_btn = NSButton.alloc().initWithFrame_(NSMakeRect(TR - 32, ROW_Y, 32, 32))
+            _pill(self.settings_btn, CARD, SNOW)
+            _icon(self.settings_btn, "slider.horizontal.3", SNOW)
+            self.settings_btn.setTarget_(self)
+            self.settings_btn.setAction_("toggleSettings:")
+            self.settings_btn.setAutoresizingMask_(top_right)
+            _describe(self.settings_btn, "덱 설정 (스튜디오 · 브리지 · 화면 · 여백 · 버튼 불투명도)")
+            view.addSubview_(self.settings_btn)
+            vol_w = max(80, min(160, TR - 32 - 12 - 32 - 6 - x))
             self.volume_bar = NSSlider.alloc().initWithFrame_(
-                NSMakeRect(vol_x, MIX_Y + 3, vol_w, 22)
+                NSMakeRect(TR - 32 - 12 - vol_w, ROW_Y + 5, vol_w, 22)
             )
             self.volume_bar.setMinValue_(0.0)
             self.volume_bar.setMaxValue_(1.0)
@@ -2518,17 +2775,79 @@ def main() -> int:
             self.volume_bar.setContinuous_(True)
             self.volume_bar.setTarget_(self)
             self.volume_bar.setAction_("setVolume:")
-            self.volume_bar.setAutoresizingMask_(stick_top)
-            _describe(self.volume_bar, "덱 소리 크기")
+            self.volume_bar.setAutoresizingMask_(top_right)
+            _describe(self.volume_bar, "덱 소리 크기 (↑/↓)")
             view.addSubview_(self.volume_bar)
-            lab_x = vol_x + vol_w + 8
+            self.mute_btn = tbtn(TR - 32 - 12 - vol_w - 6 - 32, 32, "음소거", "toggleMute:",
+                                 symbol="speaker.wave.2.fill")
+            self.mute_btn.setAutoresizingMask_(top_right)
+
+            # ---- queue column --------------------------------------------------------------
+            frost = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(QX, QY, QW, QH))
+            frost.setMaterial_(7)
+            frost.setBlendingMode_(0)
+            frost.setState_(1)
+            frost.setWantsLayer_(True)
+            frost.layer().setCornerRadius_(12.0)
+            frost.layer().setMasksToBounds_(True)
+            frost.setAutoresizingMask_(right_col)
+            view.addSubview_(frost)
+            pane = QueueDrop.alloc().initWithFrame_(frost.bounds())
+            pane.ctrl = self
+            pane.registerForDraggedTypes_([NSFilenamesPboardType])
+            pane.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            frost.addSubview_(pane)
+            self.queue_pane = frost
+
+            QIN = 14
+            head_y = QY + QH - QIN - 16
+            self.queue_head = _label(
+                NSMakeRect(QX + QIN, head_y, QW - QIN * 2 - 64, 16),
+                "대기열", 12, True, SNOW, top_right,
+            )
+            view.addSubview_(self.queue_head)
+
+            def qbtn(x, y, w, title, action, symbol, tip, mask):
+                btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, w, 28))
+                btn.setTitle_(title)
+                btn.setFont_(NSFont.boldSystemFontOfSize_(11))
+                _pill(btn, CARD, SNOW)
+                if symbol:
+                    _icon(btn, symbol, SNOW)
+                btn.setTarget_(self)
+                btn.setAction_(action)
+                btn.setAutoresizingMask_(mask)
+                _describe(btn, tip)
+                view.addSubview_(btn)
+                return btn
+
+            # "+" sits on the header line: adding is the main queue action.
+            self.add_btn = qbtn(QX + QW - QIN - 60, head_y - 6, 60, " 추가", "addToPlaylist:", "plus",
+                                "보고 있는 페이지를 대기열에 넣기", top_right)
+            self.add_btn.setImagePosition_(2)
+
+            # Settings drawer: rarely used deck controls, collapsed by default, at the queue's top.
+            DRAWER_H = 104
+            self.settings_h = DRAWER_H
+            drawer_top = head_y - 14
+            dy = drawer_top - 28
+            half = (QW - QIN * 2 - 8) / 2
+            self.studio_btn = qbtn(QX + QIN, dy, half, "스튜디오", "studio:", "",
+                                   "Studio 복사본과 브리지를 켭니다. 키가 없을 때 누르십시오", top_right)
+            self.bridge_btn = qbtn(QX + QIN + half + 8, dy, half, "브리지", "bridge:", "",
+                                   "브리지만 켭니다. Studio 없이 영상만 보냅니다", top_right)
+            dy -= 34
+            self.fit_btn = qbtn(QX + QIN, dy, half, fit_label(self.fit), "cycleFit:", "",
+                                "다음 재생부터: 자동 → 맞춤(레터박스) → 채움(잘라내기)", top_right)
+            self.crop_btn = qbtn(QX + QIN + half + 8, dy, half, crop_label(self.crop), "cycleCrop:", "",
+                                 "다음 재생부터: 검은 여백 자동 제거 / 원본 유지", top_right)
+            dy -= 30
             self.overlay_lab = _label(
-                NSMakeRect(lab_x, MIX_Y + 6, lab_w, 16),
-                overlay_label(), 10, True, GHOST, stick_top,
+                NSMakeRect(QX + QIN, dy + 4, 118, 16), "Studio 버튼 불투명도", 10, False, GHOST, top_right,
             )
             view.addSubview_(self.overlay_lab)
             self.overlay_bar = NSSlider.alloc().initWithFrame_(
-                NSMakeRect(lab_x + lab_w + 8, MIX_Y + 3, ov_w, 22)
+                NSMakeRect(QX + QIN + 122, dy + 1, QW - QIN * 2 - 122, 22)
             )
             self.overlay_bar.setMinValue_(0.0)
             self.overlay_bar.setMaxValue_(1.0)
@@ -2536,50 +2855,45 @@ def main() -> int:
             self.overlay_bar.setContinuous_(True)
             self.overlay_bar.setTarget_(self)
             self.overlay_bar.setAction_("setOverlay:")
-            self.overlay_bar.setAutoresizingMask_(stick_top)
+            self.overlay_bar.setAutoresizingMask_(top_right)
             _describe(self.overlay_bar, "영상 위 Studio 버튼 불투명도 (오른쪽이 진함)")
             _describe(self.overlay_lab, "영상 위 Studio 버튼 불투명도")
             view.addSubview_(self.overlay_bar)
-            DECK_Y = PHONE_Y + QUEUE_H - 232
-            self.studio_btn = tbtn(SIDE_X + t4[0][0], FW, "스튜디오", "studio:")
-            self.studio_btn.setFrame_(NSMakeRect(SIDE_X + t4[0][0], DECK_Y, FW, 28))
-            self.bridge_btn = tbtn(SIDE_X + t4[1][0], FW, "브리지", "bridge:")
-            self.bridge_btn.setFrame_(NSMakeRect(SIDE_X + t4[1][0], DECK_Y, FW, 28))
-            self.fit_btn = tbtn(SIDE_X + t4[2][0], FW, fit_label(self.fit), "cycleFit:")
-            self.fit_btn.setFrame_(NSMakeRect(SIDE_X + t4[2][0], DECK_Y, FW, 28))
-            self.crop_btn = tbtn(SIDE_X + t4[3][0], FW, crop_label(self.crop), "cycleCrop:")
-            self.crop_btn.setFrame_(NSMakeRect(SIDE_X + t4[3][0], DECK_Y, FW, 28))
-            _describe(self.studio_btn, "Studio 복사본과 브리지를 켭니다. 키가 없을 때 누르십시오")
-            _describe(self.bridge_btn, "브리지만 켭니다. Studio 없이 영상만 보냅니다")
-            _describe(self.fit_btn, "다음 재생부터: 자동 → 맞춤(레터박스) → 채움(잘라내기)")
-            _describe(self.crop_btn, "다음 재생부터: 검은 여백 자동 제거 / 원본 유지")
+            self.settings_views = [
+                self.studio_btn, self.bridge_btn, self.fit_btn, self.crop_btn,
+                self.overlay_lab, self.overlay_bar,
+            ]
             if not studio_installed():
                 self.studio_btn.setEnabled_(False)
                 _describe(self.studio_btn, "Ulanzi Studio가 설치되어 있지 않습니다. 브리지를 쓰십시오")
-            self.queue_head = _label(
-                NSMakeRect(SIDE_X + INSET, PHONE_Y + QUEUE_H - 258, SIDE_W - INSET * 2, 14),
-                "대기열", 10, True, GHOST, stick_top,
-            )
-            view.addSubview_(self.queue_head)
+
+            # The list, and the row actions under it.
             BTN_H = 28
-            table_y = PHONE_Y + 46
-            table_h = max(80, (PHONE_Y + QUEUE_H - QUEUE_CHROME) - table_y)
+            table_y = QY + QIN + BTN_H + 8
+            self.queue_top = head_y - 10
             scroll = NSScrollView.alloc().initWithFrame_(
-                NSMakeRect(SIDE_X + INSET, table_y, SIDE_W - INSET * 2, table_h)
+                NSMakeRect(QX + QIN - 6, table_y, QW - QIN * 2 + 12, self.queue_top - table_y)
             )
             scroll.setHasVerticalScroller_(True)
+            scroll.setAutohidesScrollers_(True)
             scroll.setBorderType_(0)
             scroll.setDrawsBackground_(False)
-            scroll.setAutoresizingMask_(NSViewMinXMargin | NSViewWidthSizable | NSViewHeightSizable)
+            scroll.setAutoresizingMask_(NSViewMinXMargin | NSViewHeightSizable)
+            self.queue_scroll = scroll
             self.playlist_table = NSTableView.alloc().initWithFrame_(scroll.contentView().bounds())
             track_col = NSTableColumn.alloc().initWithIdentifier_("track")
-            track_col.setWidth_(SIDE_W - INSET * 2)
+            track_col.setWidth_(QW - QIN * 2 + 12)
             track_col.setEditable_(False)
             self.playlist_table.addTableColumn_(track_col)
             self.playlist_table.setHeaderView_(None)
-            self.playlist_table.setRowHeight_(44)
+            self.playlist_table.setRowHeight_(QUEUE_ROW_H)
+            self.playlist_table.setIntercellSpacing_((0, 2))
             self.playlist_table.setUsesAlternatingRowBackgroundColors_(False)
             self.playlist_table.setBackgroundColor_(NSColor.clearColor())
+            try:
+                self.playlist_table.setStyle_(4)  # NSTableViewStylePlain
+            except Exception:
+                pass
             try:
                 self.playlist_table.setAppearance_(
                     NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
@@ -2610,30 +2924,29 @@ def main() -> int:
             self.playlist_table.setMenu_(menu)
             scroll.setDocumentView_(self.playlist_table)
             view.addSubview_(scroll)
+            self.queue_empty = _label(
+                NSMakeRect(QX + QIN, QY + QH / 2 - 30, QW - QIN * 2, 48),
+                "대기열이 비어 있습니다\n페이지의 ＋ 대기열 또는 여기로 파일을 끌어다 놓으십시오",
+                11, False, GHOST, NSViewMinXMargin | NSViewMinYMargin | NSViewMaxYMargin,
+            )
+            self.queue_empty.setAlignment_(1)
+            self.queue_empty.cell().setWraps_(True)
+            view.addSubview_(self.queue_empty)
 
-            def qbtn(x, w, title, action, symbol=""):
-                btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, PHONE_Y + 12, w, BTN_H))
-                btn.setTitle_(title)
-                btn.setFont_(NSFont.boldSystemFontOfSize_(11))
-                _pill(btn, CARD, SNOW)
-                if symbol:
-                    _icon(btn, symbol, SNOW)
-                btn.setTarget_(self)
-                btn.setAction_(action)
-                btn.setAutoresizingMask_(stick_bot)
-                view.addSubview_(btn)
-                return btn
-
-            self.add_btn = qbtn(SIDE_X + t4[0][0], FW, "＋", "addToPlaylist:", "plus")
-            self.up_btn = qbtn(SIDE_X + t4[1][0], FW, "↑", "moveUp:", "chevron.up")
-            self.down_btn = qbtn(SIDE_X + t4[2][0], FW, "↓", "moveDown:", "chevron.down")
-            self.del_btn = qbtn(SIDE_X + t4[3][0], FW, "삭제", "removeSelected:", "trash")
+            third = (QW - QIN * 2 - 16) / 3
+            bottom = NSViewMinXMargin | NSViewMaxYMargin
+            self.up_btn = qbtn(QX + QIN, QY + QIN, third, "↑", "moveUp:", "chevron.up", "위로 (⌥↑)", bottom)
+            self.down_btn = qbtn(QX + QIN + third + 8, QY + QIN, third, "↓", "moveDown:", "chevron.down",
+                                 "아래로 (⌥↓)", bottom)
+            self.del_btn = qbtn(QX + QIN + (third + 8) * 2, QY + QIN, third, "삭제", "removeSelected:", "trash",
+                                "대기열에서 빼기 (⌫)", bottom)
+            _gui_settings_draw(self, open_=False)
             _gui_playlist_draw(self)
 
-
-            self.dot = _label(NSMakeRect(PAD, 6, 14, 16), "●", 10, False, LIME, NSViewMaxYMargin)
+            # ---- status footer -------------------------------------------------------------
+            self.dot = _label(NSMakeRect(PAD, 7, 14, 16), "●", 11, False, LIME, NSViewMaxYMargin)
             view.addSubview_(self.dot)
-            self.spinner = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(PAD, 7, 14, 14))
+            self.spinner = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(PAD, 8, 14, 14))
             self.spinner.setStyle_(1)  # NSProgressIndicatorStyleSpinning
             self.spinner.setControlSize_(1)  # NSControlSizeSmall
             self.spinner.setDisplayedWhenStopped_(False)
@@ -2641,16 +2954,39 @@ def main() -> int:
             self.spinner.setAutoresizingMask_(NSViewMaxYMargin)
             view.addSubview_(self.spinner)
             self.status = _label(
-                NSMakeRect(PAD + 16, 6, 320, 16), "상태 확인 중…", 10, False, GHOST,
-                NSViewMaxYMargin,
+                NSMakeRect(PAD + 18, 7, 300, 16), "상태 확인 중…", 11, False, GHOST, NSViewMaxYMargin,
             )
             view.addSubview_(self.status)
+            self.reconnect_btn = NSButton.alloc().initWithFrame_(NSMakeRect(W - PAD - 76, 3, 76, 24))
+            self.reconnect_btn.setTitle_("다시 연결")
+            self.reconnect_btn.setFont_(NSFont.boldSystemFontOfSize_(11))
+            _pill(self.reconnect_btn, CARD, SNOW)
+            self.reconnect_btn.setTarget_(self)
+            self.reconnect_btn.setAction_("reconnect:")
+            _describe(self.reconnect_btn, "케이블을 다시 꽂은 뒤 덱을 다시 잡습니다")
+            self.reconnect_btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            view.addSubview_(self.reconnect_btn)
             self.note = _label(
-                NSMakeRect(PAD + 340, 6, W - PAD - 350, 16),
-                "유튜브를 열고 덱 재생. 대기열은 오른쪽.",
-                10, False, GHOST, NSViewWidthSizable | NSViewMaxYMargin,
+                NSMakeRect(PAD + 322, 7, W - PAD * 2 - 322 - 84, 16),
+                "유튜브에서 영상을 열고 ▶ 를 누르십시오.",
+                11, False, GHOST, NSViewWidthSizable | NSViewMaxYMargin,
             )
+            self.note.cell().setLineBreakMode_(4)
             view.addSubview_(self.note)
+            # The window, not the page, starts with the keyboard, so Space and the arrows reach the
+            # player until the user clicks into the page or the address field.
+            self.window.setInitialFirstResponder_(self.playlist_table)
+            ctrl = self
+
+            def on_key(event):
+                if event.window() is not ctrl.window:
+                    return event
+                return None if ctrl.keyCommand_(event) else event
+
+            self.key_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, on_key
+            )
+            _gui_backfill_meta(self)
 
             _gui_install_menu(self)
             self.window.makeKeyAndOrderFront_(None)
@@ -2854,6 +3190,60 @@ def main() -> int:
             self.crop = modes[(modes.index(cur) + 1) % len(modes)]
             _save_prefs(self)
             _gui_mode_draw(self)
+
+        def toggleSettings_(self, _sender):
+            _gui_settings_draw(self, open_=not bool(getattr(self, "settings_open", False)))
+
+        def seekBy_(self, delta):
+            """Move the deck's playhead by `delta` seconds, through the same path as the bar."""
+            duration = float(getattr(self, "media_duration", 0.0) or 0.0)
+            _source, pos, active = deck_playhead()
+            if not active or duration <= 0:
+                return False
+            self.seek_bar.setDoubleValue_(clamp_seek(pos, delta, duration))
+            self.seek_(self.seek_bar)
+            _gui_playhead_draw(self)
+            return True
+
+        def keyCommand_(self, event):
+            """Player keys, active only when no text field or web input has the keyboard.
+
+            Space plays/pauses, ←/→ seek 5s (⇧ 30s), J/L seek 10s, ↑/↓ set volume, M mutes, N/P
+            change track. Returns True when the key was handled. A key typed into the URL field or
+            into a web page's input is never taken: typing there must keep working.
+            """
+            responder = self.window.firstResponder()
+            # The URL field's editor and anything inside the web view own their own keys.
+            if responder is not None and responder.isKindOfClass_(NSText):
+                return False
+            if responder is not None and responder.isKindOfClass_(NSView) and responder.isDescendantOf_(self.web):
+                return False
+            flags = int(event.modifierFlags())
+            if flags & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl):
+                return False
+            shift = bool(flags & NSEventModifierFlagShift)
+            key = {123: "left", 124: "right", 125: "down", 126: "up", 49: "space"}.get(
+                int(event.keyCode()), str(event.charactersIgnoringModifiers() or "").lower()
+            )
+            if key == "space":
+                self.play_(None)
+                return True
+            step = seek_step(key, shift)
+            if step:
+                return self.seekBy_(step) or True
+            if key in ("up", "down"):
+                self.volume = volume_step(getattr(self, "volume", 1.0), key)
+                if self.volume > 0:
+                    self.muted = False
+                _commit_audio(self)
+                self.note.setStringValue_(f"소리 {int(round(self.volume * 100))}%")
+                return True
+            actions = {"m": self.toggleMute_, "n": self.nextTrack_, "p": self.prevTrack_}
+            if key in actions:
+                actions[key](None)
+                return True
+            return False
+
         def prevTrack_(self, _sender):
             now = deck_now_playing() or getattr(self, "seen_watch", "")
             nxt = playlist_prev(
@@ -2897,24 +3287,48 @@ def main() -> int:
         def numberOfRowsInTableView_(self, _table):
             return len(getattr(self, "playlist", []))
 
+        def tableView_viewForTableColumn_row_(self, table, _col, row):
+            """A queue row: 16:9 still, bold title, channel · length. The playing row is lime."""
+            items = getattr(self, "playlist", [])
+            if row < 0 or row >= len(items):
+                return None
+            item = items[row]
+            cell = table.makeViewWithIdentifier_owner_("queueRow", self)
+            width = table.tableColumns()[0].width()
+            if cell is None:
+                cell = NSTableCellView.alloc().initWithFrame_(NSMakeRect(0, 0, width, QUEUE_ROW_H))
+                cell.setIdentifier_("queueRow")
+                art = NSImageView.alloc().initWithFrame_(NSMakeRect(6, 6, 71, 40))
+                art.setImageScaling_(3)
+                art.setWantsLayer_(True)
+                art.layer().setCornerRadius_(5.0)
+                art.layer().setMasksToBounds_(True)
+                art.layer().setBackgroundColor_(CARD.CGColor())
+                art.setTag_(1)
+                cell.addSubview_(art)
+                title = _label(NSMakeRect(86, 26, width - 92, 18), "", 12, True, SNOW, NSViewWidthSizable)
+                title.cell().setLineBreakMode_(4)
+                title.setTag_(2)
+                cell.addSubview_(title)
+                meta = _label(NSMakeRect(86, 8, width - 92, 16), "", 10, False, GHOST, NSViewWidthSizable)
+                meta.cell().setLineBreakMode_(4)
+                meta.setTag_(3)
+                cell.addSubview_(meta)
+            art, title, meta = (cell.viewWithTag_(tag) for tag in (1, 2, 3))
+            on = playlist_playing(item, deck_now_playing(), getattr(self, "seen_watch", ""))
+            title.setStringValue_(playlist_title(item))
+            title.setTextColor_(LIME if on else SNOW)
+            meta.setStringValue_(("▶ 재생 중 · " if on else "") + (playlist_meta(item) or " "))
+            meta.setTextColor_(LIME if on else GHOST)
+            art.setImage_(_thumb_image(self, playlist_source(item)))
+            cell.setToolTip_(playlist_source(item))
+            return cell
+
         def tableView_objectValueForTableColumn_row_(self, _table, _col, row):
             items = getattr(self, "playlist", [])
             if row < 0 or row >= len(items):
                 return ""
             return playlist_label(items[row])
-
-        def tableView_willDisplayCell_forTableColumn_row_(self, _table, cell, _col, row):
-            items = getattr(self, "playlist", [])
-            if row < 0 or row >= len(items):
-                return
-            on = playlist_playing(
-                items[row], deck_now_playing(), getattr(self, "seen_watch", ""),
-            )
-            try:
-                cell.setTextColor_(LIME if on else SNOW)
-                cell.setFont_(NSFont.boldSystemFontOfSize_(12) if on else NSFont.systemFontOfSize_(12))
-            except Exception:
-                pass
 
         def tableView_shouldEditTableColumn_row_(self, _table, _col, _row):
             return False

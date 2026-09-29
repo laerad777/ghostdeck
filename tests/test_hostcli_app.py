@@ -41,12 +41,22 @@ from ghostdeck.app import (
     play_crop_choice,
     fit_label,
     crop_label,
-    overlay_label,
     play_crop_argv,
     playlist_click_row,
     playlist_playing,
-    console_row,
-    QUEUE_CHROME,
+    Layout,
+    LAYOUT_DEFAULT,
+    LAYOUT_MIN,
+    QUEUE_ROW_H,
+    clamp_seek,
+    fetch_thumbnail,
+    now_state_label,
+    playlist_meta,
+    seek_step,
+    thumbnail_cache_path,
+    thumbnail_url,
+    volume_step,
+    youtube_video_id,
     play_failure_note,
     play_success_note,
     should_auto_next,
@@ -1307,22 +1317,153 @@ def test_fit_crop_labels_name_every_mode_distinctly():
     crops = [crop_label(mode) for mode in ("auto", "none")]
     assert len(set(crops)) == 2 and all(label.startswith("여백") for label in crops)
     assert fit_label("nope") == fit_label("auto")
-    assert overlay_label() == "버튼"
     assert seek_note(65, True) == "1:05부터 다시 재생합니다."
     assert seek_note(65, False) == "1:05부터 다시 재생합니다."
 
-def test_product_console_drops_the_phone_notch():
+def test_layout_puts_the_card_on_top_and_gives_spare_width_to_the_browser():
+    """Toolbar, then a full-width Now card, then browser | fixed queue column. Nothing overlaps."""
+    for size in (LAYOUT_DEFAULT, LAYOUT_MIN, (1440, 1000)):
+        lay = Layout(*size)
+        cx, cy, cw, ch = lay.card
+        wx, wy, ww, wh = lay.web
+        qx, qy, qw, qh = lay.queue
+        # The card spans the window under the toolbar.
+        assert (cx, cx + cw) == (lay.pad, size[0] - lay.pad)
+        assert cy + ch + lay.gap == lay.toolbar_y
+        # Browser and queue share one band under the card, with the gap between them.
+        assert wy == qy == lay.footer_h and wh == qh == cy - lay.gap - lay.footer_h
+        assert wx == lay.pad and wx + ww + lay.gap == qx and qx + qw == size[0] - lay.pad
+        # The queue column never changes width; the browser takes the rest.
+        assert qw == lay.side_w
+    grow = Layout(1440, 1000).web[2] - Layout(*LAYOUT_DEFAULT).web[2]
+    assert grow == 1440 - LAYOUT_DEFAULT[0], "all extra width goes to the page"
+    # The minimum still leaves the mobile page its 320pt and the card room for its controls.
+    assert Layout(*LAYOUT_MIN).web[2] >= 320
+    assert LAYOUT_MIN[0] >= 756
+    assert Layout(*LAYOUT_MIN).body_h > QUEUE_ROW_H * 4
+
+
+def test_player_keys_seek_and_set_volume_within_bounds():
+    assert seek_step("right") == 5 and seek_step("left") == -5
+    assert seek_step("right", shift=True) == 30 and seek_step("left", shift=True) == -30
+    assert seek_step("l") == 10 and seek_step("j") == -10 and seek_step("l", shift=True) == 10
+    assert seek_step("x") == 0 and seek_step("up") == 0
+    assert clamp_seek(100, 5, 600) == 105
+    assert clamp_seek(3, -10, 600) == 0
+    assert clamp_seek(598, 30, 600) == 599, "a seek past the end lands on the last second"
+    assert clamp_seek(10, 5, 0) == 15, "unknown length does not clamp the top"
+    assert volume_step(0.5, "up") == 0.6 and volume_step(0.5, "down") == 0.4
+    assert volume_step(0.95, "up") == 1.0 and volume_step(0.05, "down") == 0.0
+    assert volume_step(0.5, "left") == 0.5
+
+
+def test_now_state_label_says_what_the_deck_is_doing():
+    assert now_state_label(True, True, False).endswith("덱에서 재생 중")
+    assert now_state_label(False, True, True) == "여는 중…"
+    assert now_state_label(False, True, False) == "멈춤"
+    assert now_state_label(False, False, False) == "대기 중"
+
+
+def test_queue_rows_carry_length_and_a_still():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    item = playlist_entry(watch, "Never Gonna Give You Up", "Rick Astley", 213)
+    assert item["duration"] == 213
+    assert playlist_meta(item) == "Rick Astley · 3:33"
+    assert playlist_meta(playlist_entry(watch, "t")) == ""
+    assert playlist_meta(playlist_entry("/tmp/a.mp4")) == "로컬 파일"
+    assert playlist_meta(playlist_entry("/tmp/a.mp4", "a", "", 7260)) == "2:01:00"
+    assert "duration" not in playlist_entry(watch, "t", "c", 0)
+    assert "duration" not in playlist_entry(watch, "t", "c", "NA")
+    # A length learned later is merged in, never overwriting a known one, and survives a save.
+    merged = playlist_add([playlist_entry(watch, "t")], watch, duration=99)
+    assert merged[0]["duration"] == 99
+    assert playlist_add(merged, watch, duration=5)[0]["duration"] == 99
+    assert playlist_normalize([{"source": watch, "duration": "12.5"}])[0]["duration"] == 12.5
+    assert youtube_video_id(watch) == "dQw4w9WgXcQ"
+    assert youtube_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert youtube_video_id("/tmp/a.mp4") == ""
+    assert thumbnail_url(watch) == "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+    assert thumbnail_url("/tmp/a.mp4") == ""
+
+
+def test_playlist_durations_survive_save_and_load(tmp_path):
+    path = tmp_path / "playlist.json"
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    playlist_save(path, [playlist_entry(watch, "t", "c", 213), playlist_entry("/tmp/a.mp4")])
+    loaded = playlist_load(path)
+    assert loaded[0]["duration"] == 213
+    assert "duration" not in loaded[1]
+
+
+def test_thumbnails_are_fetched_once_and_cached(tmp_path):
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    hits = []
+
+    class Resp:
+        def __init__(self, data):
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, _n=-1):
+            return self.data
+
+    def fetch(req, timeout=0):
+        hits.append(req.full_url)
+        return Resp(b"\xff\xd8jpeg\xff\xd9")
+
+    first = fetch_thumbnail(watch, root=tmp_path, fetch=fetch)
+    again = fetch_thumbnail(watch, root=tmp_path, fetch=fetch)
+    assert first == again == thumbnail_cache_path(watch, tmp_path)
+    assert first.read_bytes() == b"\xff\xd8jpeg\xff\xd9"
+    assert hits == ["https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"], "cached after the first fetch"
+    # The same video under another URL form shares the cache entry.
+    assert thumbnail_cache_path("https://youtu.be/dQw4w9WgXcQ", tmp_path) == first
+    # A failed fetch leaves nothing behind, so the next call can retry.
+    other = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+
+    def broken(req, timeout=0):
+        raise OSError("offline")
+
+    assert fetch_thumbnail(other, root=tmp_path, fetch=broken) is None
+    assert not thumbnail_cache_path(other, tmp_path).exists()
+    assert list(tmp_path.glob("*.part")) == []
+    # A missing local file has no still.
+    assert fetch_thumbnail(str(tmp_path / "missing.mp4"), root=tmp_path) is None
+
+
+def test_local_file_still_is_one_ffmpeg_frame(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    seen = []
+
+    def probe(argv, **_kwargs):
+        seen.append(argv)
+        if argv[0] == "ffprobe":
+            return type("R", (), {"stdout": "100.0\n", "returncode": 0})()
+        Path(argv[-1]).write_bytes(b"\xff\xd8frame")
+        return type("R", (), {"stdout": "", "returncode": 0})()
+
+    path = fetch_thumbnail(str(clip), root=tmp_path / "thumbs", probe=probe)
+    assert path is not None and path.read_bytes() == b"\xff\xd8frame"
+    grab = seen[-1]
+    assert grab[0] == "ffmpeg" and grab[grab.index("-ss") + 1] == "10.00", "10% in, past any black intro"
+    assert "-frames:v" in grab
+
+
+def test_the_window_is_the_card_layout_not_the_phone_console():
     text = Path(__file__).resolve().parents[1].joinpath("src/ghostdeck/app.py").read_text(encoding="utf-8")
-    assert "PHONE_H - 16" not in text
-    assert "setCornerRadius_(28.0)" not in text
-    assert "class Ghost" not in text
-    assert QUEUE_CHROME == 270
-    assert "h - QUEUE_CHROME" in text
-    assert "MIX_Y" in text
-    assert "DECK_Y" in text
-    assert "PHONE_W = 392" in text
-    assert "CHROME_Y" not in text
-    assert "row_play_btn" not in text
+    assert "L = Layout(*LAYOUT_DEFAULT)" in text
+    assert "setContentMinSize_(LAYOUT_MIN)" in text
+    assert "PHONE_W = 392" not in text, "the fixed phone column is gone: the browser resizes"
+    assert "QUEUE_CHROME" not in text
+    assert "tableView_viewForTableColumn_row_" in text
+    assert "tableView_willDisplayCell_forTableColumn_row_" not in text
+    assert "addLocalMonitorForEventsMatchingMask_handler_" in text
     assert "play.fill" in text
     assert "TOOL_Y" in text
 
@@ -1350,11 +1491,3 @@ def test_playlist_row_is_channel_title_without_play_glyph():
     assert '"▶ " + title' not in text
     assert 'initWithIdentifier_("track")' in text
 
-def test_console_row_shares_one_inset():
-    six = console_row(6)
-    four = console_row(4)
-    assert six[0] == (16, 50)
-    assert six[-1][0] + six[-1][1] == 356
-    assert four[0] == (16, 79)
-    assert four[-1][0] + four[-1][1] == 356
-    assert four[0][0] == six[0][0]
