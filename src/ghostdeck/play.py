@@ -232,11 +232,25 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     if gain > 1:
         gain = 1.0
     argv.extend(["--volume", f"{gain:.4f}"])
-    proc = subprocess.Popen(
-        argv,
-        start_new_session=True,
-        env=env,
-    )
+    gdstate.ensure_dirs()
+    # The player outlives this command, so it must not inherit this command's stdout/stderr. The GUI
+    # runs `play` with captured output and waits for EOF on those pipes; a detached player holding
+    # them kept `play` "running" until the GUI's 30s timeout, which was every track switch (observed:
+    # 20.5s for a 20s clip, returning only when the player exited).
+    log_path = _player_log_path()
+    log = open(log_path, "ab")
+    log_start = log.tell()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+    finally:
+        log.close()
     # A-103: a player that died on startup must not be recorded as a running session, and the
     # command must not exit 0 - the user would be told playback started while nothing is playing.
     # Nothing is written before this check, so there is no stale record to clear on the way out.
@@ -245,18 +259,14 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     except subprocess.TimeoutExpired:
         returncode = None
     if returncode is not None:
-        raise RuntimeError(
-            f"player exited with status {returncode} before it started; nothing is playing"
-        )
+        raise _player_died(returncode, log_path, log_start)
     claim_deadline = time.monotonic() + _CLAIM_WAIT
     open_deadline = time.monotonic() + _OPEN_WAIT
     saw_self = False
     while time.monotonic() < open_deadline:
         returncode = proc.poll()
         if returncode is not None:
-            raise RuntimeError(
-                f"player exited with status {returncode} before it started; nothing is playing"
-            )
+            raise _player_died(returncode, log_path, log_start)
         host = _host_claim(proc.pid)
         if host is not None:
             saw_self = True
@@ -275,6 +285,27 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         # A-104: fail loudly rather than silently reporting a session that was never recorded.
         raise RuntimeError(f"could not record the player pid {proc.pid} in {gdstate.STATE_PATH}")
     _record_identity(proc.pid)
+
+
+def _player_log_path() -> Path:
+    """Where the detached player's own output goes, next to the state it belongs to."""
+    return gdstate.STATE_PATH.parent / "player.log"
+
+
+def _player_died(returncode: int, log_path: Path, offset: int) -> RuntimeError:
+    """The start failure, with the player's own last line (it printed that to its log, not to us)."""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(offset)
+            tail = handle.read(64 * 1024).decode("utf-8", "replace")
+    except OSError:
+        tail = ""
+    # The player also logs JSON diagnostic records; the reason is its one plain `Error: detail` line.
+    lines = [line.strip() for line in tail.splitlines() if line.strip() and not line.lstrip().startswith("{")]
+    reason = f": {lines[-1]}" if lines else ""
+    return RuntimeError(
+        f"player exited with status {returncode} before it started{reason}; nothing is playing"
+    )
 
 
 def playing() -> bool:

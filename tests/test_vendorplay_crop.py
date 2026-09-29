@@ -7,6 +7,8 @@ import sys
 from fractions import Fraction
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 PLAY = ROOT / "vendor" / "d200-color-play.py"
 
@@ -158,17 +160,93 @@ def test_host_audio_is_a_separate_realtime_ffmpeg():
     assert "audiotoolbox" not in silent
     assert "-re" in silent
 
-def test_live_volume_restarts_the_speaker_not_sendcmd():
+class _Speaker:
+    """A stand-in speaker: `stdin` records what the player writes, `poll()` says if it is alive."""
+
+    def __init__(self, alive=True, stdin=True, broken=False):
+        import io
+
+        self.alive = alive
+        self.broken = broken
+        self.stdin = io.BytesIO() if stdin else None
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def written(self):
+        return self.stdin.getvalue().decode()
+
+
+def test_live_volume_changes_the_running_speaker_in_place():
+    """A slider step was a speaker kill + respawn: an audible gap per step, many per drag.
+
+    The speaker takes ffmpeg's interactive command on stdin instead, so the running AudioQueue keeps
+    playing. Respawn is kept only as the fallback when there is no live speaker to talk to.
+    """
     play = _play()
-    text = PLAY.read_text(encoding="utf-8")
-    assert "raise VolumeRequested(volume)" in text
-    assert "c vol volume" not in text
-    assert play.speaker_playhead(10, 1_000_000_000, 3_000_000_000, 1.0) == 12.0
-    assert play.speaker_playhead(0, 5, 1, 1.0) == 0.0
+    speaker = _Speaker()
+    assert play.apply_encoder_volume(speaker, 0.25) is True
+    assert speaker.written() == "cvolume@vol -1 volume 0.2500\n"
+    assert play.CURRENT_VOLUME == 0.25
+    assert play.apply_encoder_volume(speaker, 7) is True  # clamped, still in place
+    assert speaker.written().endswith("cvolume@vol -1 volume 1.0000\n")
+
+    assert play.apply_encoder_volume(None, 0.5) is False
+    assert play.CURRENT_VOLUME == 0.5, "the fallback respawn must still see the new gain"
+    assert play.apply_encoder_volume(_Speaker(alive=False), 0.5) is False
+    assert play.apply_encoder_volume(_Speaker(stdin=False), 0.5) is False
+    closed = _Speaker()
+    closed.stdin.close()
+    assert play.apply_encoder_volume(closed, 0.5) is False
+
+    # The graph the command targets: `volume@vol` has to be the label in the speaker's own filter.
     args = type("Args", (), {"loop": False, "start": 0, "duration": 0, "quality": 12, "volume": 0.0})()
     silent = play.build_audio_command(args, "/tmp/clip.mp4")
     assert "volume@vol=0.0000" in " ".join(silent)
+    assert "-nostdin" not in silent, "-nostdin would switch off the command channel"
+    assert play.speaker_playhead(10, 1_000_000_000, 3_000_000_000, 1.0) == 12.0
+    assert play.speaker_playhead(0, 5, 1, 1.0) == 0.0
     assert play.spawn_speaker(None) is None
+
+
+def test_speaker_stdin_is_a_pipe_and_stderr_is_not_left_unread(monkeypatch):
+    """stdin carries the volume command; an undrained stderr PIPE would block ffmpeg once full."""
+    play = _play()
+    seen = {}
+
+    def fake_popen(argv, **kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(play.subprocess, "Popen", fake_popen)
+    play.spawn_speaker(["ffmpeg", "-f", "audiotoolbox", "dummy"])
+    assert seen["stdin"] is play.subprocess.PIPE
+    assert seen["stderr"] is play.subprocess.DEVNULL
+
+
+def test_the_volume_command_really_changes_ffmpegs_gain():
+    """Run the exact command string against the speaker's own filter graph and measure the level."""
+    import shutil
+    import subprocess
+    import time
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is not installed")
+    play = _play()
+    args = type("Args", (), {"loop": False, "start": 0, "duration": 0, "quality": 12, "volume": 1.0})()
+    graph = play.audio_filter(args) + ",astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level"
+    speaker = subprocess.Popen(
+        ["ffmpeg", "-v", "info", "-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+         "-filter:a", graph, "-f", "null", "-"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    time.sleep(1.5)
+    assert play.apply_encoder_volume(speaker, 0.25) is True
+    _, err = speaker.communicate(timeout=20)
+    levels = [float(line.rsplit("=", 1)[1]) for line in err.decode().splitlines() if "RMS_level=" in line]
+    assert len(levels) > 4, err.decode()[-500:]
+    # 0.25 of the amplitude is -12 dB; the level must drop by about that while the process keeps running.
+    assert levels[-1] < levels[0] - 10, levels
 
 def test_frame_pump_does_not_skip_queued_jpegs():
     play = _play()

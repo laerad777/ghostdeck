@@ -117,10 +117,25 @@ def push_studio_alpha(gain):
         pass
 
 
-def apply_encoder_volume(encoder, gain):
-    """Remember the live gain. The speaker ffmpeg has no sendcmd graph."""
+def apply_encoder_volume(speaker, gain):
+    """Set the running speaker's gain in place. True when the speaker took it.
+
+    The speaker reads ffmpeg's interactive commands on stdin, so `volume@vol` changes on the next
+    audio frame with no gap. Killing and respawning the speaker for every slider step was a gap per
+    step: a new AudioQueue, a fresh HTTP open and a re-seek to the estimated playhead, and a drag
+    sends many steps. False means the caller has to respawn (no speaker, or its stdin is closed).
+    """
     global CURRENT_VOLUME
     CURRENT_VOLUME = clamp_volume(gain)
+    stdin = getattr(speaker, "stdin", None)
+    if speaker is None or stdin is None or speaker.poll() is not None:
+        return False
+    try:
+        stdin.write(f"cvolume@vol -1 volume {CURRENT_VOLUME:.4f}\n".encode())
+        stdin.flush()
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def speaker_playhead(start, started_ns, now_ns, rate=1.0):
@@ -639,8 +654,7 @@ class VideoStream:
             check_cancel(self.cancel)
             wanted = take_seek_request()
             volume = take_volume_request()
-            if volume is not None:
-                apply_encoder_volume(speaker, volume)
+            if volume is not None and not apply_encoder_volume(speaker, volume):
                 raise VolumeRequested(volume)
             overlay = take_overlay_request()
             if overlay is not None:
@@ -718,10 +732,15 @@ def stop_encoder(encoder, *, harsh: bool = False):
 
 
 def spawn_speaker(audio_cmd):
+    """The host speaker. stdin is the live-volume channel; stderr is discarded.
+
+    stderr used to be a PIPE nobody read, so once ffmpeg's warnings (reconnects, decode notices)
+    filled the 16KB pipe buffer the speaker blocked on its next write and the sound stopped.
+    """
     if not audio_cmd:
         return None
     return subprocess.Popen(
-        audio_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
+        audio_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0,
     )
 
 

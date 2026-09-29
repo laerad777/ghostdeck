@@ -13,8 +13,11 @@ they cannot see or disturb a real bridge or a real deck.
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -87,13 +90,21 @@ def test_start_play_raises_when_the_player_dies_on_startup(tmp_path, monkeypatch
     """
     from ghostdeck import play, state
 
-    monkeypatch.setattr(play, "VENDOR_PLAY", _player(tmp_path, "import sys\nprint('boom', file=sys.stderr)\nraise SystemExit(3)\n"))
+    monkeypatch.setattr(play, "VENDOR_PLAY", _player(
+        tmp_path,
+        "import sys\nprint('boom', file=sys.stderr)\n"
+        "print('{\"event\":\"hostVideoTerminal\"}', flush=True)\nraise SystemExit(3)\n",
+    ))
 
     with pytest.raises(RuntimeError) as excinfo:
         play.start_play(str(_source(tmp_path)))
 
     assert "status 3" in str(excinfo.value), excinfo.value
     assert "nothing is playing" in str(excinfo.value), excinfo.value
+    # The player's stderr goes to its log now, so its reason is read back from there -- the plain
+    # line, not the JSON diagnostic record it logs after it.
+    assert "boom" in str(excinfo.value), excinfo.value
+    assert "hostVideoTerminal" not in str(excinfo.value), excinfo.value
     # The dead player must not be recorded as a running session.
     assert state.load()["play_pid"] is None
     assert not (deck_home / ".ghostdeck" / "play.pid").exists()
@@ -132,6 +143,56 @@ def test_start_play_records_a_player_that_stays_up(tmp_path, monkeypatch, deck_h
     import signal
 
     os.kill(data["play_pid"], signal.SIGTERM)
+
+
+def test_play_returns_while_the_player_keeps_running_under_captured_output(tmp_path):
+    """The GUI runs `play` with captured stdout/stderr and waits for EOF.
+
+    The player is detached and outlives `play`. When it inherited those pipes, the GUI's read never
+    saw EOF, so every track switch took the GUI's whole 30s timeout (measured 20.5s for a 20s clip,
+    returning only when the player itself exited). `play` has to return in about its own grace time.
+    """
+    home = tmp_path / "home"
+    (home / ".ghostdeck").mkdir(parents=True)
+    player = _player(tmp_path, "import time\nprint('player says hi', flush=True)\ntime.sleep(30)\n")
+    driver = tmp_path / "driver.py"
+    driver.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / 'src')!r})\n"
+        "from pathlib import Path\n"
+        "from ghostdeck import devicebuild, play, state, studio, usb\n"
+        f"state.HOME = Path({str(home / '.ghostdeck')!r})\n"
+        "state.STATE_PATH = state.HOME / 'state.json'\n"
+        "devicebuild.ensure = lambda: None\n"
+        "play._require_tools = lambda source: None\n"
+        "play.adb.require_adb = lambda: None\n"
+        "usb.detect = lambda: {'serial': 'FAKESERIAL', 'mode': 'adb'}\n"
+        "studio.require_bridge_or_start_it = lambda: None\n"
+        "play._kill_play = lambda **k: None\n"
+        "play._signal_speakers = lambda: None\n"
+        "play.abandon_host_session = lambda *a: None\n"
+        f"play._HOST_STATE = Path({str(tmp_path / 'host.json')!r})\n"
+        "play._CLAIM_WAIT = 0.2\n"
+        f"play.VENDOR_PLAY = Path({str(player)!r})\n"
+        f"play.start_play({str(_source(tmp_path))!r})\n"
+        "print(state.load()['play_pid'])\n",
+        encoding="utf-8",
+    )
+    began = time.monotonic()
+    result = subprocess.run([sys.executable, str(driver)], capture_output=True, text=True, timeout=25)
+    elapsed = time.monotonic() - began
+    pid = int(result.stdout.strip().splitlines()[-1])
+    try:
+        assert result.returncode == 0, result.stderr
+        assert elapsed < 8, f"play blocked for {elapsed:.1f}s on the detached player's pipes"
+        assert "player says hi" not in result.stdout + result.stderr
+        deadline = time.monotonic() + 5
+        log = home / ".ghostdeck" / "player.log"
+        while "player says hi" not in (log.read_text() if log.exists() else "") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert "player says hi" in log.read_text(), "the player's output was lost instead of logged"
+    finally:
+        os.kill(pid, signal.SIGKILL)
 
 
 def test_start_play_leaves_the_studio_copy_running(tmp_path, monkeypatch, deck_home):
