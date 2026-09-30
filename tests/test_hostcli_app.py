@@ -60,6 +60,7 @@ from ghostdeck.app import (
     play_failure_note,
     play_success_note,
     should_auto_next,
+    deck_finished,
     opening_session,
     seek_note,
     player_prefs_load,
@@ -1289,25 +1290,47 @@ def test_real_cli_refusals_map_to_korean(monkeypatch, tmp_path):
         raise AssertionError("_require_tools did not refuse")
 
 
-def test_auto_next_skips_live_session():
-    assert should_auto_next(
-        playing=True, session_active=False, was_playing=True, saw_picture=True,
-        user_stopped=False, busy=False,
-    ) is False
-    assert should_auto_next(
-        playing=False, session_active=True, was_playing=True, saw_picture=True,
-        user_stopped=False, busy=False,
-    ) is True
-    assert should_auto_next(
-        playing=False, session_active=True, was_playing=False, saw_picture=False,
-        user_stopped=False, busy=False,
-    ) is False
-    assert should_auto_next(
-        playing=False, session_active=False, was_playing=True, saw_picture=True,
-        user_stopped=False, busy=False,
-    ) is True
+def test_auto_next_waits_for_the_track_to_reach_its_own_end():
+    """Only a natural end advances; the empty gap inside a switch is not an end."""
+    ended = dict(playing=False, finished=True, was_playing=True, saw_picture=True, user_stopped=False, busy=False)
+    assert should_auto_next(**ended) is True
+    # The switch gap: the old player is gone, the new one not up yet, and no DONE record names the
+    # track -- this was the case that started a second play over the one just chosen.
+    assert should_auto_next(**{**ended, "finished": False}) is False
+    assert should_auto_next(**{**ended, "playing": True}) is False
+    assert should_auto_next(**{**ended, "user_stopped": True}) is False
+    assert should_auto_next(**{**ended, "busy": True}) is False
+    assert should_auto_next(**{**ended, "saw_picture": False}) is False, "never shown, never ended"
     assert opening_session(playing=True, has_picture=False, session_active=True) is True
     assert opening_session(playing=False, has_picture=True, session_active=False) is False
+
+
+def test_deck_finished_names_only_a_natural_end(tmp_path):
+    path = tmp_path / "host.json"
+    src = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def record(phase, state, cleanup="proven"):
+        path.write_text(json.dumps({
+            "phase": phase, "source": src,
+            "video": {"status": {"state": state, "cleanup": cleanup}},
+        }), encoding="utf-8")
+
+    record("terminal", 6)
+    assert deck_finished(path) == src
+    record("terminal", 8)        # cancelled: a stop or a switch killed it
+    assert deck_finished(path) == ""
+    record("terminal", 9)        # failed
+    assert deck_finished(path) == ""
+    record("terminal", 6, "unproven")
+    assert deck_finished(path) == ""
+    record("active", 4)          # still streaming
+    assert deck_finished(path) == ""
+    # `abandon_host_session` marks a killed player terminal without a DONE status.
+    path.write_text(json.dumps({"phase": "terminal", "source": src, "video": {"status": {"state": 4}}}))
+    assert deck_finished(path) == ""
+    path.write_text("not json")
+    assert deck_finished(path) == ""
+    assert deck_finished(tmp_path / "missing.json") == ""
 
 
 def test_fit_crop_labels_name_every_mode_distinctly():

@@ -788,18 +788,46 @@ def play_success_note(has_picture: bool) -> str:
     return "첫 프레임을 기다리는 중입니다."
 
 
+# `d200_video_stream` states: DONE is 6, reached only when the deck consumed every frame up to EOS.
+_VIDEO_STATE_DONE = 6
+
+
+def deck_finished(path: Path = HOST_STATE) -> str:
+    """The source whose session ended because the video ran out, or empty.
+
+    Only a natural end counts: the player published `phase=terminal` with the deck's own DONE status
+    and proven cleanup. A player that was killed (a switch started from anywhere, a stop) or that
+    failed leaves a different status, so its disappearance is not "the track ended".
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ""
+    if not isinstance(data, dict) or str(data.get("phase") or "") != "terminal":
+        return ""
+    video = data.get("video") if isinstance(data.get("video"), dict) else {}
+    status = video.get("status") if isinstance(video.get("status"), dict) else {}
+    if status.get("state") != _VIDEO_STATE_DONE or status.get("cleanup") != "proven":
+        return ""
+    return str(data.get("source") or "").strip()
+
+
 def should_auto_next(
     *,
     playing: bool,
-    session_active: bool,
+    finished: bool,
     was_playing: bool,
     saw_picture: bool,
     user_stopped: bool,
     busy: bool,
 ) -> bool:
-    if user_stopped or busy or playing:
-        return False
-    if session_active and not saw_picture:
+    """Advance only after the track we watched play reached its own end.
+
+    `finished` is `deck_finished()` naming that track. Without it, "no player and no session" also
+    matched the gap inside a switch, so the window started the next track over the one just chosen
+    and the new player was killed (measured: 2 of 12 external switches while the window was open).
+    """
+    if user_stopped or busy or playing or not finished:
         return False
     return was_playing and saw_picture
 
@@ -2139,6 +2167,29 @@ def main() -> int:
         ctrl.note.setStringValue_("대기열에 넣었습니다.")
 
 
+    def _gui_card_row(ctrl) -> None:
+        """Fit mute + volume between the repeat button and the settings button.
+
+        Autoresizing alone cannot do this: a fixed-width slider pinned right slides into the
+        transport buttons as the window narrows (measured at 760pt: over shuffle and repeat), and a
+        stretchy one becomes absurdly long when it widens. So the slider takes what is free, 60-160pt.
+        """
+        repeat = getattr(ctrl, "repeat_btn", None)
+        gear = getattr(ctrl, "settings_btn", None)
+        volume = getattr(ctrl, "volume_bar", None)
+        mute = getattr(ctrl, "mute_btn", None)
+        if None in (repeat, gear, volume, mute):
+            return
+        left = repeat.frame().origin.x + repeat.frame().size.width + 16
+        right = gear.frame().origin.x - 12
+        width = max(60.0, min(160.0, right - left - 32 - 6))
+        vf = volume.frame()
+        vf.origin.x, vf.size.width = right - width, width
+        volume.setFrame_(vf)
+        mf = mute.frame()
+        mf.origin.x = vf.origin.x - 6 - mf.size.width
+        mute.setFrame_(mf)
+
     def _gui_settings_draw(ctrl, open_=None) -> None:
         """Show or hide the deck-settings drawer at the top of the queue column.
 
@@ -2151,9 +2202,13 @@ def main() -> int:
         for item in getattr(ctrl, "settings_views", []):
             item.setHidden_(not on)
         scroll = getattr(ctrl, "queue_scroll", None)
-        top = getattr(ctrl, "queue_top", None)
-        if scroll is not None and top is not None:
+        head = getattr(ctrl, "queue_head", None)
+        if scroll is not None and head is not None:
+            # Measured from the header's current frame, not a launch-time constant: the header rides
+            # the column's top edge as the window resizes, and the list must end under it (or under
+            # the drawer) at every size.
             frame = scroll.frame()
+            top = head.frame().origin.y - 10
             ceiling = top - (getattr(ctrl, "settings_h", 0) if on else 0)
             frame.size.height = max(60.0, ceiling - frame.origin.y)
             scroll.setFrame_(frame)
@@ -2370,15 +2425,21 @@ def main() -> int:
         if picture:
             ctrl.was_playing = True
             ctrl.saw_picture = True
+            # The deck is the authority on what is playing: a track started from the CLI, the deck
+            # or another window is the one whose end must advance the queue.
+            if now and not getattr(ctrl, "busy", False):
+                ctrl.seen_watch = now
             return
         from ghostdeck import play as playmod
         proc = playmod.playing()
         opening = (proc or deck_session_active()) and not getattr(ctrl, "saw_picture", False)
         if (opening or proc) and not picture:
             return
+        watched = playlist_identity(getattr(ctrl, "seen_watch", "") or now)
+        ended = playlist_identity(deck_finished())
         if should_auto_next(
             playing=proc,
-            session_active=deck_session_active(),
+            finished=bool(ended) and ended == watched,
             was_playing=getattr(ctrl, "was_playing", False),
             saw_picture=getattr(ctrl, "saw_picture", False),
             user_stopped=getattr(ctrl, "user_stopped", False),
@@ -2523,9 +2584,6 @@ def main() -> int:
             self.window.setContentMinSize_(LAYOUT_MIN)
             self.window.setContentSize_((W, H))
             self.window.setBackgroundColor_(INK)
-            # Remember size and place across launches. The key lives in the shared `Python` defaults
-            # domain (the GUI has no bundle id of its own), so it is namespaced to this window.
-            self.window.setFrameAutosaveName_("ghostdeck.main")
             try:
                 self.window.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua"))
             except Exception:
@@ -2781,6 +2839,7 @@ def main() -> int:
             self.mute_btn = tbtn(TR - 32 - 12 - vol_w - 6 - 32, 32, "음소거", "toggleMute:",
                                  symbol="speaker.wave.2.fill")
             self.mute_btn.setAutoresizingMask_(top_right)
+            # Their final frames come from `_gui_card_row`, on every resize.
 
             # ---- queue column --------------------------------------------------------------
             frost = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(QX, QY, QW, QH))
@@ -2870,9 +2929,8 @@ def main() -> int:
             # The list, and the row actions under it.
             BTN_H = 28
             table_y = QY + QIN + BTN_H + 8
-            self.queue_top = head_y - 10
             scroll = NSScrollView.alloc().initWithFrame_(
-                NSMakeRect(QX + QIN - 6, table_y, QW - QIN * 2 + 12, self.queue_top - table_y)
+                NSMakeRect(QX + QIN - 6, table_y, QW - QIN * 2 + 12, head_y - 10 - table_y)
             )
             scroll.setHasVerticalScroller_(True)
             scroll.setAutohidesScrollers_(True)
@@ -2989,6 +3047,14 @@ def main() -> int:
             _gui_backfill_meta(self)
 
             _gui_install_menu(self)
+            # Remember size and place across launches -- restored only now. Every control above is
+            # placed for LAYOUT_DEFAULT and follows later size changes through its autoresizing
+            # mask; restoring the saved frame before they existed left them placed for 1000x860
+            # inside a smaller view, so the toolbar and the card landed above the window's top edge.
+            # The key lives in the shared `Python` defaults domain (no bundle id of our own).
+            self.window.setFrameAutosaveName_("ghostdeck.main")
+            _gui_card_row(self)
+            _gui_settings_draw(self)
             self.window.makeKeyAndOrderFront_(None)
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 2.0, self, "poll:", None, True
@@ -3507,6 +3573,10 @@ def main() -> int:
                     kept.append((win, popup))
             self.popups = kept
 
+
+        def windowDidResize_(self, _notification):
+            _gui_card_row(self)
+            _gui_settings_draw(self)
 
         def windowWillClose_(self, _notification):
             try:
