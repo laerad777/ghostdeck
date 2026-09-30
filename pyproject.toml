@@ -54,7 +54,7 @@ ghostdeck = "ghostdeck.cli:main"
 hid = ["hidapi"]
 usb = ["pyusb"]
 device = ["hidapi", "pyusb"]
-gui = ["pyobjc-framework-Cocoa", "pyobjc-framework-WebKit"]
+gui = ["pyobjc-framework-Cocoa", "pyobjc-framework-WebKit", "pyobjc-framework-MediaPlayer"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -36,6 +36,9 @@ source .venv/bin/activate
 python -m pip install -e ".[device]"
 ```
 
+The window (`ghostdeck gui`, `macos/Ghostdeck.app`) also needs `python -m pip install -e ".[gui]"`
+(PyObjC Cocoa, WebKit and MediaPlayer).
+
 Put `adb` and `ffmpeg` on `PATH`. Homebrew ffmpeg plus Android
 platform-tools is enough:
 
@@ -94,7 +97,7 @@ bridge that copy's shim sees no device.
 | `ghostdeck stop` | Stop the player. If the bridge is down, restore stock UI and clear `/tmp/ghostdeck-*`. If the bridge is up, leave the deck in ADB so Studio keys keep working. |
 | `ghostdeck detect` | Serial, VID/PID, USB mode. Fails if no deck. |
 | `ghostdeck status` | One line: `usb=… [transport=…] shim=… copy=… playing=…`. `transport=` appears only when the deck is attached but its adb transport will not run a command. |
-| `ghostdeck gui` | A small browser with a Now Playing card on top (still, title, seek, transport, volume) and the queue on the right (still, title, channel · length). Play the open video or a local file (파일 / drop / Cmd-O) on the deck. Ads on the same YouTube id do not restart. Not a host player. Without the official app it plays through the bridge alone. Studio / bridge / fit / crop / button opacity are in the settings drawer (the sliders button on the card). Keys when no text field has focus: Space play/pause, ←/→ 5s (⇧ 30s), J/L 10s, ↑/↓ volume, M mute, N/P next/previous; menu: ↩ play, ⌘. stop. `macos/Ghostdeck.app` opens it from Finder and shows an alert when it cannot start; its stderr goes to `~/.ghostdeck/gui.log`. |
+| `ghostdeck gui` | A small browser with a Now Playing card on top (still, title, seek, transport, volume) and the queue on the right (still, title, channel · length). Play the open video or a local file (파일 / drop / Cmd-O) on the deck. Ads on the same YouTube id do not restart. Not a host player. Without the official app it plays through the bridge alone. Studio / bridge / fit / crop / button opacity are in the settings drawer (the sliders button on the card). Keys when no text field has focus: Space play/pause, ←/→ 5s (⇧ 30s), J/L 10s, ↑/↓ volume, M mute, N/P next/previous; in the queue ⌫ removes (⌘Z undoes) and ⌥↑/⌥↓ reorder; menu: ↩ play, ⌘. stop. The keyboard media keys, AirPods and Control Center control the deck too. Closing the window only hides it: the deck keeps playing and the menu-bar item (or a Dock click) brings it back; ⌘Q quits. Dropping a folder on the queue adds its videos in name order. `macos/Ghostdeck.app` opens it from Finder and shows an alert when it cannot start; its stderr goes to `~/.ghostdeck/gui.log`. |
 
 `play` is a launcher: it returns after the player has survived a short grace
 window. The player keeps looping until `stop`.

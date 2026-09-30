@@ -25,7 +25,7 @@ fi
 
 # The window needs pyobjc; check it here, where a failure can still be shown, because `exec` below
 # hands this process to Python and nothing after it runs.
-if ! reason="$("$PY" -c 'import AppKit, WebKit, ghostdeck.app' 2>&1)"; then
+if ! reason="$("$PY" -c 'import AppKit, WebKit, MediaPlayer, ghostdeck.app' 2>&1)"; then
   fail "${PY}: $(printf '%s\n' "$reason" | tail -n 1)
 pip install -e \".[device,gui]\" 을 실행하십시오."
 fi

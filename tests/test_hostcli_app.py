@@ -61,6 +61,24 @@ from ghostdeck.app import (
     play_success_note,
     should_auto_next,
     deck_finished,
+    now_playing_snapshot,
+    source_length,
+    note_kind,
+    note_expired,
+    NOTE_INFO_SECONDS,
+    control_states,
+    settings_summary,
+    thumbnail_prune,
+    seek_base,
+    time_labels,
+    remote_play_wanted,
+    status_menu_items,
+    REMOTE_COMMANDS,
+    NOW_PLAYING_PLAYING,
+    NOW_PLAYING_PAUSED,
+    drop_note,
+    should_adopt_now,
+    sources_in_drop,
     opening_session,
     seek_note,
     player_prefs_load,
@@ -142,7 +160,7 @@ def test_the_window_shows_a_readable_state_instead_of_the_raw_status_line():
     assert status_text("usb=adb shim=up copy=yes playing=yes", has_picture=False) == "덱 ADB · 키 연결됨 · 여는 중"
     assert status_text("usb=adb shim=up copy=yes playing=no") == "덱 ADB · 키 연결됨 · 멈춤"
     assert status_text("usb=hid shim=down copy=yes playing=no") == "덱 HID · 키 없음 · 멈춤"
-    assert status_text("usb=none shim=down copy=no playing=no") == "덱 없음 · 키 없음 · 멈춤 · 연결을 누르십시오"
+    assert status_text("usb=none shim=down copy=no playing=no") == "덱 없음 · 키 없음 · 멈춤 · 다시 연결을 누르십시오"
 
 
 def test_a_bridge_that_is_up_is_not_worth_saying_in_the_window():
@@ -282,6 +300,70 @@ def test_playable_source_uses_a_direct_media_file():
     assert playable_source(page, media) == media
 
 
+def test_only_a_video_is_a_playable_source():
+    """Any other text used to pass straight through: a shell command copied to the clipboard was
+    sent as `play <command>`, and '추가' on about:blank queued 'about:blank'."""
+    assert playable_source("about:blank") == ""
+    assert playable_source("javascript:alert(1)") == ""
+    assert playable_source("file:///etc/passwd") == ""
+    assert playable_source('FOO="$PWD/bin" ./scripts/tool issue --file ~/x.json') == ""
+    assert playable_source("https://example.com/a b") == "", "text with spaces is not a URL"
+    assert playable_source("https://localhost/x") == ""
+    assert playable_source("회의록 초안입니다") == ""
+    assert playable_source("https://cdn.example.com/live/index.m3u8?token=1") == \
+        "https://cdn.example.com/live/index.m3u8?token=1"
+    assert playable_source("https://youtu.be/dQw4w9WgXcQ") == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert playable_source("/tmp/clip.mp4") == "/tmp/clip.mp4"
+    assert playable_source("/tmp/notes.txt") == ""
+
+
+def test_another_sites_video_page_still_plays():
+    """▶ plays the open video on any site (9b9f5e9): the player resolves the page with yt-dlp.
+    Tightening the filter must not drop that; only YouTube's non-video pages stay refused."""
+    assert playable_source("https://vimeo.com/76979871") == "https://vimeo.com/76979871"
+    assert playable_source("https://www.twitch.tv/videos/123") == "https://www.twitch.tv/videos/123"
+    assert playable_source("https://www.youtube.com/@channel") == ""
+    assert play_request("https://vimeo.com/76979871", "https://vimeo.com/76979871")[0] == "https://vimeo.com/76979871"
+    # A clipboard or field holding junk yields nothing to play, and says so upstream.
+    assert play_request("https://www.youtube.com/", "https://www.youtube.com/",
+                        pasteboard='FOO="$PWD" ./tool --x') == ("", 0.0)
+    assert play_request("", "about:blank") == ("", 0.0)
+    assert resolve_source("", "https://vimeo.com/76979871") == "https://vimeo.com/76979871"
+    assert resolve_source("", "/Users/me/notes.txt") == ""
+    assert resolve_source("", "/Users/me/Movies/a.mp4") == "/Users/me/Movies/a.mp4"
+
+
+def test_a_drop_yields_the_media_it_holds_and_says_what_it_skipped(tmp_path):
+    clips = tmp_path / "clips"
+    clips.mkdir()
+    for name in ("b.mkv", "a.mp4", "notes.txt", ".hidden.mp4"):
+        (clips / name).write_bytes(b"x")
+    (clips / "nested").mkdir()
+    (clips / "nested" / "deep.mp4").write_bytes(b"x")
+    loose = tmp_path / "c.mov"
+    loose.write_bytes(b"x")
+    found, skipped = sources_in_drop([str(clips), str(loose), str(tmp_path / "readme.txt")])
+    # A folder gives its own media files in name order (not hidden files, not subfolders).
+    assert found == [str(clips / "a.mp4"), str(clips / "b.mkv"), str(loose)]
+    assert skipped == 1, "the loose .txt is the one refused item"
+    assert sources_in_drop([str(tmp_path / "readme.txt")]) == ([], 1)
+    assert sources_in_drop([str(tmp_path / "empty")]) == ([], 1)
+    assert drop_note(3, 1) == "3개를 대기열에 넣었습니다. 영상이 아닌 1개는 건너뛰었습니다."
+    assert drop_note(1, 0) == "대기열에 넣었습니다."
+    assert drop_note(0, 2) == "영상 파일이 아닙니다. mp4 · mkv · mov · webm · m4v 파일을 놓으십시오."
+
+
+def test_a_track_removed_from_the_queue_is_not_put_back_by_the_poll():
+    """The poll re-added whatever the deck played if it was missing from the queue, so deleting the
+    playing row came back at the end 2s later (measured 9 -> 10 rows)."""
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert should_adopt_now(watch, [], removed=set()) is True, "a track started elsewhere joins"
+    assert should_adopt_now(watch, [], removed={watch}) is False
+    assert should_adopt_now("https://youtu.be/dQw4w9WgXcQ", [], removed={watch}) is False
+    assert should_adopt_now(watch, [playlist_entry(watch)], removed=set()) is False
+    assert should_adopt_now("", [], removed=set()) is False
+
+
 def test_should_start_play_ignores_the_same_youtube_video():
     watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert should_start_play(watch, watch, "https://rr.googlevideo.com/videoplayback") == ""
@@ -381,7 +463,8 @@ def test_deck_crop_reads_a_letterbox_rect(tmp_path):
 
 
 def test_empty_field_plays_a_copied_url():
-    assert resolve_source("", "https://youtu.be/dQw4w9WgXcQ") == "https://youtu.be/dQw4w9WgXcQ"
+    # A copied short link plays as its canonical watch URL, the same identity the queue keys on.
+    assert resolve_source("", "https://youtu.be/dQw4w9WgXcQ") == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert resolve_source("/tmp/clip.mp4", "https://youtu.be/x") == "/tmp/clip.mp4"
     assert resolve_source("", "not a source") == ""
 
@@ -396,7 +479,7 @@ def test_play_uses_pasteboard_when_the_field_is_empty():
         return CommandResult(argv, 0, "", "")
 
     DeckRemote(run).play("  ", pasteboard="https://youtu.be/dQw4w9WgXcQ")
-    assert calls == [["status"], ["play", "https://youtu.be/dQw4w9WgXcQ"]]
+    assert calls == [["status"], ["play", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"]]
 
 
 def test_play_starts_studio_when_the_shim_is_down():
@@ -1207,16 +1290,16 @@ def test_the_refusals_a_user_actually_hits_are_korean_and_actionable():
     from ghostdeck import studio
 
     cases = {
-        "no D200 on USB": "연결",
-        "timed out": "연결",
+        "no D200 on USB": "다시 연결",
+        "timed out": "다시 연결",
         f"{studio.STUDIO_MISSING} {studio.ORIGINAL}": "브리지",
         f"{studio.BRIDGE_DOWN} (absent), and the player reaches the deck through it": "스튜디오",
         "ffmpeg not on PATH: install it (brew install ffmpeg)": "brew install ffmpeg",
         "yt-dlp not on PATH: install it (brew install yt-dlp)": "brew install yt-dlp",
         "hidapi is not installed (pip install hidapi)": "pip install",
         "the deck (S) is attached in ADB mode but its adb transport is offline, so it": "뽑았다",
-        "D200 is not enumerating through ADB: no bridge serial": "연결",
-        "hidshim bridge socket did not come up": "연결",
+        "D200 is not enumerating through ADB: no bridge serial": "다시 연결",
+        "hidshim bridge socket did not come up": "다시 연결",
         f"a listener holds {studio.SOCKET} but no live {studio.BRIDGE.name} of ours owns it": "브리지 소켓",
         "d200-color-agent is not built.": "README",
     }
@@ -1514,3 +1597,176 @@ def test_playlist_row_is_channel_title_without_play_glyph():
     assert '"▶ " + title' not in text
     assert 'initWithIdentifier_("track")' in text
 
+
+
+def test_now_playing_snapshot_is_what_macos_shows():
+    watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    item = playlist_entry(watch, "Never Gonna Give You Up", "Rick Astley", 213)
+    snap = now_playing_snapshot(item, playing=True, position=61.5, duration=0)
+    assert snap == {"title": "Never Gonna Give You Up", "artist": "Rick Astley", "elapsed": 61.5,
+                    "rate": 1.0, "state": NOW_PLAYING_PLAYING, "duration": 213.0}
+    paused = now_playing_snapshot(item, playing=False, position=61.5, duration=213)
+    assert paused["rate"] == 0.0 and paused["state"] == NOW_PLAYING_PAUSED, "a stopped deck does not drift"
+    assert now_playing_snapshot(item, playing=True, position=999, duration=213)["elapsed"] == 213
+    live = now_playing_snapshot(playlist_entry(watch, "Live", ""), playing=True, position=10, duration=0)
+    assert "duration" not in live and live["artist"] == "ghostdeck"
+    assert now_playing_snapshot({}, playing=False, position=0, duration=0) == {}
+    assert now_playing_snapshot(None, playing=True, position=0, duration=0) == {}
+
+
+def test_system_media_commands_map_to_window_actions():
+    assert REMOTE_COMMANDS["togglePlayPauseCommand"] == "play:"
+    assert REMOTE_COMMANDS["nextTrackCommand"] == "nextTrack:"
+    assert REMOTE_COMMANDS["previousTrackCommand"] == "prevTrack:"
+    assert REMOTE_COMMANDS["stopCommand"] == "stop:"
+    # Explicit play on a playing deck / pause on a stopped deck must not toggle the other way.
+    assert remote_play_wanted("remotePlay:", has_picture=True) is False
+    assert remote_play_wanted("remotePlay:", has_picture=False) is True
+    assert remote_play_wanted("remotePause:", has_picture=False) is False
+    assert remote_play_wanted("remotePause:", has_picture=True) is True
+    assert remote_play_wanted("play:", has_picture=True) is True
+
+
+def test_menu_bar_item_offers_control_with_the_window_hidden():
+    rows = status_menu_items(has_picture=True, has_source=True, busy=False, window_visible=False)
+    titles = [t for t, a in rows if a]
+    assert titles[0] == "일시정지" and "정지" in titles and "ghostdeck 창 보기" in titles
+    assert rows[-1] == ("ghostdeck 종료", "terminate:")
+    idle = [t for t, a in status_menu_items(has_picture=False, has_source=False, busy=False, window_visible=True) if a]
+    assert idle[0] == "재생" and "정지" not in idle and "ghostdeck 창 앞으로" in idle
+
+
+def test_now_card_state_tells_opening_playing_stopped_and_idle_apart():
+    # Opening: the play was sent (busy) or the player claimed the deck but no frame yet.
+    assert now_state_label(False, True, True) == "여는 중…"
+    assert now_state_label(False, True, False, session_active=True) == "여는 중…", \
+        "a claimed session with no frame read '멈춤' for the whole 1-5s start"
+    assert now_state_label(True, True, False, session_active=True) == "● 덱에서 재생 중"
+    # Stopped with a resume point: the card keeps the track and says where ▶ resumes.
+    assert now_state_label(False, True, False, resume=734.0) == "멈춤 · 12:14부터 이어 재생"
+    assert now_state_label(False, True, False) == "멈춤"
+    assert now_state_label(False, False, False) == "대기 중"
+
+
+def test_repeated_seek_keys_add_up_from_the_pending_target():
+    """← ← from 100s gave [95, 95]: each press re-read the deck, which had not moved yet."""
+    now = 1000.0
+    assert seek_base(100.0, hold=None, hold_until=0.0, now=now) == 100.0
+    assert seek_base(100.0, hold=95.0, hold_until=now + 1.5, now=now) == 95.0
+    assert seek_base(100.0, hold=95.0, hold_until=now - 0.1, now=now) == 100.0, "an expired hold is not reused"
+    assert clamp_seek(seek_base(100.0, hold=95.0, hold_until=now + 1, now=now), -5, 600) == 90.0
+
+
+def test_time_labels_for_live_vod_and_nothing():
+    assert time_labels(734.0, 7260.0, has_source=True) == ("12:14", "2:01:00")
+    assert time_labels(120.0, 0.0, has_source=True, live=True) == ("2:00", "실시간")
+    assert time_labels(120.0, 0.0, has_source=True) == ("2:00", "--:--")
+    assert time_labels(0.0, 0.0, has_source=False) == ("0:00", "--:--")
+
+
+def test_footer_info_fades_but_errors_and_progress_stay():
+    assert note_kind("대기열에 넣었습니다.") == "info"
+    assert note_kind("재생 준비 중…") == "progress"
+    assert note_kind("덱이 USB에 없습니다.", error=True) == "error"
+    assert note_expired("info", 100.0, 100.0 + NOTE_INFO_SECONDS) is True
+    assert note_expired("info", 100.0, 100.0 + NOTE_INFO_SECONDS - 0.1) is False
+    assert note_expired("error", 100.0, 1e9) is False, "an error stays until something else is said"
+    assert note_expired("progress", 100.0, 1e9) is False, "a … line stays until its operation reports"
+
+
+def test_buttons_are_enabled_only_when_they_can_act():
+    empty = control_states(queue_len=0, selected=-1, has_picture=False, has_source=False, busy=False)
+    assert empty == {"play_btn": True, "stop_btn": False, "prev_btn": False, "next_btn": False,
+                     "del_btn": False, "up_btn": False, "down_btn": False}
+    top = control_states(queue_len=3, selected=0, has_picture=True, has_source=True, busy=False)
+    assert top["stop_btn"] and top["del_btn"] and top["down_btn"] and not top["up_btn"]
+    bottom = control_states(queue_len=3, selected=2, has_picture=False, has_source=False, busy=False)
+    assert bottom["up_btn"] and not bottom["down_btn"] and not bottom["stop_btn"]
+    assert control_states(queue_len=3, selected=7, has_picture=False, has_source=False, busy=False)["del_btn"] is False
+    assert control_states(queue_len=0, selected=-1, has_picture=False, has_source=False, busy=True)["stop_btn"], \
+        "■ can cancel a play that is still starting"
+
+
+def test_recovery_hints_name_the_real_button():
+    """The button is titled '다시 연결'; hints that said '연결을 누르십시오' named no visible button."""
+    text = Path(__file__).resolve().parents[1].joinpath("src/ghostdeck/app.py").read_text(encoding="utf-8")
+    import re
+    assert not re.search(r"(?<!다시 )연결을 누르", text)
+    assert failure_note("no D200 on USB").endswith("다시 연결을 누르십시오.")
+
+
+def test_hidden_settings_are_summarised():
+    assert settings_summary("auto", "auto") == ""
+    assert settings_summary("cover", "auto") == "화면: 채움"
+    assert settings_summary("pad", "none") == "화면: 맞춤 · 여백: 유지"
+
+
+def test_a_live_row_is_remembered_so_it_is_not_probed_again(tmp_path):
+    watch = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+    rows = playlist_add([], watch, "Radio", "Ch", 0, live=True)
+    assert rows[0].get("live") is True and "duration" not in rows[0]
+    path = tmp_path / "playlist.json"
+    playlist_save(path, rows)
+    assert playlist_load(path)[0].get("live") is True, "survives a save"
+    # A real length learned later replaces the live mark.
+    later = playlist_add(rows, watch, duration=120)
+    assert later[0]["duration"] == 120 and "live" not in later[0]
+    assert playlist_normalize([{"source": watch, "live": "yes"}])[0].get("live") is None, "only a true bool counts"
+
+
+def test_the_thumbnail_cache_is_pruned_to_the_queue(tmp_path):
+    keep = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+    gone = "https://www.youtube.com/watch?v=bbbbbbbbbbb"
+    for source in (keep, gone):
+        thumbnail_cache_path(source, tmp_path).write_bytes(b"x")
+    (tmp_path / "inflight.part").write_bytes(b"x")
+    (tmp_path / "notes.txt").write_bytes(b"x")
+    assert thumbnail_prune([keep], tmp_path) == 1
+    assert thumbnail_cache_path(keep, tmp_path).exists()
+    assert not thumbnail_cache_path(gone, tmp_path).exists()
+    assert (tmp_path / "inflight.part").exists(), "a fetch in flight is not pulled out from under it"
+    assert (tmp_path / "notes.txt").exists(), "only our own cache files are touched"
+    assert thumbnail_prune([keep], tmp_path / "missing") == 0
+
+
+def test_only_a_clean_no_length_answer_marks_a_row_live():
+    """An offline launch used to mark every length-less YouTube row live for good."""
+    watch = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+
+    def answer(stdout, code=0):
+        def probe(argv, **_k):
+            return type("R", (), {"stdout": stdout, "returncode": code})()
+        return probe
+
+    assert source_length(watch, probe=answer("NA\n")) == (0.0, True)
+    assert source_length(watch, probe=answer("213\n")) == (213.0, False)
+    assert source_length(watch, probe=answer("", 1)) == (0.0, False), "a failed probe is not live"
+    assert source_length(watch, probe=answer("NA\n", 1)) == (0.0, False)
+
+    def offline(argv, **_k):
+        raise OSError("no network")
+
+    assert source_length(watch, probe=offline) == (0.0, False)
+    assert source_length("/tmp/clip.mp4", probe=answer("NA\n")) == (0.0, False), "only YouTube can be live"
+
+
+def test_stop_is_off_once_the_deck_has_stopped():
+    """The card keeps the resume point after ■, but ■ itself has nothing left to stop."""
+    stopped = control_states(queue_len=3, selected=0, has_picture=False, has_source=False, busy=False)
+    assert stopped["stop_btn"] is False
+    opening = control_states(queue_len=3, selected=0, has_picture=False, has_source=True, busy=False)
+    assert opening["stop_btn"] is True, "a claimed session (opening) can be stopped"
+    rows = status_menu_items(has_picture=False, has_source=False, busy=False, window_visible=False)
+    assert "정지" not in [t for t, a in rows]
+
+
+def test_menu_bar_stop_is_offered_exactly_when_the_stop_button_is():
+    """With the window hidden the menu bar is the only ■; it must never disagree with the button."""
+    for picture in (False, True):
+        for source in (False, True):
+            for busy in (False, True):
+                button = control_states(queue_len=0, selected=-1, has_picture=picture, has_source=source, busy=busy)["stop_btn"]
+                rows = status_menu_items(has_picture=picture, has_source=source, busy=busy, window_visible=False)
+                assert ("정지" in [t for t, a in rows]) is button, (picture, source, busy)
+    starting = status_menu_items(has_picture=False, has_source=False, busy=True, window_visible=False)
+    assert "정지" in [t for t, a in starting], "a play still starting can be cancelled from the menu bar"

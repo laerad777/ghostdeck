@@ -155,7 +155,7 @@ def status_text(status_stdout: str, *, has_picture=None, has_studio: bool = True
     else:
         piece.append("멈춤")
     if fields.get("usb", "").startswith("none"):
-        piece.append("연결을 누르십시오")
+        piece.append("다시 연결을 누르십시오")
     return " · ".join(piece)
 
 
@@ -190,7 +190,7 @@ def status_dot_color(status_stdout: str, *, has_picture=None, has_studio: bool =
 def recovery_action(status_stdout: str, *, has_studio: bool = True) -> str:
     """The one recovery button this state calls for: "reconnect", "studio", or "" for none.
 
-    `연결` finds a deck that is not on USB. `스튜디오` brings the keys up on a deck that is there.
+    `다시 연결` finds a deck that is not on USB. `스튜디오` brings the keys up on a deck that is there.
     A wedged transport and a missing Python backend have no button that fixes them, so nothing is
     offered rather than a button that cannot help.
     """
@@ -227,13 +227,6 @@ def read_pasteboard(run=subprocess.run) -> str:
     return (result.stdout or "").strip()
 
 
-def looks_like_source(text: str) -> bool:
-    text = text.strip()
-    if not text:
-        return False
-    return "://" in text or text.startswith("/")
-
-
 def media_path_candidate(text: str) -> str:
     """A local file path that play can take, or empty. Existence is the CLI's job."""
     text = (text or "").strip().strip('"')
@@ -263,9 +256,61 @@ def dropped_play_source(filenames) -> str:
     return ""
 
 
+def sources_in_drop(filenames) -> tuple[list[str], int]:
+    """(media paths to queue, count of dropped items that held none).
+
+    A folder contributes its own media files in name order: not hidden files, not subfolders, so
+    dropping a season folder queues its episodes and nothing surprising from deeper down.
+    """
+    found: list[str] = []
+    skipped = 0
+    for name in filenames or []:
+        path = Path(str(name))
+        if path.is_dir():
+            inside = [
+                str(child) for child in sorted(path.iterdir(), key=lambda p: p.name.lower())
+                if child.is_file() and not child.name.startswith(".") and media_path_candidate(str(child))
+            ]
+            if inside:
+                found.extend(inside)
+            else:
+                skipped += 1
+            continue
+        candidate = media_path_candidate(str(path))
+        if candidate:
+            found.append(candidate)
+        else:
+            skipped += 1
+    return found, skipped
+
+
+def drop_note(added: int, skipped: int) -> str:
+    """What a queue drop did, in one line."""
+    if added <= 0:
+        return "영상 파일이 아닙니다. mp4 · mkv · mov · webm · m4v 파일을 놓으십시오."
+    head = "대기열에 넣었습니다." if added == 1 else f"{added}개를 대기열에 넣었습니다."
+    if skipped:
+        head += f" 영상이 아닌 {skipped}개는 건너뛰었습니다."
+    return head
+
+
+def should_adopt_now(now: str, items, *, removed) -> bool:
+    """True when the deck's current track should join the queue.
+
+    A track started outside the window (CLI, another window) is added so the queue shows what is
+    playing. A track the user just removed is not: the poll used to put it straight back at the end.
+    """
+    now = playlist_identity((now or "").strip())
+    if not now or now in {playlist_identity(s) for s in removed or ()}:
+        return False
+    return playlist_index(items, now) < 0
+
+
 def playlist_entry(
-    source: str, title: str = "", channel: str = "", duration: float = 0.0,
+    source: str, title: str = "", channel: str = "", duration: float = 0.0, *, live: bool = False,
 ) -> dict:
+    """One queue row. `live` records that the length probe found none (a live stream), so the
+    launch backfill does not re-probe it with yt-dlp every time (~3s each)."""
     entry = {
         "source": (source or "").strip(),
         "title": (title or "").strip(),
@@ -274,6 +319,8 @@ def playlist_entry(
     length = parse_duration(duration)
     if length > 0:
         entry["duration"] = round(length, 3)
+    elif live:
+        entry["live"] = True
     return entry
 
 
@@ -299,11 +346,13 @@ def playlist_normalize(items) -> list[dict]:
             title = str(item.get("title") or "").strip()
             channel = str(item.get("channel") or "").strip()
             duration = parse_duration(item.get("duration"))
+            live = item.get("live") is True
         else:
             source = str(item).strip()
             title = ""
             channel = ""
             duration = 0.0
+            live = False
         if not source:
             continue
         key = playlist_identity(source)
@@ -315,9 +364,10 @@ def playlist_normalize(items) -> list[dict]:
                 existing["channel"] = channel
             if duration > 0 and not existing.get("duration"):
                 existing["duration"] = round(duration, 3)
+                existing.pop("live", None)
             continue
         seen[key] = len(out)
-        out.append(playlist_entry(key, title, channel, duration))
+        out.append(playlist_entry(key, title, channel, duration, live=live))
     return out
 
 
@@ -344,8 +394,12 @@ def playlist_label(item) -> str:
     return source if len(source) <= 48 else source[:45] + "..."
 
 
-def playlist_add(items, source: str, title: str = "", channel: str = "", duration: float = 0.0) -> list[dict]:
-    """Append a playable source. A source already in the queue is not added again."""
+def playlist_add(items, source: str, title: str = "", channel: str = "", duration: float = 0.0,
+                 *, live: bool = False) -> list[dict]:
+    """Append a playable source. A source already in the queue is not added again.
+
+    `live=True` records a finished probe that found no length; a later real length replaces it.
+    """
     source = playlist_identity((source or "").strip())
     out = playlist_normalize(items)
     if not source:
@@ -362,9 +416,12 @@ def playlist_add(items, source: str, title: str = "", channel: str = "", duratio
                 merged["channel"] = channel
             if length > 0 and not merged.get("duration"):
                 merged["duration"] = round(length, 3)
+                merged.pop("live", None)
+            elif live and not merged.get("duration"):
+                merged["live"] = True
             out[i] = merged
             return out
-    return out + [playlist_entry(source, title, channel, length)]
+    return out + [playlist_entry(source, title, channel, length, live=live)]
 
 
 def playlist_extend(items, entries) -> list[dict[str, str]]:
@@ -442,6 +499,29 @@ def thumbnail_cache_path(source: str, root: Path | None = None) -> Path:
     base = (root if root is not None else Path.home() / ".ghostdeck" / "thumbs")
     key = hashlib.sha1(playlist_identity(source).encode("utf-8")).hexdigest()[:20]
     return base / f"{key}.jpg"
+
+
+def thumbnail_prune(keep_sources, root: Path | None = None) -> int:
+    """Delete cached stills for sources no longer queued. Returns how many were removed.
+
+    The cache is one small file per video ever queued; without this it only grew. A `.part` file is
+    a fetch in flight (prune runs beside the first fetches at launch) and is left alone; a failed
+    fetch removes its own.
+    """
+    base = root if root is not None else Path.home() / ".ghostdeck" / "thumbs"
+    if not base.is_dir():
+        return 0
+    keep = {thumbnail_cache_path(s, base).name for s in keep_sources}
+    removed = 0
+    for path in base.iterdir():
+        if path.is_file() and path.suffix == ".jpg" and path.name not in keep:
+            path.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
+# A failed still is retried after this long, instead of staying blank until the app restarts.
+THUMB_RETRY_SECONDS = 60.0
 
 
 def fetch_thumbnail(source: str, root: Path | None = None, fetch=None, probe=None) -> Path | None:
@@ -643,6 +723,20 @@ def fit_label(fit: str) -> str:
 def crop_label(crop: str) -> str:
     return "여백: 유지" if play_crop_choice(crop) == "none" else "여백: 자동"
 
+
+def settings_summary(fit: str, crop: str) -> str:
+    """The non-default deck settings, one line, or empty when everything is on auto.
+
+    With the drawer closed a non-default fit/crop was invisible, so a deck that filled or padded
+    oddly gave no clue why. The gear's tooltip and a lime mark carry this instead.
+    """
+    parts = []
+    if play_fit(fit) != "auto":
+        parts.append(fit_label(fit))
+    if play_crop_choice(crop) != "auto":
+        parts.append(crop_label(crop))
+    return " · ".join(parts)
+
 QUEUE_ROW_H = 52
 
 
@@ -700,15 +794,154 @@ LAYOUT_MIN = (760, 640)
 LAYOUT_DEFAULT = (1000, 860)
 
 
-def now_state_label(has_picture: bool, has_source: bool, busy: bool) -> str:
-    """The small caps line above the title: what the deck is doing right now."""
+# MPNowPlayingPlaybackState values (MediaPlayer/MPNowPlayingInfoCenter.h). Named here so the pure
+# helpers below stay importable without the MediaPlayer bindings; the stopped state is only ever
+# published from the MediaPlayer module itself (clearing Now Playing).
+NOW_PLAYING_PLAYING, NOW_PLAYING_PAUSED = 1, 2
+
+
+def now_playing_snapshot(item, *, playing: bool, position: float, duration: float) -> dict:
+    """What macOS Now Playing shows (Control Center, the lock screen, AirPods): plain values.
+
+    Empty when nothing is loaded, which clears the system entry. `rate` 0 when paused keeps the
+    system scrubber from drifting; the elapsed time is interpolated by macOS from `position` + rate.
+    """
+    if not isinstance(item, dict) or not playlist_source(item):
+        return {}
+    snap = {
+        "title": playlist_title(item),
+        "artist": playlist_subtitle(item) or "ghostdeck",
+        "elapsed": max(0.0, float(position or 0.0)),
+        "rate": 1.0 if playing else 0.0,
+        "state": NOW_PLAYING_PLAYING if playing else NOW_PLAYING_PAUSED,
+    }
+    length = parse_duration(duration) or parse_duration(item.get("duration"))
+    if length > 0:
+        snap["duration"] = length
+        snap["elapsed"] = min(snap["elapsed"], length)
+    return snap
+
+
+# System remote command -> the window action it runs. The deck has one play button: ▶ on a playing
+# deck stops it (resume point kept), ▶ on a stopped deck resumes.
+REMOTE_COMMANDS = {
+    "togglePlayPauseCommand": "play:",
+    "playCommand": "remotePlay:",
+    "pauseCommand": "remotePause:",
+    "stopCommand": "stop:",
+    "nextTrackCommand": "nextTrack:",
+    "previousTrackCommand": "prevTrack:",
+}
+
+
+def remote_play_wanted(command: str, has_picture: bool) -> bool:
+    """Whether a system play/pause command should act, given what the deck is doing.
+
+    `play` on a playing deck and `pause` on a stopped one are no-ops: headphone double-taps and the
+    keyboard key send explicit play or pause, and toggling on those would invert them.
+    """
+    if command == "remotePlay:":
+        return not has_picture
+    if command == "remotePause:":
+        return has_picture
+    return True
+
+
+def status_menu_items(*, has_picture: bool, has_source: bool, busy: bool, window_visible: bool) -> list[tuple[str, str]]:
+    """(title, action) rows of the menu-bar item. An empty action is a separator.
+
+    The menu-bar item keeps the deck reachable with the window closed: closing the window only
+    hides it, the deck keeps playing, and this is where pause and stop still live. 정지 is offered
+    exactly when the window's ■ can act, so a hidden window never leaves a play unstoppable.
+    """
+    rows = [
+        ("일시정지" if has_picture else "재생", "play:"),
+        ("다음 곡", "nextTrack:"),
+        ("이전 곡", "prevTrack:"),
+    ]
+    if control_states(queue_len=0, selected=-1, has_picture=has_picture, has_source=has_source, busy=busy)["stop_btn"]:
+        rows.append(("정지", "stop:"))
+    rows += [("", ""), ("ghostdeck 창 앞으로" if window_visible else "ghostdeck 창 보기", "showWindow:"),
+             ("", ""), ("ghostdeck 종료", "terminate:")]
+    return rows
+
+
+# How long a plain info line stays in the footer before it gives way to the neutral hint.
+NOTE_INFO_SECONDS = 4.0
+NOTE_IDLE = ""
+
+
+def note_kind(text: str, *, error: bool = False) -> str:
+    """'error' stays until something else is said; 'progress' (a … line) until its operation
+    reports; 'info' fades after NOTE_INFO_SECONDS. A stale 'queued' next to a changed state was
+    the footer's main lie."""
+    if error:
+        return "error"
+    return "progress" if (text or "").rstrip().endswith("…") else "info"
+
+
+def note_expired(kind: str, set_at: float, now: float) -> bool:
+    return kind == "info" and now - set_at >= NOTE_INFO_SECONDS
+
+
+def control_states(*, queue_len: int, selected: int, has_picture: bool, has_source: bool, busy: bool) -> dict:
+    """Which card/queue buttons can act right now. A button that would do nothing is disabled.
+
+    `has_source` is the deck's own session (a player running or claimed), not the resume point the
+    card keeps after ■: that point is for ▶, and ■ on an already stopped deck does nothing.
+    ▶ needs something to play (a row, a resumable track or the open page, which it checks itself
+    and explains). ■ needs a session or a play in flight. ⏮/⏭ need a queue. Row buttons need a
+    selected row, and ↑/↓ a row that can move that way.
+    """
+    row = selected if 0 <= selected < queue_len else -1
+    return {
+        "play_btn": True,
+        "stop_btn": has_picture or has_source or busy,
+        "prev_btn": queue_len > 0,
+        "next_btn": queue_len > 0,
+        "del_btn": row >= 0,
+        "up_btn": row > 0,
+        "down_btn": 0 <= row < queue_len - 1,
+    }
+
+
+def now_state_label(
+    has_picture: bool, has_source: bool, busy: bool, *, session_active: bool = False, resume: float = 0.0,
+) -> str:
+    """The small caps line above the title: what the deck is doing right now.
+
+    Opening covers both halves of a start: the play is in flight (`busy`), and the player has
+    claimed the deck but not shown a frame (`session_active`). The second half read '멈춤' for the
+    whole 1-5s start. A stopped track with a resume point says where ▶ picks up.
+    """
     if has_picture:
         return "● 덱에서 재생 중"
-    if has_source and busy:
+    if has_source and (busy or session_active):
         return "여는 중…"
+    if has_source and resume > 0:
+        return f"멈춤 · {format_clock(resume)}부터 이어 재생"
     if has_source:
         return "멈춤"
     return "대기 중"
+
+
+def seek_base(position: float, *, hold, hold_until: float, now: float) -> float:
+    """Where the next relative seek starts: the target still pending, else the deck's position.
+
+    The deck republishes its playhead only after it jumped, so a second ← read the old position
+    and landed on the same second as the first (← ← from 100s gave 95, 95).
+    """
+    if hold is not None and now < hold_until:
+        return float(hold)
+    return float(position)
+
+
+def time_labels(position: float, duration: float, *, has_source: bool, live: bool = False) -> tuple[str, str]:
+    """(elapsed, right-hand) labels under the seek bar."""
+    elapsed = format_clock(position) if has_source else "0:00"
+    if duration > 0:
+        return elapsed, format_clock(duration)
+    return elapsed, "실시간" if has_source and live else "--:--"
 
 
 def seek_step(key: str, shift: bool = False) -> float:
@@ -739,16 +972,16 @@ _FAILURE_NOTES = (
     ("before it started", "재생을 시작하지 못했습니다."),
     ("nothing is playing", "재생을 시작하지 못했습니다."),
     ("transport is", "덱이 응답하지 않습니다. 덱을 뽑았다 다시 꽂으십시오."),
-    ("no d200 on usb", "덱이 USB에 없습니다. 케이블을 꽂고 연결을 누르십시오."),
-    ("not enumerating through adb", "덱이 ADB로 전환되지 않았습니다. 연결을 누르십시오."),
-    ("not in adb after switch", "덱이 ADB로 전환되지 않았습니다. 연결을 누르십시오."),
-    ("did not enumerate through adb", "덱이 ADB로 전환되지 않았습니다. 연결을 누르십시오."),
-    ("no adb device reachable", "덱이 보이지 않습니다. 케이블을 꽂고 연결을 누르십시오."),
+    ("no d200 on usb", "덱이 USB에 없습니다. 케이블을 꽂고 다시 연결을 누르십시오."),
+    ("not enumerating through adb", "덱이 ADB로 전환되지 않았습니다. 다시 연결을 누르십시오."),
+    ("not in adb after switch", "덱이 ADB로 전환되지 않았습니다. 다시 연결을 누르십시오."),
+    ("did not enumerate through adb", "덱이 ADB로 전환되지 않았습니다. 다시 연결을 누르십시오."),
+    ("no adb device reachable", "덱이 보이지 않습니다. 케이블을 꽂고 다시 연결을 누르십시오."),
     (studio.STUDIO_MISSING.lower(), "Ulanzi Studio가 없습니다. 브리지를 누르면 키 없이 재생됩니다."),
     ("back in hid mode", "브리지가 덱을 놓쳤습니다. 스튜디오를 누르면 새로 띄웁니다."),
     (studio.BRIDGE_DOWN.lower(), "브리지가 꺼져 있습니다. 스튜디오를 누르십시오."),
     (f"no live {studio.BRIDGE.name} of ours", "다른 프로세스가 브리지 소켓을 잡고 있습니다."),
-    ("bridge socket did not come up", "브리지를 띄우지 못했습니다. 연결을 누른 다음 다시 시도하십시오."),
+    ("bridge socket did not come up", "브리지를 띄우지 못했습니다. 다시 연결을 누른 다음 재생하십시오."),
     ("did not stay running", "Studio 복사본이 바로 꺼졌습니다. 스튜디오를 다시 누르십시오."),
     ("d200-color-agent is not built", "덱 에이전트가 없습니다. README의 디바이스 에이전트 설치를 따르십시오."),
     ("ffmpeg not on path", "ffmpeg가 없습니다. brew install ffmpeg 후 다시 시도하십시오."),
@@ -757,7 +990,7 @@ _FAILURE_NOTES = (
     ("is not installed (pip install", "파이썬 패키지가 없습니다. pip install -e \".[device]\" 후 다시 여십시오."),
     ("source is not a file", "재생할 파일을 찾지 못했습니다."),
     ("did not release within", "덱이 영상을 놓지 않았습니다. 정지를 한 번 더 누르십시오."),
-    ("timed out", "응답이 너무 늦습니다. 연결을 누른 다음 다시 시도하십시오."),
+    ("timed out", "응답이 너무 늦습니다. 다시 연결을 누른 다음 재생하십시오."),
 )
 
 
@@ -1126,10 +1359,19 @@ def parse_duration(raw) -> float:
 
 
 def source_duration(source: str, probe=None) -> float:
-    """Length of the playable source. Never HID. Never the page's video tag."""
+    """Length of the playable source. Never HID. Never the page's video tag. 0 when unknown."""
+    return source_length(source, probe=probe)[0]
+
+
+def source_length(source: str, probe=None) -> tuple[float, bool]:
+    """(length, live). `live` is True only when yt-dlp answered cleanly that there is no length.
+
+    A failed probe (offline, timeout, private video, missing tool) is (0, False): it says nothing
+    about the video, so it must not be saved as "live" and stop the row from ever being re-probed.
+    """
     source = (source or "").strip()
     if not source:
-        return 0.0
+        return 0.0, False
     runner = subprocess.run if probe is None else probe
     watch = youtube_watch_url(source)
     local = media_path_candidate(source)
@@ -1139,7 +1381,6 @@ def source_duration(source: str, probe=None) -> float:
                 ["yt-dlp", "--no-warnings", "--skip-download", "-O", "%(duration)s", watch],
                 capture_output=True, text=True, timeout=20, check=False,
             )
-            raw = (result.stdout or "").strip()
         elif local:
             result = runner(
                 [
@@ -1149,12 +1390,14 @@ def source_duration(source: str, probe=None) -> float:
                 ],
                 capture_output=True, text=True, timeout=8, check=False,
             )
-            raw = (result.stdout or "").strip()
         else:
-            return 0.0
+            return 0.0, False
     except (OSError, subprocess.TimeoutExpired):
-        return 0.0
-    return parse_duration(raw)
+        return 0.0, False
+    raw = (result.stdout or "").strip()
+    length = parse_duration(raw)
+    live = bool(watch) and length <= 0 and raw == "NA" and getattr(result, "returncode", 1) == 0
+    return length, live
 
 
 def deck_crop(path: Path = HOST_STATE) -> str:
@@ -1280,12 +1523,11 @@ def play_request(
 
 
 def resolve_source(field: str, pasteboard: str = "") -> str:
-    """The field wins. An empty field plays a copied file path or URL."""
+    """The field wins. An empty field plays a copied video link or media file path, nothing else."""
     field = field.strip()
     if field:
         return field
-    pasteboard = pasteboard.strip()
-    return pasteboard if looks_like_source(pasteboard) else ""
+    return playable_source(pasteboard)
 
 
 def youtube_watch_url(href: str) -> str:
@@ -1375,24 +1617,34 @@ def youtube_playlist_entries(href: str, run=None, limit: int = 200) -> list[dict
 
 
 def playable_source(href: str, media_src: str = "") -> str:
-    """Page or media URL to send to play. YouTube stays a watch URL so ads do not restart."""
+    """The one thing 재생 or 추가 may hand the deck, or empty. Never arbitrary text.
+
+    A YouTube watch/short link becomes its canonical watch URL (ads on the same id do not restart);
+    any other YouTube page (home, search, channel) is not a video. Another site's http(s) page is
+    passed on as is: the player resolves it with yt-dlp, which is how ▶ plays the open video on
+    Vimeo, Twitch and the rest. A media URL (the page's `<video>` src or the text itself) and a
+    local media path pass too. Anything else -- about:, javascript:, file: to a non-video, bare
+    text -- is refused: it used to pass through unchanged, so a shell command on the clipboard was
+    sent as `play <command>` and 'about:blank' was queued.
+    """
     href = (href or "").strip()
     watch = youtube_watch_url(href)
     if watch:
         return watch
     src = (media_src or "").strip()
-    if src.startswith("blob:") or "googlevideo.com" in src:
-        src = ""
-    if src.startswith("http://") or src.startswith("https://"):
-        path = urlparse(src).path.lower()
-        if path.endswith(_MEDIA_SUFFIXES):
-            return src
-    host = urlparse(href).netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    if host in _YT_HOSTS or host.endswith(".youtube.com"):
-        return ""
-    return href
+    if src.startswith(("http://", "https://")) and "googlevideo.com" not in src \
+            and urlparse(src).path.lower().endswith(_MEDIA_SUFFIXES):
+        return src
+    if href.startswith(("http://", "https://")) and not any(ch.isspace() for ch in href):
+        host = urlparse(href).netloc.lower().split(":")[0]
+        if host.startswith("www."):
+            host = host[4:]
+        if not host or "." not in host:
+            return ""
+        if host in _YT_HOSTS or host.endswith(".youtube.com"):
+            return ""
+        return href
+    return media_path_candidate(href)
 
 
 def should_start_play(seen: str, href: str, media_src: str = "") -> str:
@@ -1596,6 +1848,8 @@ def main() -> int:
         )
         from Foundation import NSIndexSet, NSURL, NSURLRequest, NSTimer
         from PyObjCTools import AppHelper
+        import MediaPlayer as MP
+        from AppKit import NSStatusBar, NSVariableStatusItemLength
         from WebKit import (
             WKUserContentController,
             WKUserScript,
@@ -1605,7 +1859,8 @@ def main() -> int:
         )
     except ImportError:
         print(
-            "ghostdeck gui needs pyobjc-framework-Cocoa and pyobjc-framework-WebKit on macOS",
+            "ghostdeck gui needs pyobjc-framework-Cocoa, -WebKit and -MediaPlayer on macOS"
+            " (pip install -e '.[gui]')",
             file=sys.stderr,
         )
         return 2
@@ -1891,9 +2146,167 @@ def main() -> int:
 
     def _gui_note_failure(ctrl, note: str, full: str) -> None:
         """The short Korean line in the strip; the whole CLI message on hover."""
-        ctrl.note.setStringValue_(note)
+        _gui_notify(ctrl, note, error=True)
         full = (full or "").strip()
         ctrl.note.setToolTip_(full if full and full != note else None)
+
+    def _gui_notify(ctrl, text: str, *, error: bool = False) -> None:
+        """Put one line in the footer. The single entry point for the note strip.
+
+        Info lines fade after NOTE_INFO_SECONDS (see `_gui_note_tick`); errors and in-progress
+        lines stay until the next line replaces them.
+        """
+        ctrl.note.setStringValue_(text)
+        ctrl.note.setToolTip_(None)
+        ctrl.note_kind = note_kind(text, error=error)
+        ctrl.note_at = time.monotonic()
+        ctrl.note.setTextColor_(NSColor.systemRedColor() if error else GHOST)
+
+    def _gui_note_tick(ctrl) -> None:
+        if note_expired(getattr(ctrl, "note_kind", ""), float(getattr(ctrl, "note_at", 0.0)), time.monotonic()):
+            ctrl.note.setStringValue_(NOTE_IDLE)
+            ctrl.note.setToolTip_(None)
+            ctrl.note_kind = ""
+
+    def _gui_controls_draw(ctrl) -> None:
+        """Enable only the buttons that can act (a disabled button reads as 'not now')."""
+        table = getattr(ctrl, "playlist_table", None)
+        states = control_states(
+            queue_len=len(getattr(ctrl, "playlist", [])),
+            selected=int(table.selectedRow()) if table is not None else -1,
+            has_picture=deck_has_picture(),
+            has_source=bool(deck_now_playing()) or deck_session_active(),
+            busy=bool(getattr(ctrl, "busy", False)),
+        )
+        for name, on in states.items():
+            button = getattr(ctrl, name, None)
+            if button is not None and bool(button.isEnabled()) != on:
+                button.setEnabled_(on)
+                button.setAlphaValue_(1.0 if on else 0.4)
+
+    def _gui_now_playing(ctrl) -> None:
+        """Publish the deck's track to macOS Now Playing.
+
+        Only a change is published: the 0.1s playhead tick calls this, and rewriting the system
+        entry that often makes Control Center's scrubber jitter. macOS interpolates elapsed time
+        from the last (position, rate), so a steady track needs no updates at all.
+        """
+        source, pos, active = deck_playhead()
+        picture = deck_has_picture()
+        if not active:
+            source = getattr(ctrl, "resume_source", "") or ""
+            pos = float(getattr(ctrl, "resume_pos", 0.0) or 0.0)
+        item = playlist_find(getattr(ctrl, "playlist", []), source) if source else {}
+        if source and not item.get("source"):
+            item = playlist_entry(source)
+        snap = now_playing_snapshot(
+            item, playing=picture, position=pos,
+            duration=float(getattr(ctrl, "media_duration", 0.0) or 0.0),
+        )
+        key = (snap.get("title"), snap.get("artist"), snap.get("duration"), snap.get("state"))
+        last = getattr(ctrl, "now_playing_key", None)
+        drift = abs(snap.get("elapsed", 0.0) - getattr(ctrl, "now_playing_elapsed", 0.0)
+                    - (time.monotonic() - getattr(ctrl, "now_playing_at", 0.0)) * snap.get("rate", 0.0))
+        if key == last and drift < 2.0:
+            return
+        ctrl.now_playing_key = key
+        ctrl.now_playing_elapsed = snap.get("elapsed", 0.0)
+        ctrl.now_playing_at = time.monotonic()
+        center = MP.MPNowPlayingInfoCenter.defaultCenter()
+        if not snap:
+            center.setNowPlayingInfo_(None)
+            center.setPlaybackState_(MP.MPNowPlayingPlaybackStateStopped)
+        else:
+            info = {
+                MP.MPMediaItemPropertyTitle: snap["title"],
+                MP.MPMediaItemPropertyArtist: snap["artist"],
+                MP.MPNowPlayingInfoPropertyElapsedPlaybackTime: snap["elapsed"],
+                MP.MPNowPlayingInfoPropertyPlaybackRate: snap["rate"],
+            }
+            if "duration" in snap:
+                info[MP.MPMediaItemPropertyPlaybackDuration] = snap["duration"]
+            center.setNowPlayingInfo_(info)
+            center.setPlaybackState_(snap["state"])
+        commands = MP.MPRemoteCommandCenter.sharedCommandCenter()
+        commands.changePlaybackPositionCommand().setEnabled_(bool(snap.get("duration")) and picture)
+
+    def _gui_remote_commands(ctrl) -> None:
+        """Route the keyboard media keys, AirPods and Control Center to the window's own actions."""
+        commands = MP.MPRemoteCommandCenter.sharedCommandCenter()
+        ctrl.remote_tokens = []
+
+        def handler(action):
+            method = action.replace(":", "_")
+
+            def run(_event):
+                AppHelper.callAfter(lambda: getattr(ctrl, method)(None))
+                return MP.MPRemoteCommandHandlerStatusSuccess
+            return run
+
+        for name, action in REMOTE_COMMANDS.items():
+            command = getattr(commands, name)()
+            command.setEnabled_(True)
+            ctrl.remote_tokens.append((command, command.addTargetWithHandler_(handler(action))))
+
+        def seek(event):
+            duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
+            at = float(event.positionTime())
+            if duration <= 0 or not 0 <= at <= duration:
+                return MP.MPRemoteCommandHandlerStatusCommandFailed
+
+            def apply():
+                ctrl.seek_bar.setDoubleValue_(at)
+                ctrl.seek_(ctrl.seek_bar)
+
+            AppHelper.callAfter(apply)
+            return MP.MPRemoteCommandHandlerStatusSuccess
+
+        command = commands.changePlaybackPositionCommand()
+        ctrl.remote_tokens.append((command, command.addTargetWithHandler_(seek)))
+        for unused in ("skipForwardCommand", "skipBackwardCommand", "seekForwardCommand",
+                       "seekBackwardCommand", "changeRepeatModeCommand", "changeShuffleModeCommand",
+                       "ratingCommand", "likeCommand", "dislikeCommand", "bookmarkCommand",
+                       "changePlaybackRateCommand", "enableLanguageOptionCommand", "disableLanguageOptionCommand"):
+            getattr(commands, unused)().setEnabled_(False)
+
+    def _gui_status_draw(ctrl) -> None:
+        """Rebuild the menu-bar item's menu for the current state (it is small; rebuilding is cheap)."""
+        item = getattr(ctrl, "status_item", None)
+        if item is None:
+            return
+        picture = deck_has_picture()
+        on_deck = bool(deck_now_playing()) or deck_session_active()
+        source = deck_now_playing() or getattr(ctrl, "resume_source", "")
+        # 정지 follows ■ (a session or a play in flight); the stopped track is for 재생.
+        rows = status_menu_items(has_picture=picture, has_source=on_deck, busy=bool(getattr(ctrl, "busy", False)),
+                                 window_visible=bool(ctrl.window.isVisible()))
+        key = (tuple(rows), playlist_title(playlist_find(getattr(ctrl, "playlist", []), source)) if source else "")
+        if key == getattr(ctrl, "status_key", None):
+            return
+        ctrl.status_key = key
+        menu = NSMenu.alloc().init()
+        if key[1]:
+            head = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(key[1][:48], None, "")
+            head.setEnabled_(False)
+            menu.addItem_(head)
+            menu.addItem_(NSMenuItem.separatorItem())
+        for title, action in rows:
+            if not action:
+                menu.addItem_(NSMenuItem.separatorItem())
+                continue
+            entry = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+            entry.setTarget_(None if action == "terminate:" else ctrl)
+            menu.addItem_(entry)
+        item.setMenu_(menu)
+        button = item.button()
+        if button is not None:
+            glyph = _symbol("play.rectangle.fill" if picture else "play.rectangle")
+            if glyph is not None:
+                glyph.setTemplate_(True)
+                button.setImage_(glyph)
+            else:
+                button.setTitle_("▶" if picture else "▷")
+            button.setToolTip_("ghostdeck · " + (key[1] or "재생 중인 영상 없음"))
 
     def _gui_apply(ctrl, results, error, epoch=None) -> None:
         if epoch is not None and epoch != getattr(ctrl, "epoch", 0):
@@ -1941,18 +2354,22 @@ def main() -> int:
             _gui_note_failure(ctrl, note, last.stderr or last.stdout)
         elif last.argv[:1] == ["stop"]:
             ctrl.seen_watch = ""
-            ctrl.note.setStringValue_("멈췄습니다.")
+            _gui_notify(ctrl, "멈췄습니다.")
         elif last.argv[:1] == ["play"]:
             if len(last.argv) > 1:
                 ctrl.seen_watch = last.argv[1]
+                # The last track the deck took is what the card shows once it stops, and what ▶
+                # resumes; ■ refines the position, a natural end leaves it at the start.
+                ctrl.resume_source = last.argv[1]
+                ctrl.resume_pos = 0.0
                 _gui_playlist_put(ctrl, last.argv[1])
-            ctrl.note.setStringValue_(play_success_note(deck_has_picture()))
+            _gui_notify(ctrl, play_success_note(deck_has_picture()))
         elif last.argv[:1] == ["studio"]:
-            ctrl.note.setStringValue_("스튜디오를 켰습니다. 이제 재생할 수 있습니다.")
+            _gui_notify(ctrl, "스튜디오를 켰습니다. 이제 재생할 수 있습니다.")
         elif last.argv[:1] == ["bridge"]:
-            ctrl.note.setStringValue_("브리지를 켰습니다. 키 없이 재생할 수 있습니다.")
+            _gui_notify(ctrl, "브리지를 켰습니다. 키 없이 재생할 수 있습니다.")
         elif last.argv[:1] == ["reconnect"]:
-            ctrl.note.setStringValue_("연결했습니다. 재생할 수 있습니다.")
+            _gui_notify(ctrl, "연결했습니다. 재생할 수 있습니다.")
         if should_retry_pending(
             pending, pending_start, getattr(ctrl, "seen_watch", ""), getattr(ctrl, "played_start", 0.0)
         ):
@@ -1964,7 +2381,7 @@ def main() -> int:
             epoch = ctrl.epoch
             if not ctrl.busy:
                 _gui_set_busy(ctrl, True)
-            ctrl.note.setStringValue_(
+            _gui_notify(ctrl, 
                 {"reconnect": "연결 다시 잡는 중…", "studio": "스튜디오 켜는 중…", "bridge": "브리지 켜는 중…"}.get(op, "준비 중…")
             )
             threading.Thread(
@@ -1990,7 +2407,7 @@ def main() -> int:
             epoch = ctrl.epoch
             if not ctrl.busy:
                 _gui_set_busy(ctrl, True)
-            ctrl.note.setStringValue_("멈추는 중…")
+            _gui_notify(ctrl, "멈추는 중…")
             threading.Thread(
                 target=_busy_call,
                 args=(
@@ -2009,7 +2426,7 @@ def main() -> int:
         if ctrl.busy and op == "play":
             ctrl.pending_source = source
             ctrl.pending_start = play_offset(start)
-            ctrl.note.setStringValue_("지금 작업이 끝나면 재생합니다.")
+            _gui_notify(ctrl, "지금 작업이 끝나면 재생합니다.")
             return
         if ctrl.busy and op != "status":
             return
@@ -2019,7 +2436,7 @@ def main() -> int:
                 ctrl.played_start = play_offset(start)
                 ctrl.saw_picture = False
             _gui_set_busy(ctrl, True)
-            ctrl.note.setStringValue_("재생 준비 중…" if op == "play" else "멈추는 중…")
+            _gui_notify(ctrl, "재생 준비 중…" if op == "play" else "멈추는 중…")
         pasteboard = read_pasteboard() if op == "play" else ""
         if op == "play":
             pref = play_crop_choice(getattr(ctrl, "crop", "auto"))
@@ -2072,10 +2489,10 @@ def main() -> int:
 
         def fill():
             title, channel = source_identity(source) if not found.get("title") else ("", "")
-            length = source_duration(source) if not found.get("duration") else 0.0
+            length, live = source_length(source) if not found.get("duration") else (0.0, False)
 
             def apply():
-                ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, title, channel, length)
+                ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, title, channel, length, live=live)
                 playlist_save(PLAYLIST_PATH, ctrl.playlist)
                 _gui_playlist_draw(ctrl)
 
@@ -2084,19 +2501,25 @@ def main() -> int:
         threading.Thread(target=fill, daemon=True).start()
 
     def _gui_backfill_meta(ctrl) -> None:
-        """Fill missing lengths for rows saved before durations were stored. One worker, in order."""
-        missing = [playlist_source(item) for item in getattr(ctrl, "playlist", []) if not item.get("duration")]
+        """Fill missing lengths for rows saved before durations were stored. One worker, in order.
+
+        A row yt-dlp answers for with no length is a live stream: it is marked `live` so the next
+        launch does not probe it again (~3s of yt-dlp per live row, every launch). A failed probe
+        (offline, timeout) marks nothing and is simply tried again next launch.
+        """
+        missing = [playlist_source(item) for item in getattr(ctrl, "playlist", [])
+                   if not item.get("duration") and not item.get("live")]
         if not missing:
             return
 
         def fill():
             for source in missing:
-                length = source_duration(source)
-                if length <= 0:
+                length, live = source_length(source)
+                if length <= 0 and not live:
                     continue
 
-                def apply(source=source, length=length):
-                    ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, duration=length)
+                def apply(source=source, length=length, live=live):
+                    ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, duration=length, live=live)
                     playlist_save(PLAYLIST_PATH, ctrl.playlist)
                     _gui_playlist_draw(ctrl)
 
@@ -2106,15 +2529,22 @@ def main() -> int:
 
     _THUMBS: dict = {}
     _THUMB_PENDING: set = set()
+    _THUMB_FAILED: dict = {}
 
     def _thumb_image(ctrl, source: str):
-        """The NSImage for a source's still, or None while it loads (the view redraws on arrival)."""
+        """The NSImage for a source's still, or None while it loads (the view redraws on arrival).
+
+        A failed fetch is retried after THUMB_RETRY_SECONDS rather than cached as None for the
+        session, so a row loaded while offline gets its still once the network is back.
+        """
         key = playlist_identity(source)
         if not key:
             return None
         if key in _THUMBS:
             return _THUMBS[key]
         if key in _THUMB_PENDING:
+            return None
+        if time.monotonic() - _THUMB_FAILED.get(key, -THUMB_RETRY_SECONDS) < THUMB_RETRY_SECONDS:
             return None
         _THUMB_PENDING.add(key)
 
@@ -2124,6 +2554,10 @@ def main() -> int:
             def apply():
                 _THUMB_PENDING.discard(key)
                 image = NSImage.alloc().initWithContentsOfFile_(str(path)) if path else None
+                if image is None:
+                    _THUMB_FAILED[key] = time.monotonic()
+                    return
+                _THUMB_FAILED.pop(key, None)
                 _THUMBS[key] = image
                 table = getattr(ctrl, "playlist_table", None)
                 if table is not None:
@@ -2141,19 +2575,19 @@ def main() -> int:
         if not href:
             return
         if youtube_playlist_page(href):
-            ctrl.note.setStringValue_("재생목록을 읽는 중…")
+            _gui_notify(ctrl, "재생목록을 읽는 중…")
 
             def fill_list():
                 entries = youtube_playlist_entries(href)
 
                 def apply():
                     if not entries:
-                        ctrl.note.setStringValue_("재생목록을 읽지 못했습니다.")
+                        _gui_notify(ctrl, "재생목록을 읽지 못했습니다.", error=True)
                         return
                     ctrl.playlist = playlist_extend(getattr(ctrl, "playlist", []), entries)
                     playlist_save(PLAYLIST_PATH, ctrl.playlist)
                     _gui_playlist_draw(ctrl)
-                    ctrl.note.setStringValue_(f"재생목록 {len(entries)}곡을 넣었습니다.")
+                    _gui_notify(ctrl, f"재생목록 {len(entries)}곡을 넣었습니다.")
 
                 AppHelper.callAfter(apply)
 
@@ -2161,10 +2595,10 @@ def main() -> int:
             return
         source = youtube_watch_url(href) or playable_source(href)
         if not source:
-            ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
+            _gui_notify(ctrl, "이 페이지에서 영상을 찾지 못했습니다.", error=True)
             return
         _gui_playlist_put(ctrl, source)
-        ctrl.note.setStringValue_("대기열에 넣었습니다.")
+        _gui_notify(ctrl, "대기열에 넣었습니다.")
 
 
     def _gui_card_row(ctrl) -> None:
@@ -2214,8 +2648,13 @@ def main() -> int:
             scroll.setFrame_(frame)
         button = getattr(ctrl, "settings_btn", None)
         if button is not None:
-            _pill(button, LIME if on else CARD, INK if on else SNOW)
-            _icon(button, "slider.horizontal.3", INK if on else SNOW)
+            custom = settings_summary(getattr(ctrl, "fit", "auto"), getattr(ctrl, "crop", "auto"))
+            # Open, or closed over a non-default setting: the gear is lime so the setting is not hidden.
+            lit = on or bool(custom)
+            _pill(button, LIME if lit else CARD, INK if lit else SNOW)
+            _icon(button, "slider.horizontal.3", INK if lit else SNOW)
+            _describe(button, "덱 설정 (스튜디오 · 브리지 · 화면 · 여백 · 버튼 불투명도)"
+                      + (f" — 지금: {custom}" if custom else ""))
 
     def _gui_playlist_draw(ctrl) -> None:
         table = getattr(ctrl, "playlist_table", None)
@@ -2240,17 +2679,30 @@ def main() -> int:
 
     def _gui_now_draw(ctrl) -> None:
         source, _pos, active = deck_playhead()
+        stopped_on = ""
         if not active:
-            source = getattr(ctrl, "seen_watch", "") if getattr(ctrl, "busy", False) else ""
+            if getattr(ctrl, "busy", False):
+                source = getattr(ctrl, "seen_watch", "")
+            else:
+                # Stopped: the card keeps the track ▶ would resume, instead of going blank.
+                source = stopped_on = getattr(ctrl, "resume_source", "") or ""
         source = playlist_identity(source)
         items = getattr(ctrl, "playlist", [])
         found = playlist_find(items, source) if source else playlist_entry("")
+        if source and not found.get("source"):
+            found = playlist_entry(source)
         now_head = getattr(ctrl, "now_head", None)
         if now_head is not None:
-            now_head.setStringValue_(now_state_label(deck_has_picture(), bool(source), bool(getattr(ctrl, "busy", False))))
+            now_head.setStringValue_(now_state_label(
+                deck_has_picture(), bool(source), bool(getattr(ctrl, "busy", False)),
+                session_active=deck_session_active(),
+                resume=float(getattr(ctrl, "resume_pos", 0.0) or 0.0) if stopped_on else 0.0,
+            ))
         title = getattr(ctrl, "now_title", None)
         if title is not None:
-            title.setStringValue_(playlist_title(found) if source else "재생 중인 영상이 없습니다")
+            text = playlist_title(found) if source else "재생 중인 영상이 없습니다"
+            title.setStringValue_(text)
+            title.setToolTip_(text if source else None)
         channel = getattr(ctrl, "now_channel", None)
         if channel is not None:
             channel.setStringValue_(
@@ -2303,6 +2755,8 @@ def main() -> int:
         bar = getattr(ctrl, "volume_bar", None)
         if bar is not None and not getattr(ctrl, "voluming", False):
             bar.setDoubleValue_(clamp_volume(getattr(ctrl, "volume", 1.0)))
+            # Muted: the level is kept for unmute, but shown faded so it does not read as audible.
+            bar.setAlphaValue_(0.35 if getattr(ctrl, "muted", False) else 1.0)
         fit_btn = getattr(ctrl, "fit_btn", None)
         if fit_btn is not None:
             mode = play_fit(getattr(ctrl, "fit", "auto"))
@@ -2313,6 +2767,8 @@ def main() -> int:
             mode = play_crop_choice(getattr(ctrl, "crop", "auto"))
             crop_btn.setTitle_(crop_label(mode))
             _pill(crop_btn, LIME if mode != "auto" else CARD, INK if mode != "auto" else SNOW)
+        if getattr(ctrl, "settings_btn", None) is not None:
+            _gui_settings_draw(ctrl)
 
 
     def _save_prefs(ctrl) -> None:
@@ -2348,26 +2804,40 @@ def main() -> int:
                 elapsed.setStringValue_(format_clock(bar.doubleValue()))
             return
         _gui_now_draw(ctrl)
-        source, pos, _active = deck_playhead()
-        host_len = deck_duration()
+        source, pos, active = deck_playhead()
+        if not active and not getattr(ctrl, "busy", False) and getattr(ctrl, "resume_source", ""):
+            # Stopped: the bar and times stay on the track the card shows, at its resume point.
+            source = playlist_identity(ctrl.resume_source)
+            pos = float(getattr(ctrl, "resume_pos", 0.0) or 0.0)
+        host_len = deck_duration() if active else 0.0
         if host_len > 0 and source:
             ctrl.duration_for = source
             ctrl.media_duration = host_len
         duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
         if source and source != getattr(ctrl, "duration_for", ""):
             ctrl.duration_for = source
+            ctrl.duration_live = False
             ctrl.media_duration = 0.0
             duration = 0.0
-            if not getattr(ctrl, "duration_busy", False):
+            row = playlist_find(getattr(ctrl, "playlist", []), source)
+            known = parse_duration(row.get("duration"))
+            if known > 0:
+                # The queue already knows the length (stored when it was queued): no probe needed,
+                # and a stopped track shows its bar at once.
+                ctrl.media_duration = duration = known
+            elif row.get("live"):
+                ctrl.duration_live = True
+            elif not getattr(ctrl, "duration_busy", False):
                 ctrl.duration_busy = True
 
                 def fill():
-                    value = source_duration(source)
+                    value, live = source_length(source)
 
                     def apply():
                         ctrl.duration_busy = False
                         if getattr(ctrl, "duration_for", "") == source:
                             ctrl.media_duration = value
+                            ctrl.duration_live = live
                         _gui_playhead_draw(ctrl)
 
                     AppHelper.callAfter(apply)
@@ -2375,7 +2845,7 @@ def main() -> int:
                 threading.Thread(target=fill, daemon=True).start()
         duration = float(getattr(ctrl, "media_duration", 0.0) or 0.0)
         now = time.monotonic()
-        hold = getattr(ctrl, "hold_pos", None)
+        hold = getattr(ctrl, "hold_pos", None) if active else None
         hold_until = float(getattr(ctrl, "hold_until", 0.0) or 0.0)
         if hold is not None and now < hold_until and abs(pos - hold) > 1.25:
             pos = hold
@@ -2402,13 +2872,20 @@ def main() -> int:
                 getattr(ctrl, "repeat", "off"),
             ),
         )
+        # Live only on yt-dlp's clean "no length" answer (or a row saved as live), never on a failed probe.
+        live = bool(source) and duration <= 0 and getattr(ctrl, "duration_for", "") == source \
+            and bool(getattr(ctrl, "duration_live", False))
+        left, right = time_labels(pos, duration, has_source=bool(source), live=live)
         if elapsed is not None:
-            elapsed.setStringValue_(format_clock(pos) if source else "0:00")
+            elapsed.setStringValue_(left)
         if remain is not None:
-            remain.setStringValue_(format_clock(duration) if duration else "--:--")
+            remain.setStringValue_(right)
         if bar is None:
             return
         if duration <= 0:
+            # Live, or length not known yet: there is nothing to seek to, so the bar is not offered.
+            bar.setDoubleValue_(0.0)
+            bar.setEnabled_(False)
             return
         bar.setMaxValue_(duration)
         bar.setDoubleValue_(pos)
@@ -2416,8 +2893,12 @@ def main() -> int:
 
     def _gui_sync_deck(ctrl, playing: bool) -> None:
         now = playlist_identity(deck_now_playing())
-        sources = [playlist_identity(playlist_source(item)) for item in getattr(ctrl, "playlist", [])]
-        if now and now not in sources:
+        removed = getattr(ctrl, "removed_now", set())
+        if now not in removed:
+            # A removed track stays out only while it is the one playing; once the deck moves on
+            # the user may queue it again like anything else.
+            removed.clear()
+        if should_adopt_now(now, getattr(ctrl, "playlist", []), removed=removed):
             _gui_playlist_put(ctrl, now)
         else:
             _gui_playlist_draw(ctrl)
@@ -2488,6 +2969,7 @@ def main() -> int:
         def mouseDown_(self, event):
             ctrl = self.ctrl
             ctrl.seeking = True
+            # The superclass tracks the whole drag and returns on mouse-up.
             objc.super(SeekSlider, self).mouseDown_(event)
             ctrl.hold_pos = play_offset(self.doubleValue())
             ctrl.hold_until = time.monotonic() + 2.0
@@ -2495,6 +2977,10 @@ def main() -> int:
             elapsed = getattr(ctrl, "elapsed_lab", None)
             if elapsed is not None:
                 elapsed.setStringValue_(format_clock(self.doubleValue()))
+            if getattr(ctrl, "seek_on_release", False):
+                # A stopped deck starts one play, at the point the drag ended.
+                ctrl.seek_on_release = False
+                ctrl.seek_(self)
 
         def mouseDragged_(self, event):
             objc.super(SeekSlider, self).mouseDragged_(event)
@@ -2517,15 +3003,11 @@ def main() -> int:
 
         def performDragOperation_(self, info):
             names = info.draggingPasteboard().propertyListForType_(NSFilenamesPboardType) or []
-            added = False
-            for name in names:
-                source = media_path_candidate(str(name))
-                if source:
-                    _gui_playlist_put(self.ctrl, source)
-                    added = True
-            if added:
-                self.ctrl.note.setStringValue_("대기열에 넣었습니다.")
-            return added
+            found, skipped = sources_in_drop(list(names))
+            for source in found:
+                _gui_playlist_put(self.ctrl, source)
+            _gui_notify(self.ctrl, drop_note(len(found), skipped), error=not found)
+            return bool(found)
 
     class Controller(NSObject):
         def init(self):
@@ -2535,6 +3017,8 @@ def main() -> int:
             self.pending_start = 0.0
             self.seen_watch = ""
             self.playlist = playlist_load(PLAYLIST_PATH)
+            # Tracks the user removed while the deck was playing them: the poll must not re-add them.
+            self.removed_now = set()
             prefs = player_prefs_load()
             self.repeat = prefs["repeat"]
             self.shuffle = prefs["shuffle"]
@@ -3034,6 +3518,12 @@ def main() -> int:
             # The window, not the page, starts with the keyboard, so Space and the arrows reach the
             # player until the user clicks into the page or the address field.
             self.window.setInitialFirstResponder_(self.playlist_table)
+            # Tab walks address bar -> page -> queue -> address bar. The loop was empty (autorecalc off,
+            # no nextKeyView), so Tab never left the focused control. Buttons join it when the user
+            # turns on keyboard navigation in System Settings, as everywhere on macOS.
+            self.url_field.setNextKeyView_(self.web)
+            self.web.setNextKeyView_(self.playlist_table)
+            self.playlist_table.setNextKeyView_(self.url_field)
             ctrl = self
 
             def on_key(event):
@@ -3045,6 +3535,14 @@ def main() -> int:
                 NSEventMaskKeyDown, on_key
             )
             _gui_backfill_meta(self)
+            # Stills of rows no longer queued are dropped once per launch, off the main thread.
+            keep = [playlist_source(item) for item in self.playlist]
+            threading.Thread(target=lambda: thumbnail_prune(keep), daemon=True).start()
+            # The menu-bar item and the system media controls are how the deck stays controllable
+            # with the window closed (closing only hides it; see windowShouldClose_).
+            self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+            _gui_remote_commands(self)
+            _gui_status_draw(self)
 
             _gui_install_menu(self)
             # Remember size and place across launches -- restored only now. Every control above is
@@ -3121,7 +3619,7 @@ def main() -> int:
                 if source:
                     sources.append(source)
             if not sources:
-                self.note.setStringValue_("재생할 수 있는 영상이 아닙니다.")
+                _gui_notify(self, "재생할 수 있는 영상이 아닙니다.", error=True)
                 return
             for source in sources:
                 _gui_playlist_put(self, source)
@@ -3144,7 +3642,7 @@ def main() -> int:
                 has_picture=False,
                 session_active=deck_session_active(),
             ):
-                self.note.setStringValue_(play_success_note(False))
+                _gui_notify(self, play_success_note(False))
                 return
             items = getattr(self, "playlist", [])
             row = -1
@@ -3180,7 +3678,7 @@ def main() -> int:
                 if source:
                     _gui_kick(ctrl, "play", source, start=off)
                     return
-                ctrl.note.setStringValue_("이 페이지에서 영상을 찾지 못했습니다.")
+                _gui_notify(ctrl, "재생할 영상이 없습니다. 유튜브 영상을 열거나 대기열에 넣으십시오.", error=True)
 
             self.web.evaluateJavaScript_completionHandler_(
                 "(window.__ghostdeckNow ? window.__ghostdeckNow() : window.location.href)",
@@ -3205,6 +3703,10 @@ def main() -> int:
 
         def tickPlayhead_(self, _timer):
             _gui_playhead_draw(self)
+            _gui_now_playing(self)
+            _gui_note_tick(self)
+            _gui_controls_draw(self)
+            _gui_status_draw(self)
 
         def seek_(self, sender):
             duration = float(getattr(self, "media_duration", 0.0) or 0.0)
@@ -3213,21 +3715,28 @@ def main() -> int:
             at = play_offset(sender.doubleValue())
             if at > duration:
                 at = duration
-            source = getattr(self, "seen_watch", "") or deck_now_playing()
+            # Stopped: the bar belongs to the track the card still shows, so dragging it restarts
+            # that track from the chosen point instead of saying nothing is playing.
+            source = (getattr(self, "seen_watch", "") or deck_now_playing()
+                      or getattr(self, "resume_source", ""))
             if not source:
-                self.note.setStringValue_("재생 중인 영상이 없습니다.")
+                _gui_notify(self, "재생 중인 영상이 없습니다.", error=True)
                 return
             self.user_stopped = False
             self.hold_pos = at
             self.hold_until = time.monotonic() + 2.0
             if deck_has_picture() and request_live_seek(at):
-                self.note.setStringValue_(seek_note(at, True))
+                _gui_notify(self, seek_note(at, True))
+                return
+            if getattr(self, "seeking", False):
+                # Mid-drag on a deck that has to (re)start: one play on mouse-up, not one per event.
+                self.seek_on_release = True
                 return
             crop = play_crop_choice(getattr(self, "crop", "auto"))
             if crop == "auto":
                 crop = deck_crop() or "auto"
             _gui_kick(self, "play", source, start=at, crop=crop)
-            self.note.setStringValue_(seek_note(at, False))
+            _gui_notify(self, seek_note(at, False))
 
         def setVolume_(self, sender):
             self.volume = clamp_volume(sender.doubleValue())
@@ -3261,12 +3770,18 @@ def main() -> int:
             _gui_settings_draw(self, open_=not bool(getattr(self, "settings_open", False)))
 
         def seekBy_(self, delta):
-            """Move the deck's playhead by `delta` seconds, through the same path as the bar."""
+            """Move the deck's playhead by `delta` seconds, through the same path as the bar.
+
+            Steps add up: the base is the target still pending from the previous press, since the
+            deck's published position lags the jump it was just asked for.
+            """
             duration = float(getattr(self, "media_duration", 0.0) or 0.0)
             _source, pos, active = deck_playhead()
             if not active or duration <= 0:
                 return False
-            self.seek_bar.setDoubleValue_(clamp_seek(pos, delta, duration))
+            base = seek_base(pos, hold=getattr(self, "hold_pos", None),
+                             hold_until=float(getattr(self, "hold_until", 0.0) or 0.0), now=time.monotonic())
+            self.seek_bar.setDoubleValue_(clamp_seek(base, delta, duration))
             self.seek_(self.seek_bar)
             _gui_playhead_draw(self)
             return True
@@ -3285,11 +3800,29 @@ def main() -> int:
             if responder is not None and responder.isKindOfClass_(NSView) and responder.isDescendantOf_(self.web):
                 return False
             flags = int(event.modifierFlags())
-            if flags & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl):
+            if flags & (NSEventModifierFlagCommand | NSEventModifierFlagControl):
+                return False
+            code = int(event.keyCode())
+            if responder is self.playlist_table:
+                # The rows are read-only, so Tab is not cell navigation: it leaves the list.
+                if code == 48:
+                    if flags & NSEventModifierFlagShift:
+                        self.window.selectKeyViewPrecedingView_(self.playlist_table)
+                    else:
+                        self.window.selectKeyViewFollowingView_(self.playlist_table)
+                    return True
+                # Queue editing, as the row buttons' tooltips promise: ⌫ / ⌦ remove, ⌥↑/⌥↓ move.
+                if code in (51, 117) and not flags & NSEventModifierFlagOption:
+                    self.removeSelected_(None)
+                    return True
+                if flags & NSEventModifierFlagOption and code in (125, 126):
+                    (self.moveUp_ if code == 126 else self.moveDown_)(None)
+                    return True
+            if flags & NSEventModifierFlagOption:
                 return False
             shift = bool(flags & NSEventModifierFlagShift)
             key = {123: "left", 124: "right", 125: "down", 126: "up", 49: "space"}.get(
-                int(event.keyCode()), str(event.charactersIgnoringModifiers() or "").lower()
+                code, str(event.charactersIgnoringModifiers() or "").lower()
             )
             if key == "space":
                 self.play_(None)
@@ -3302,7 +3835,7 @@ def main() -> int:
                 if self.volume > 0:
                     self.muted = False
                 _commit_audio(self)
-                self.note.setStringValue_(f"소리 {int(round(self.volume * 100))}%")
+                _gui_notify(self, f"소리 {int(round(self.volume * 100))}%")
                 return True
             actions = {"m": self.toggleMute_, "n": self.nextTrack_, "p": self.prevTrack_}
             if key in actions:
@@ -3319,7 +3852,7 @@ def main() -> int:
                 shuffle=getattr(self, "shuffle", False),
             )
             if not nxt:
-                self.note.setStringValue_("이전 곡이 없습니다.")
+                _gui_notify(self, "이전 곡이 없습니다.")
                 return
             self.user_stopped = False
             _gui_kick(self, "play", nxt)
@@ -3333,7 +3866,7 @@ def main() -> int:
                 shuffle=getattr(self, "shuffle", False),
             )
             if not nxt:
-                self.note.setStringValue_("다음 곡이 없습니다.")
+                _gui_notify(self, "다음 곡이 없습니다.")
                 return
             self.user_stopped = False
             _gui_kick(self, "play", nxt)
@@ -3387,7 +3920,8 @@ def main() -> int:
             meta.setStringValue_(("▶ 재생 중 · " if on else "") + (playlist_meta(item) or " "))
             meta.setTextColor_(LIME if on else GHOST)
             art.setImage_(_thumb_image(self, playlist_source(item)))
-            cell.setToolTip_(playlist_source(item))
+            # The full title (rows truncate at the column width) over the source it plays.
+            cell.setToolTip_(f"{playlist_title(item)}\n{playlist_source(item)}")
             return cell
 
         def tableView_objectValueForTableColumn_row_(self, _table, _col, row):
@@ -3416,11 +3950,12 @@ def main() -> int:
             pboard = info.draggingPasteboard()
             names = pboard.propertyListForType_(NSFilenamesPboardType) or []
             if names:
-                for name in names:
-                    source = media_path_candidate(str(name))
-                    if source:
-                        _gui_playlist_put(self, source)
-                return True
+                # Same as a drop on the queue pane: folders expand, refusals are said, counts reported.
+                found, skipped = sources_in_drop(list(names))
+                for source in found:
+                    _gui_playlist_put(self, source)
+                _gui_notify(self, drop_note(len(found), skipped), error=not found)
+                return bool(found)
             raw = pboard.stringForType_("ghostdeck.playlist.row")
             if raw is None or str(raw).strip() == "":
                 return False
@@ -3475,7 +4010,7 @@ def main() -> int:
             table = self.playlist_table
             row = playlist_click_row(table.clickedRow(), table.selectedRow(), len(items))
             if row < 0:
-                self.note.setStringValue_("재생할 항목을 고르십시오.")
+                _gui_notify(self, "재생할 항목을 고르십시오.")
                 return
             source = playlist_source(items[row])
             from ghostdeck import play as playmod
@@ -3485,16 +4020,67 @@ def main() -> int:
                 has_picture=deck_has_picture(),
                 session_active=deck_session_active(),
             ) and same:
-                self.note.setStringValue_(play_success_note(False))
+                _gui_notify(self, play_success_note(False))
                 return
             self.user_stopped = False
             _gui_kick(self, "play", source)
 
         def removeSelected_(self, _sender):
             row = int(self.playlist_table.selectedRow())
-            self.playlist = playlist_remove(getattr(self, "playlist", []), row)
+            items = getattr(self, "playlist", [])
+            if not 0 <= row < len(items):
+                _gui_notify(self, "지울 항목을 고르십시오.")
+                return
+            entry = dict(items[row])
+            self.playlist = playlist_remove(items, row)
             playlist_save(PLAYLIST_PATH, self.playlist)
+            source = playlist_identity(playlist_source(entry))
+            if source and source == playlist_identity(deck_now_playing()):
+                # Removing the playing row takes it out of the queue; the deck keeps playing it
+                # (stopping is ■), and the poll must not put it straight back.
+                self.removed_now.add(source)
+            undo = self.window.undoManager()
+            if undo is not None:
+                undo.registerUndoWithTarget_selector_object_(
+                    self, "restoreRow:", {"row": row, "entry": json.dumps(entry, ensure_ascii=False)}
+                )
+                undo.setActionName_("대기열에서 제거")
             _gui_playlist_draw(self)
+            if self.playlist:
+                keep = min(row, len(self.playlist) - 1)
+                self.playlist_table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(keep), False)
+            _gui_notify(self, f"'{playlist_title(entry)}'을(를) 대기열에서 뺐습니다. ⌘Z로 되돌릴 수 있습니다.")
+
+        def restoreRow_(self, payload):
+            """Undo of removeSelected_: put the row back where it was."""
+            entry = json.loads(str(payload["entry"]))
+            row = int(payload["row"])
+            items = playlist_normalize(getattr(self, "playlist", []))
+            if playlist_index(items, playlist_source(entry)) >= 0:
+                return
+            items.insert(max(0, min(row, len(items))), entry)
+            self.playlist = playlist_normalize(items)
+            self.removed_now.discard(playlist_identity(playlist_source(entry)))
+            playlist_save(PLAYLIST_PATH, self.playlist)
+            undo = self.window.undoManager()
+            if undo is not None:
+                # Redo removes the same track again, found by identity: the row index may have
+                # moved (a move, an add, auto-next) between undo and redo.
+                undo.registerUndoWithTarget_selector_object_(self, "removeSource:", playlist_source(entry))
+                undo.setActionName_("대기열에서 제거")
+            _gui_playlist_draw(self)
+            at = playlist_index(self.playlist, playlist_source(entry))
+            if at >= 0:
+                self.playlist_table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(at), False)
+                self.playlist_table.scrollRowToVisible_(at)
+            _gui_notify(self, "되돌렸습니다.")
+
+        def removeSource_(self, source):
+            """Redo of a restore: remove that same track again, wherever it now is."""
+            row = playlist_index(getattr(self, "playlist", []), str(source))
+            if row >= 0:
+                self.playlist_table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(row), False)
+                self.removeSelected_(None)
 
         def userContentController_didReceiveScriptMessage_(self, _ucc, message):
             body = message.body()
@@ -3578,12 +4164,53 @@ def main() -> int:
             _gui_card_row(self)
             _gui_settings_draw(self)
 
-        def windowWillClose_(self, _notification):
+        def windowShouldClose_(self, _sender):
+            """⌘W and the red button hide the window; the deck and its controls keep running.
+
+            Closing used to quit the controller while the deck played on, leaving no pause or stop
+            short of relaunching. The menu-bar item, the Dock icon and the media keys stay live;
+            ⌘Q quits.
+            """
+            self.window.orderOut_(None)
+            if deck_has_picture():
+                _gui_notify(self, "창을 숨겼습니다. 덱은 계속 재생합니다.")
+            _gui_status_draw(self)
+            return False
+
+        def showWindow_(self, _sender):
+            NSApp.activateIgnoringOtherApps_(True)
+            self.window.makeKeyAndOrderFront_(None)
+            _gui_status_draw(self)
+
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, _app, visible):
+            # A Dock click brings a hidden window back.
+            if not visible:
+                self.showWindow_(None)
+            return True
+
+        def remotePlay_(self, _sender):
+            # An explicit play (AirPods, the media key's play) on a playing deck must not stop it.
+            if remote_play_wanted("remotePlay:", deck_has_picture()):
+                self.play_(None)
+
+        def remotePause_(self, _sender):
+            if remote_play_wanted("remotePause:", deck_has_picture()):
+                self.play_(None)
+
+        def applicationWillTerminate_(self, _notification):
             try:
                 self.ucc.removeScriptMessageHandlerForName_("ghostdeck")
             except Exception:
                 pass
-            NSApp.terminate_(None)
+            commands = MP.MPRemoteCommandCenter.sharedCommandCenter()
+            for command, token in getattr(self, "remote_tokens", []):
+                command.removeTarget_(token)
+            center = MP.MPNowPlayingInfoCenter.defaultCenter()
+            center.setNowPlayingInfo_(None)
+            center.setPlaybackState_(MP.MPNowPlayingPlaybackStateStopped)
+            item = getattr(self, "status_item", None)
+            if item is not None:
+                NSStatusBar.systemStatusBar().removeStatusItem_(item)
 
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(0)
