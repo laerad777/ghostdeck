@@ -2886,6 +2886,9 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    if "GHOSTDECK_CHILD_LEASE" in os.environ:
+        from ghostdeck.lifecycle import child_lease
+        child_lease(lambda: os.kill(os.getpid(), signal.SIGTERM))
     stop_endpoint = StopEndpoint('bridge', stop)
     try:
         if arguments.state_file:
@@ -2898,6 +2901,8 @@ def main():
             except StateFileError as error:
                 print(f'bridge_state_file_failed error={error}', file=sys.stderr, flush=True)
                 raise SystemExit(1)
+        if stopping.is_set():
+            return
         try:
             transport.start()
         except DeviceAdmissionError as error:

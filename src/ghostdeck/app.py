@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
-from ghostdeck import studio
+from ghostdeck import lifecycle, studio
 
 _SHIM_UP = re.compile(r"(?:^|\s)shim=up(?:\s|$)")
 # The fields `status` prints. Parsed by name so a new field cannot be mistaken for a value.
@@ -60,7 +60,7 @@ class CommandResult:
         return message_head(self.stderr or self.stdout) or f"exit {self.code}"
 
 
-def run_cli(argv: list[str]) -> CommandResult:
+def run_cli(argv: list[str], *, cancel=None) -> CommandResult:
     """Run `ghostdeck` as a child. HID enumerate in this process crashes the window.
 
     Measured: macOS 27 EXC_BREAKPOINT (`__CFCheckCFInfoPACSignature` /
@@ -76,6 +76,11 @@ def run_cli(argv: list[str]) -> CommandResult:
     # Keep the GUI budget aligned with reconnect instead of killing that normal recovery.
     timeout = {"studio": 180.0, "play": 180.0, "bridge": 90.0, "stop": 60.0, "reconnect": 180.0}.get(argv[0] if argv else "", 20.0)
     try:
+        if argv and argv[0] in lifecycle.COMMANDS:
+            code, out, err = lifecycle.run_command(
+                [sys.executable, "-m", "ghostdeck", *argv], env=env, timeout=timeout, cancel=cancel,
+            )
+            return CommandResult(list(argv), code, out, err)
         proc = subprocess.run(
             [sys.executable, "-m", "ghostdeck", *argv],
             capture_output=True,
@@ -995,6 +1000,8 @@ def volume_step(volume: float, key: str) -> float:
 # CLI refusal fragment (lower-cased) -> the Korean line the window shows. First match wins, so the
 # more specific phrase comes first. Each line names the next thing to do, not the internal cause.
 _FAILURE_NOTES = (
+    ("cleanup is still pending", "이전 작업을 정리하고 덱을 복구 중입니다. 끝날 때까지 기다리십시오."),
+    ("still unconfirmed", "시작 상태를 아직 확인하지 못했습니다. 완료될 때까지 기다리십시오."),
     ("open failed", "덱이 아직 이전 영상을 안 놓았습니다."),
     ("busy with another video", "덱이 아직 이전 영상을 안 놓았습니다."),
     ("has not proven", "덱이 아직 이전 영상을 안 놓았습니다."),
@@ -1751,22 +1758,53 @@ class DeckRemote:
     """
 
     def __init__(self, run=run_cli):
-        self._run = run
+        self._runner = run
+        self._operation_lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._closing = False
+
+    def cancel(self):
+        with self._cancel_lock:
+            self._cancel.set()
+
+    def shutdown(self):
+        with self._cancel_lock:
+            self._closing = True
+            self._cancel.set()
+
+    def _run(self, argv):
+        if self._cancel.is_set() and argv != ["status"]:
+            return CommandResult(argv, 1, "", "command cancelled")
+        if self._runner is run_cli:
+            return run_cli(argv, cancel=self._cancel)
+        return self._runner(argv)
+
+    def _operation(self, operation, *, supersede=False):
+        if supersede:
+            self.cancel()
+        # Stop/reconnect cannot overtake an in-flight startup and leave it resurrecting later.
+        with self._operation_lock:
+            with self._cancel_lock:
+                if self._closing:
+                    return CommandResult([], 1, "", "command cancelled")
+                self._cancel = threading.Event()
+            return operation()
 
     def status(self) -> CommandResult:
         return self._run(["status"])
 
     def stop(self) -> CommandResult:
-        return self._run(["stop"])
+        return self._operation(lambda: self._run(["stop"]), supersede=True)
 
     def reconnect(self) -> CommandResult:
-        return self._run(["reconnect"])
+        return self._operation(lambda: self._run(["reconnect"]), supersede=True)
 
     def studio(self) -> CommandResult:
-        return self._run(["studio"])
+        return self._operation(lambda: self._run(["studio"]), supersede=True)
 
     def bridge(self) -> CommandResult:
-        return self._run(["bridge"])
+        return self._operation(lambda: self._run(["bridge"]), supersede=True)
 
     def _bring_up(self, results: list[CommandResult]) -> bool:
         """`studio`, or the bridge alone when this host has no Studio to start. True if either is up.
@@ -1784,6 +1822,10 @@ class DeckRemote:
         return results[-1].code == 0
 
     def play(self, source: str, pasteboard: str = "", start: float = 0.0, loop: bool = True, crop: str = "auto", volume: float = 1.0, fit: str = "auto") -> list[CommandResult]:
+        result = self._operation(lambda: self._play(source, pasteboard, start, loop, crop, volume, fit))
+        return result if isinstance(result, list) else [result]
+
+    def _play(self, source, pasteboard, start, loop, crop, volume, fit):
         source = resolve_source(source, pasteboard)
         if not source:
             return [CommandResult(["play"], 2, "", "유튜브에서 영상을 열거나 파일을 연 다음 재생을 누르십시오")]
@@ -2381,6 +2423,13 @@ def main() -> int:
                 _gui_recovery_draw(ctrl, recovery_action(item.stdout, has_studio=has))
                 _gui_sync_deck(ctrl, parse_status_fields(item.stdout).get("playing") == "yes")
         last = results[-1] if results else None
+        if last is not None and (last.code == 75 or "cleanup is still pending" in last.detail):
+            ctrl.seen_watch = ""
+            note = ("시작 상태를 아직 확인하지 못했습니다. 완료될 때까지 기다리십시오."
+                    if "still unconfirmed" in last.stderr else
+                    "이전 작업을 정리하고 덱을 복구 중입니다. 끝날 때까지 기다리십시오.")
+            _gui_note_failure(ctrl, note, last.stderr or last.stdout)
+            return
         if last is None:
             if should_retry_pending(
                 pending, pending_start, getattr(ctrl, "seen_watch", ""), getattr(ctrl, "played_start", 0.0)
@@ -4277,6 +4326,7 @@ def main() -> int:
                 self.play_(None)
 
         def applicationWillTerminate_(self, _notification):
+            remote.shutdown()
             try:
                 self.ucc.removeScriptMessageHandlerForName_("ghostdeck")
             except Exception:

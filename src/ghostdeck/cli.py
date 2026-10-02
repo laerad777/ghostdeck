@@ -5,7 +5,7 @@ import sys
 
 from ghostdeck import devicebuild
 from ghostdeck import play as playmod
-from ghostdeck import studio, tree, usb
+from ghostdeck import lifecycle, studio, tree, usb
 
 # A missing optional backend is not a hardware verdict, so it gets its own exit code (A-102).
 # Before this, `detect` printed "no device" and exited 1 for both "no deck is attached" and
@@ -71,43 +71,49 @@ def main(argv: list[str] | None = None) -> int:
     p_play.add_argument("--mute", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if args.cmd in _NEEDS_TREE:
-            # Fail fast, before any device work: one line, and the environment exit code (2) because
-            # this is the environment being wrong, not the hardware (A-102's distinction).
-            tree.root()
-        if args.cmd == "detect":
-            return _detect()
-        if args.cmd == "status":
-            return _status()
-        if args.cmd == "play":
-            playmod.start_play(
-                args.source,
-                fit=args.fit,
-                start=args.start,
-                loop=not args.no_loop,
-                crop=args.crop,
-                volume=0.0 if args.mute else args.volume,
-            )
-            return 0
-        if args.cmd == "stop":
-            playmod.stop()
-            return 0
-        if args.cmd == "studio":
-            studio.launch()
-            return 0
-        if args.cmd == "bridge":
-            studio.bridge_up()
-            return 0
-        if args.cmd == "reconnect":
-            studio.reconnect()
-            return 0
-        if args.cmd == "build":
-            studio.ensure_copy()
-            devicebuild.ensure()
-            return 0
-        if args.cmd == "gui":
-            from ghostdeck.app import main as gui_main
-            return gui_main()
+        with lifecycle.command(args.cmd) as operation:
+            if operation is not None:
+                operation.check()
+            if args.cmd in _NEEDS_TREE:
+                # Fail fast, before any device work: one line, and the environment exit code (2) because
+                # this is the environment being wrong, not the hardware (A-102's distinction).
+                tree.root()
+            if args.cmd == "detect":
+                return _detect()
+            if args.cmd == "status":
+                return _status()
+            if args.cmd == "play":
+                playmod.start_play(
+                    args.source,
+                    fit=args.fit,
+                    start=args.start,
+                    loop=not args.no_loop,
+                    crop=args.crop,
+                    volume=0.0 if args.mute else args.volume,
+                )
+                return 0
+            if args.cmd == "stop":
+                playmod.stop()
+                return 0
+            if args.cmd == "studio":
+                studio.launch()
+                return 0
+            if args.cmd == "bridge":
+                studio.bridge_up()
+                return 0
+            if args.cmd == "reconnect":
+                studio.reconnect()
+                return 0
+            if args.cmd == "build":
+                studio.ensure_copy()
+                devicebuild.ensure()
+                return 0
+            if args.cmd == "gui":
+                from ghostdeck.app import main as gui_main
+                return gui_main()
+    except lifecycle.Cancelled:
+        print("command cancelled; startup children have exited", file=sys.stderr)
+        return 1
     except usb.MissingDependency as error:
         # The backend, not the deck (A-102). No command can reach a hardware conclusion here, so
         # every one of them reports the environment and exits with the environment code.

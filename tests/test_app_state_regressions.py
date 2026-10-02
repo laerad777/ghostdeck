@@ -238,6 +238,10 @@ def test_gui_command_timeout_allows_play_recovery_and_cleanup(monkeypatch, opera
             assert kwargs["timeout"] > 2 * app.studio.BRIDGE_READY_TIMEOUT + app.studio.BRIDGE_WAIT + 20 + 5
         return SimpleNamespace(returncode=0, stdout="", stderr="")
     monkeypatch.setattr(app.subprocess, "run", run)
+    def managed(argv, **kwargs):
+        result = run(argv, **kwargs)
+        return result.returncode, result.stdout, result.stderr
+    monkeypatch.setattr(app.lifecycle, "run_command", managed)
     assert app.run_cli([operation]).code == 0
 
 
@@ -264,3 +268,21 @@ def test_explicit_play_clears_removed_suppression_but_loop_restart_preserves_it(
     kick = gui_function("_gui_kick", _gui_notify=lambda *a: None)
     kick(ctrl, "play", "/tmp/a.mp4", preserve_queue=preserve_queue)
     assert ("/tmp/a.mp4" in ctrl.removed_now) is preserve_queue
+
+
+@pytest.mark.parametrize("detail", [
+    "timed out; startup cleanup is still pending; wait before retrying",
+    "startup handoff was committed but is still unconfirmed; wait before retrying",
+])
+def test_pending_cleanup_never_prompts_or_retries_play(detail):
+    notes, retries = [], []
+    ctrl = SimpleNamespace(pending_source="/tmp/next.mp4", pending_start=0, seen_watch="/tmp/old.mp4",
+                           note=SimpleNamespace(setToolTip_=lambda value: None))
+    apply = gui_function("_gui_apply", _gui_set_busy=lambda *args: None,
+                         _gui_note_failure=lambda ctrl, text, raw: notes.append(text),
+                         _gui_kick=lambda *args, **kwargs: retries.append(args))
+    apply(ctrl, [app.CommandResult(["play", "/tmp/old.mp4"], 75, "", detail)], None)
+    assert not retries
+    assert notes and "기다리십시오" in notes[0]
+    assert "다시 연결" not in notes[0]
+    assert "다시 연결" not in app.play_failure_note(detail)
