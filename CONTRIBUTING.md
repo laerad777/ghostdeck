@@ -2,8 +2,32 @@
 
 Contributions are welcome as GitHub Issues and pull requests.
 
-PRs run the device-free pytest suite on macOS (the 0.1.0 host) and Ubuntu,
-and must include `Signed-off-by` on every commit.
+PRs run the device-free pytest suite on macOS (Python 3.12, the 0.1.0 host)
+and Ubuntu (Python 3.11, 3.12 and 3.13). The Ubuntu 3.12 leg also installs the
+ARM cross compiler to exercise the real archive/ABI guards. Every non-merge
+commit must include a valid `Signed-off-by: Name <email>` trailer in the final
+commit-message trailer block; a matching line in the subject or body is not enough.
+
+To run the same device-free checks from a checkout:
+
+```sh
+python -m pip install pytest
+GHOSTDECK_HW_TEST= PYTHONPATH=src python -m pytest tests/ -q -ra --tb=short --durations=15 --junitxml=test-results/pytest.xml
+python tools/check_dco.py <base-commit> <head-commit>
+```
+
+CI uploads a separate JUnit artifact per OS/Python leg even when tests fail.
+Skip reasons and the slowest tests appear in the job log. Platform/toolchain
+specific tests may skip locally; do not treat those as tested hardware support.
+External actions are pinned to reviewed release commits using Node 24. A
+self-hosted runner must be at least 2.327.1 (checkout inside Docker actions
+requires 2.329.0); the last observed deck runner, 2.337.0, meets both minimums.
+Updating workflow action pins does not require running the hardware workflow.
+
+The DCO job fails closed on Git errors and validates Git-parsed trailers. It
+retains the existing `pull_request` workflow trust model: a contributor who can
+change that workflow can also change its checks. This is not independent
+malicious-PR enforcement; maintainers must review workflow changes.
 
 ## License of contributions
 
