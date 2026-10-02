@@ -103,6 +103,17 @@ bridge that copy's shim sees no device.
 If OPEN does not complete within 20 seconds after the startup grace period, startup
 fails and the launcher cancels only its own player. The player keeps looping until `stop`.
 
+GUI startup timeouts, Stop and Quit request cooperative cancellation. Mutating CLI
+commands hold a startup/restoration lock; newly launched bridge/player children
+inherit it until startup commits or their cleanup exits. A reused, already-running
+bridge is not cancelled with a failed play. If cleanup exceeds the bounded wait,
+the command reports it as pending and refuses a new mutation while restoration
+still owns the lock. It never force-kills a bridge/player to meet the GUI deadline.
+An unresponsive OS or device can still leave restoration pending; process exit is
+not a claim of physical-device restoration. Source probes run in owned disposable
+process groups so their helpers are terminated on cancellation. Independently
+session-detached third-party helpers are outside that group guarantee.
+
 ## Stop vs Studio
 
 Three owners, one of them a `ghostdeck` command:

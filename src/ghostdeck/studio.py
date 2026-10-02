@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-from ghostdeck import HID_PID, HID_VID, adb, devicebuild, tree, usb
+from ghostdeck import HID_PID, HID_VID, adb, devicebuild, lifecycle, tree, usb
 
 ORIGINAL = Path("/Applications/Ulanzi Studio.app")
 COPY = Path.home() / "Applications" / "Ulanzi Studio ADB.app"
@@ -217,6 +217,7 @@ def bridge_up() -> None:
     refusals (A-133 ownership, undeterminable endpoint) apply, so neither path can adopt a stranger's
     listener.
     """
+    lifecycle.check()
     endpoint, reason = _socket_state()
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         raise _undeterminable_endpoint(reason)
@@ -228,6 +229,7 @@ def bridge_up() -> None:
 
 
 def launch() -> None:
+    lifecycle.check()
     endpoint, reason = _socket_state()
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         # Refuse before touching the copy: quitting a healthy shim for a bridge that then cannot
@@ -243,6 +245,7 @@ def launch() -> None:
         # Ours, but possibly dead inside: replace it rather than open Studio against it. Re-probe so
         # a replaced bridge takes the `dead` branch below and the copy is relaunched onto the new one.
         _replace_lost_bridge()
+        lifecycle.check()
         endpoint, reason = _socket_state()
         if endpoint == _ENDPOINT_UNDETERMINABLE:
             raise _undeterminable_endpoint(reason)
@@ -256,19 +259,24 @@ def launch() -> None:
         _quit_copy()
     # After the refusals, so nothing is rebuilt or copied on a path that then declines to open
     # Studio.
+    lifecycle.check()
     ensure_copy()
+    lifecycle.check()
     devicebuild.ensure()
     _ensure_bridge()
     settle = time.monotonic() + 2.0
     while time.monotonic() < settle:
+        lifecycle.check()
         if not _socket_live() or not _bridge_owner_live():
             raise RuntimeError(
                 BRIDGE_DOWN + " (bridge died before Studio opened)"
             )
         time.sleep(0.2)
+    lifecycle.check()
     subprocess.run(["/usr/bin/open", str(COPY)], check=True, timeout=15)
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
+        lifecycle.check()
         if running() and _socket_live() and _bridge_owner_live():
             return
         time.sleep(0.25)
@@ -289,10 +297,12 @@ def reconnect(*, wait: float = 12.0) -> None:
         _quit_copy()
     _quit_official()
     _stop_our_bridge()
+    lifecycle.check()
     adb.restart_server()
     found = usb.detect()
     deadline = time.monotonic() + wait
     while (found or {}).get("mode") not in ("hid", "adb") and time.monotonic() < deadline:
+        lifecycle.check()
         time.sleep(0.4)
         found = usb.detect()
     if (found or {}).get("mode") not in ("hid", "adb"):
@@ -617,6 +627,7 @@ def _device_ready(serial: str, *, timeout: float) -> bool:
     """
     deadline = time.monotonic() + timeout
     while True:
+        lifecycle.check()
         try:
             result = adb.run(
                 ["-s", serial, "shell", "getprop sys.usb.config"],
@@ -664,8 +675,8 @@ def _spawn_bridge(serial: str, log, *, detach: bool = True) -> subprocess.Popen:
         "--hid-pid",
         f"{HID_PID:04x}",
     ]
-    return subprocess.Popen(
-        [sys.executable, "-c", wrapper, *argv] if detach else argv,
+    return lifecycle.spawn(
+        [sys.executable, "-c", wrapper, *argv] if detach and not lifecycle.managed() else argv,
         stdin=subprocess.DEVNULL,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -682,8 +693,7 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
     try:
         child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        child.kill()
-        child.wait(timeout=timeout)
+        raise RuntimeError("bridge cleanup is still pending; not replacing it") from None
 
 
 def _stop_verifier_bridge(child: subprocess.Popen, *, timeout: float = 60.0) -> bool:
@@ -797,6 +807,7 @@ def require_bridge_or_start_it() -> None:
     if ORIGINAL.is_dir():
         require_bridge()
         return
+    lifecycle.check()
     endpoint, reason = _socket_state()
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         raise _undeterminable_endpoint(reason)
@@ -881,6 +892,7 @@ def _ensure_bridge(*, reuse_existing: bool = True) -> subprocess.Popen | None:
     server_restarted = False
     try:
         for attempt in range(BRIDGE_ATTEMPTS):
+            lifecycle.check()
             if attempt:
                 time.sleep(BRIDGE_RETRY_DELAY)
             try:
@@ -888,7 +900,9 @@ def _ensure_bridge(*, reuse_existing: bool = True) -> subprocess.Popen | None:
             except Exception as error:
                 reason = str(error) or type(error).__name__
                 continue
+            lifecycle.check()
             ready = _device_ready(serial, timeout=BRIDGE_READY_TIMEOUT)
+            lifecycle.check()
             if not ready and not server_restarted and _usb_reports_adb(serial):
                 # H3, observed on the physical deck: the USB layer reports the deck in ADB mode
                 # while the *host adb server* still has no transport for it, so `adb devices` is
@@ -932,8 +946,11 @@ def _ensure_bridge(*, reuse_existing: bool = True) -> subprocess.Popen | None:
             try:
                 deadline = time.monotonic() + BRIDGE_WAIT
                 while time.monotonic() < deadline:
+                    lifecycle.check()
                     if _socket_live() and _bridge_owner_live():
                         if reuse_existing:
+                            if lifecycle.managed() and _owned_bridge_pid() != child.pid:
+                                raise RuntimeError("bridge listener changed during bring-up; refusing to adopt it")
                             return
                         if _owned_bridge_pid() == child.pid and child.poll() is None:
                             retained = True

@@ -21,6 +21,10 @@ import queue
 import time
 
 from d200_jpeg import JpegFramer, JpegFramingError
+from d200_subprocess import SourceProcesses
+
+_SOURCE_PROCESSES = SourceProcesses()
+_MEDIA_CHILDREN = []
 from d200_process_control import StopEndpoint, emit_diagnostic, publish_video_state, video_bridge_request
 import d200_video_stream as wire
 
@@ -223,7 +227,7 @@ def align_jpeg_payload(frame):
 
 
 def run(*arguments, check=True, capture=False):
-    return subprocess.run((ADB, "-s", SERIAL, *arguments[1:]) if arguments and arguments[0] == ADB
+    return _SOURCE_PROCESSES.run((ADB, "-s", SERIAL, *arguments[1:]) if arguments and arguments[0] == ADB
                           else arguments, check=check, capture_output=capture, text=capture,
                           timeout=90)
 
@@ -764,6 +768,26 @@ def stop_encoder(encoder, *, harsh: bool = False):
     for stream in (encoder.stdin, encoder.stdout, encoder.stderr):
         if stream:
             stream.close()
+    if encoder.poll() is not None:
+        try:
+            _MEDIA_CHILDREN.remove(encoder)
+        except ValueError:
+            pass
+
+
+def spawn_media(command, **kwargs):
+    # SIGTERM must not unwind between Popen and registering its returned handle.
+    _SOURCE_PROCESSES.spawning += 1
+    try:
+        if _SOURCE_PROCESSES.cancelled.is_set():
+            raise InterruptedError("playback cancelled")
+        child = subprocess.Popen(command, **kwargs)
+        _MEDIA_CHILDREN.append(child)
+    finally:
+        _SOURCE_PROCESSES.spawning -= 1
+    if _SOURCE_PROCESSES.cancelled.is_set():
+        raise InterruptedError("playback cancelled")
+    return child
 
 
 def spawn_speaker(audio_cmd):
@@ -774,13 +798,13 @@ def spawn_speaker(audio_cmd):
     """
     if not audio_cmd:
         return None
-    return subprocess.Popen(
+    return spawn_media(
         audio_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0,
     )
 
 
 def spawn_av(command, audio_cmd):
-    encoder = subprocess.Popen(
+    encoder = spawn_media(
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
     return encoder, spawn_speaker(audio_cmd)
@@ -960,9 +984,11 @@ def main():
     cancel = threading.Event()
     diagnostics = HostDiagnostics()
     finalizing = False
+    client = encoder = speaker = stderr_thread = None
 
     def interrupt(_signum, _frame):
         cancel.set()
+        _SOURCE_PROCESSES.cancelled.set()
         diagnostics.mark("cancelRequested")
         try:
             if speaker is not None and speaker.poll() is None:
@@ -971,7 +997,7 @@ def main():
                 encoder.kill()
         except OSError:
             pass
-        if not finalizing:
+        if not finalizing and not _SOURCE_PROCESSES.spawning:
             raise InterruptedError("playback cancelled")
 
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -980,6 +1006,9 @@ def main():
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
     else:
         signal.signal(signal.SIGHUP, interrupt)
+    if "GHOSTDECK_CHILD_LEASE" in os.environ:
+        from ghostdeck.lifecycle import child_lease
+        child_lease(lambda: os.kill(os.getpid(), signal.SIGTERM))
     endpoint = StopEndpoint("player", lambda: os.kill(os.getpid(), signal.SIGTERM))
     owner = endpoint.state()
     state = dict(schemaVersion=2, phase="active", pid=os.getpid(), control=owner,
@@ -1197,6 +1226,7 @@ def main():
         success = True
     finally:
         finalizing = True
+        cancel.set()
         try:
             if speaker is not None and speaker.poll() is None:
                 speaker.kill()
@@ -1210,13 +1240,18 @@ def main():
 
         def cleanup_encoder():
             try:
+                _SOURCE_PROCESSES.close()
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                encoder_errors.append(error)
+            try:
                 stop_encoder(speaker, harsh=True)
             except (OSError, subprocess.TimeoutExpired) as error:
                 encoder_errors.append(error)
-            try:
-                stop_encoder(encoder)
-            except (OSError, subprocess.TimeoutExpired) as error:
-                encoder_errors.append(error)
+            for child in tuple(_MEDIA_CHILDREN):
+                try:
+                    stop_encoder(child)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    encoder_errors.append(error)
 
         encoder_cleanup = threading.Thread(target=cleanup_encoder, daemon=True)
         encoder_cleanup.start()

@@ -137,13 +137,15 @@ def test_start_play_still_reports_a_missing_deck_when_backends_work(monkeypatch)
     assert "no D200 on USB" in str(excinfo.value)
 
 
-def test_main_maps_a_missing_backend_to_the_environment_exit_code(monkeypatch, capsys):
+def test_main_maps_a_missing_backend_to_the_environment_exit_code(monkeypatch, capsys, tmp_path):
     """The mapping is in `main`, so every command reports the environment consistently."""
     from ghostdeck import cli, usb
 
     def boom(*args, **kwargs):
         raise usb.MissingDependency(HINT)
 
+    from ghostdeck import state
+    monkeypatch.setattr(state, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(cli.playmod, "stop", boom)
     code = cli.main(["stop"])
     captured = capsys.readouterr()

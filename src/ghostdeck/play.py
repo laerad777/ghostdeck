@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from ghostdeck import adb, devicebuild, state as gdstate, studio, usb
+from ghostdeck import adb, devicebuild, lifecycle, state as gdstate, studio, usb
 from ghostdeck.playident import (
     TRANSPORT_READY,
     VENDOR_DIR,
@@ -172,6 +172,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     studio.require_bridge_or_start_it()
     gdstate.ensure_dirs()
     devicebuild.ensure()
+    lifecycle.check()
     found = usb.detect()
     if found is None or found.get("mode") in (None, "none"):
         # A missing backend is not a missing deck (A-102): `detect()` attaches the hint when it
@@ -181,11 +182,13 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
         if dependency:
             raise usb.MissingDependency(dependency)
         raise RuntimeError("no D200 on USB")
+    lifecycle.check()
     if found["mode"] == "hid":
         usb.switch_hid_to_adb()
         found = usb.detect()
     if found is None or found.get("mode") != "adb":
         raise RuntimeError("deck is not in ADB after switch")
+    lifecycle.check()
     predecessor = gdstate.load().get("play_pid") is not None
     try:
         _kill_play()
@@ -195,6 +198,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     _signal_speakers()
     if predecessor:
         _session_released(timeout=1.5)
+    lifecycle.check()
     abandon_host_session()
     if not VENDOR_PLAY.is_file():
         raise RuntimeError(f"vendor player missing: {VENDOR_PLAY}")
@@ -240,7 +244,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     log = open(log_path, "ab")
     log_start = log.tell()
     try:
-        proc = subprocess.Popen(
+        proc = lifecycle.spawn(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=log,
@@ -258,11 +262,13 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
             returncode = proc.wait(timeout=_PLAY_GRACE)
         except subprocess.TimeoutExpired:
             returncode = None
+        lifecycle.check()
         if returncode is not None:
             raise _player_died(returncode, log_path, log_start)
         open_deadline = time.monotonic() + _OPEN_WAIT
         saw_self = False
         while time.monotonic() < open_deadline:
+            lifecycle.check()
             returncode = proc.poll()
             if returncode is not None:
                 raise _player_died(returncode, log_path, log_start)
@@ -279,6 +285,7 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
             time.sleep(0.1)
         else:
             raise RuntimeError(f"video OPEN timed out after {_OPEN_WAIT:g}s; startup cancelled")
+        lifecycle.check()
         data = gdstate.update(play_pid=proc.pid)
         if data.get("play_pid") != proc.pid:
             # A-104: fail loudly rather than silently reporting a session that was never recorded.
@@ -287,6 +294,9 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     except BaseException:
         # Popen owns precisely this child. Never use the global stop sweep or
         # erase host/state records: another session may have replaced ours.
+        if lifecycle.managed():
+            # The command owns the lease and waits for graceful restoration on unwind.
+            raise
         if proc.poll() is None:
             proc.terminate()
             try:
