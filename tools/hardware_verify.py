@@ -35,7 +35,10 @@ Usage
 
 Run it on an interpreter that has `hidapi` and `pyusb` (the project extras:
 `pip install ghostdeck[device]`), because `usb.detect()` needs them. Exit codes:
-0 = every check passed, 1 = a check failed, 2 = skipped (no deck attached).
+0 = every check passed, 1 = a check failed, 2 = skipped/refused (no deck or busy endpoint).
+An occupied endpoint stays non-zero: it is not a successful hardware test. Close the
+existing session in its owning application before re-running; never kill it here.
+Set GHOSTDECK_HW_LOG_DIR to retain verifier-launched CLI/player logs for CI artifacts.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -195,6 +199,30 @@ def wait_for_mode(wanted: str, *, timeout: float = 25.0) -> str:
     return current
 
 
+def open_run_log(prefix: str):
+    """Keep launcher diagnostics in the run's artifact directory, including on macOS."""
+    directory = os.environ.get("GHOSTDECK_HW_LOG_DIR")
+    if directory:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".log", delete=False, dir=directory)
+    print(f"  output: {handle.name}", flush=True)
+    return handle
+
+
+def report_play_log(player) -> None:
+    handle = getattr(player, "_ghostdeck_log", None)
+    if handle is None:
+        return
+    try:
+        with open(handle.name, "rb") as source:
+            source.seek(0, os.SEEK_END)
+            source.seek(max(0, source.tell() - 8192))
+            tail = source.read().decode("utf-8", "replace")
+        print(f"  launcher output ({handle.name}, last 8192 bytes):\n{tail}")
+    except OSError as error:
+        print(f"  cannot read launcher output: {error}")
+
+
 def cli(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
     """Run the product CLI, capturing output through a FILE.
 
@@ -212,7 +240,7 @@ def cli(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
     Pass an explicit `timeout` when the command is expected to be long-lived; see
     `start_play_async` for the pattern the harness uses.
     """
-    handle = tempfile.NamedTemporaryFile(prefix="ghostdeck-cli-", suffix=".log", delete=False)
+    handle = open_run_log("ghostdeck-cli-")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "ghostdeck.cli", *args],
@@ -233,7 +261,7 @@ def start_play_async(media: str) -> subprocess.Popen:
     `HOST_STATE`'s diagnostics for consumption and then calls `cli("stop")`. Output goes to a
     file for the same reason as `cli()`.
     """
-    handle = tempfile.NamedTemporaryFile(prefix="ghostdeck-play-", suffix=".log", delete=False)
+    handle = open_run_log("ghostdeck-play-")
     process = subprocess.Popen(
         [sys.executable, "-m", "ghostdeck.cli", "play", media],
         stdout=handle, stderr=subprocess.STDOUT,
@@ -299,6 +327,41 @@ def stop_playing() -> str:
     return "; ".join(outcomes)
 
 
+def require_run_bridge(bridge) -> None:
+    if bridge.poll() is not None or studio._owned_bridge_pid() != bridge.pid:
+        raise RuntimeError("this run no longer owns the bridge listener; refusing play/stop")
+
+
+def teardown(bridge, serial: str | None) -> None:
+    print("\n== teardown ==")
+    try:
+        require_run_bridge(bridge)
+    except RuntimeError as error:
+        check("teardown ownership", False, str(error))
+        # Still release our exact child, but never issue shared stop against its replacement.
+        finished = studio._stop_verifier_bridge(bridge)
+        check("owned bridge cleanup finished", finished, "cleanup still pending" if not finished else "exited")
+        return
+    try:
+        observe("before teardown")
+        print(f"  teardown: {stop_playing()}")
+    finally:
+        finished = studio._stop_verifier_bridge(bridge)
+        check("owned bridge cleanup finished", finished,
+              "cleanup still pending; leaving the bridge alive without SIGKILL" if not finished else "exited")
+    if not finished:
+        return
+    check("the bridge this run started exited cleanly", bridge.poll() == 0,
+          f"rc={bridge.poll()}")
+    final_mode = wait_for_mode("hid")
+    observe("after teardown")
+    check("deck back on HID", final_mode == "hid", final_mode)
+    check("not playing", not play.playing(), f"playing={play.playing()}")
+    if serial and final_mode == "hid":
+        staged = deck_paths(serial, "/tmp/d200-color-agent")["/tmp/d200-color-agent"]
+        check("no staged agent left after the bridge stopped", staged == "ABSENT", staged)
+
+
 def main() -> int:
     if os.environ.get(ENV_GATE) != "1":
         print(f"SKIP: real-hardware verification is opt-in; set {ENV_GATE}=1 to run it.")
@@ -330,6 +393,14 @@ def main() -> int:
         print("          This harness only stops a bridge it started itself, so it will not")
         print("          adopt or signal an existing one. Stop it first, then re-run.")
         return 2
+    # The socket is shared across checkouts. A process list scoped to ROOT misses an
+    # operator's bridge launched from another checkout (consistent with October 1's logs).
+    endpoint, reason = studio._socket_state()
+    if endpoint != studio._ENDPOINT_DEAD:
+        print(f"REFUSING: bridge endpoint {studio.SOCKET} is {endpoint} ({reason}).")
+        print("          Leave the existing session alone; close it in its owning application")
+        print("          and re-run when the deck is idle. No hardware checks were run.")
+        return 2
     check("no bridge running at start", not before, f"pids={before}")
 
     observe("before")
@@ -347,100 +418,103 @@ def main() -> int:
         # "build d200-zkgui-proxy, d200-color-agent and libd200-zkgui-preload.so first".
         # A warm `~/.ghostdeck/bin` cache does not need the cross compiler (A-166).
         devicebuild.ensure()
-        studio._ensure_bridge()
+        bridge = studio._ensure_bridge(reuse_existing=False)
     except Exception as error:
         check("bring-up", False, f"{type(error).__name__}: {error}")
         print("\nRESULT: cannot continue without a bridge")
         return 1
-    setup_seconds = time.monotonic() - began
-    # Ownership is "absent before bring-up": only pids that were NOT there before are ours
-    # to release. The `before` set is empty by construction here (we refused otherwise), but
-    # the subtraction is kept so the rule holds even if the gate above is ever relaxed.
-    our_bridges = [pid for pid in own_bridges() if pid not in before]
-    observe("after bring-up")
-    check("bridge socket live", studio._socket_state()[0] == "live", str(studio._socket_state()))
-    check("exactly one bridge", own_bridge_count() == 1, f"count={own_bridge_count()}")
-    check("deck reports adb", device_mode() == "adb", device_mode())
+    serial = None
+    try:
+        setup_seconds = time.monotonic() - began
+        # Strict bring-up returns the actual (non-double-forked) bridge child. A bridge
+        # from another process is never ours merely because it appeared during the wait.
+        our_bridges = [bridge.pid] if bridge is not None else []
+        observe("after bring-up")
+        check("bridge socket live", studio._socket_state()[0] == "live", str(studio._socket_state()))
+        count = own_bridge_count()
+        check("exactly one bridge", count == 1, f"count={count}")
+        listener = studio._owned_bridge_pid()
+        if count != 1 or bridge is None or bridge.poll() is not None or listener not in our_bridges:
+            check("bridge belongs to this run", False, f"started={our_bridges}, listener={listener}")
+            print("RESULT: refusing play/stop against an unowned session; leaving it untouched")
+            return 1
+        check("deck reports adb", device_mode() == "adb", device_mode())
 
-    serial = device_serial()
-    check("serial resolved", bool(serial), "read from the device")
-    if not serial:
-        return 1
+        serial = device_serial()
+        check("serial resolved", bool(serial), "read from the device")
+        if not serial:
+            return 1
 
-    rows = adb_devices()
-    check("adb sees the deck", any(s == serial for s, _ in rows), str(rows))
-    check("deck answers a command", reachable(serial), f"after {setup_seconds:.1f}s bring-up")
-    if setup_seconds > 10:
-        notes.append(f"bring-up took {setup_seconds:.1f}s (a fast bring-up is ~2-6s); "
-                     "slow bring-up means the device proxy needed retries")
+        rows = adb_devices()
+        check("adb sees the deck", any(s == serial for s, _ in rows), str(rows))
+        check("deck answers a command", reachable(serial), f"after {setup_seconds:.1f}s bring-up")
+        if setup_seconds > 10:
+            notes.append(f"bring-up took {setup_seconds:.1f}s (a fast bring-up is ~2-6s); "
+                         "slow bring-up means the device proxy needed retries")
 
-    for media in args.media or []:
-        print(f"\n== play {media} ==")
-        if HOST_STATE.exists():
-            HOST_STATE.unlink()
-        # `play` loops until stopped, so it is started, watched, and then stopped - never
-        # awaited. Awaiting it always times out regardless of clip length (see cli()).
-        player = start_play_async(media)
-        peak = {}
-        for _ in range(24):
-            time.sleep(1.0)
-            current = host_diagnostics()
-            if (current.get("framesConsumed") or 0) >= (peak.get("framesConsumed") or 0):
-                peak = current
-            if (peak.get("framesConsumed") or 0) > 5 and peak.get("firstConsumedReceipt"):
-                break
-            # Do NOT stop waiting when the launcher exits. `ghostdeck play` is a fire-and-hold
-            # launcher: it starts the player, waits out its own A-103 grace window and returns,
-            # and the player only begins publishing consumed frames a second or two AFTER that.
-            # Treating the launcher's exit as failure made a healthy session read as 0 frames.
-            # Only a launcher that exited NON-ZERO is a failure.
-            if player.poll() not in (None, 0) and (peak.get("framesConsumed") or 0) == 0:
-                break
-        check("play started", (peak.get("framesConsumed") or 0) > 0 or player.poll() in (None, 0),
-              f"launcher rc={player.poll()}")
-        consumed = peak.get("framesConsumed") or 0
-        check("frames consumed by the deck", consumed > 5,
-              f"sent={peak.get('framesSent')} consumed={consumed} bytes={peak.get('streamBytesSent')}")
-        observe("during play")
+        for media in args.media or []:
+            require_run_bridge(bridge)
+            print(f"\n== play {media} ==")
+            if HOST_STATE.exists():
+                HOST_STATE.unlink()
+            # `play` loops until stopped, so it is started, watched, and then stopped - never
+            # awaited. Awaiting it always times out regardless of clip length (see cli()).
+            player = start_play_async(media)
+            peak = {}
+            for _ in range(24):
+                time.sleep(1.0)
+                current = host_diagnostics()
+                if (current.get("framesConsumed") or 0) >= (peak.get("framesConsumed") or 0):
+                    peak = current
+                if (peak.get("framesConsumed") or 0) > 5 and peak.get("firstConsumedReceipt"):
+                    break
+                # Do NOT stop waiting when the launcher exits. `ghostdeck play` is a fire-and-hold
+                # launcher: it starts the player, waits out its own A-103 grace window and returns,
+                # and the player only begins publishing consumed frames a second or two AFTER that.
+                # Treating the launcher's exit as failure made a healthy session read as 0 frames.
+                # Only a launcher that exited NON-ZERO is a failure.
+                if player.poll() not in (None, 0) and (peak.get("framesConsumed") or 0) == 0:
+                    break
+            check("play started", (peak.get("framesConsumed") or 0) > 0 or player.poll() in (None, 0),
+                  f"launcher rc={player.poll()}")
+            consumed = peak.get("framesConsumed") or 0
+            if player.poll() not in (None, 0) or consumed <= 5:
+                report_play_log(player)
+            check("frames consumed by the deck", consumed > 5,
+                  f"sent={peak.get('framesSent')} consumed={consumed} bytes={peak.get('streamBytesSent')}")
+            observe("during play")
 
-        status = cli("status")
-        line = (status.stdout or "").strip().splitlines()[0] if status.stdout else ""
-        check("status reports playing", "playing=yes" in line, line[:110] or "(no output)")
+            status = cli("status")
+            line = (status.stdout or "").strip().splitlines()[0] if status.stdout else ""
+            check("status reports playing", "playing=yes" in line, line[:110] or "(no output)")
 
-        print(f"\n== stop {media} ==")
-        observe("before stop")
-        still = cli("stop")
-        check("stop exit 0", still.returncode == 0,
-              f"rc={still.returncode} {(still.stdout or '').strip()[:90]}")
-        observe("after stop")
-        check("bridge survived stop", own_bridge_count() >= 1, f"count={own_bridge_count()}")
-        check("deck still attached", device_mode() in ("hid", "adb"), device_mode())
-        if device_mode() == "none":
-            notes.append("the deck left the USB bus during stop; it needs a physical replug. "
-                         "Investigate whether the stock-UI restart can drop the link.")
-        # The staged agent belongs to the BRIDGE's session, not to `stop`: the bridge removes
-        # it in its own teardown (`_remove_staged_agent`). So while the bridge runs the agent
-        # is legitimately present, and asserting ABSENT here would be asserting the wrong
-        # contract. It is checked in the teardown section instead, after the bridge is gone.
+            print(f"\n== stop {media} ==")
+            observe("before stop")
+            require_run_bridge(bridge)
+            still = cli("stop")
+            check("stop exit 0", still.returncode == 0,
+                  f"rc={still.returncode} {(still.stdout or '').strip()[:90]}")
+            observe("after stop")
+            check("bridge survived stop", own_bridge_count() >= 1, f"count={own_bridge_count()}")
+            check("deck still attached", device_mode() in ("hid", "adb"), device_mode())
+            if device_mode() == "none":
+                notes.append("the deck left the USB bus during stop; it needs a physical replug. "
+                             "Investigate whether the stock-UI restart can drop the link.")
+            # The staged agent belongs to the BRIDGE's session, not to `stop`: the bridge removes
+            # it in its own teardown (`_remove_staged_agent`). So while the bridge runs the agent
+            # is legitimately present, and asserting ABSENT here would be asserting the wrong
+            # contract. It is checked in the teardown section instead, after the bridge is gone.
 
-    print("\n== teardown ==")
-    if args.no_clean:
-        print("  (--no-clean: leaving the session up)")
-    else:
-        observe("before teardown")
-        print(f"  teardown: {stop_playing()}")
-        remaining = stop_own_bridges(our_bridges)
-        check("the bridge this run started is stopped", not remaining, f"remaining={remaining}")
-        # Only once the bridge is gone can the deck return to HID: the restarted stock UI
-        # performs the HID re-enumeration, and the bridge holds the ADB session until then.
-        final_mode = wait_for_mode("hid")
-        observe("after teardown")
-        check("deck back on HID", final_mode == "hid", final_mode)
-        check("not playing", not play.playing(), f"playing={play.playing()}")
-        if serial and final_mode == "hid":
-            # Re-check the staged agent now, the point at which the bridge has removed it.
-            staged = deck_paths(serial, "/tmp/d200-color-agent")["/tmp/d200-color-agent"]
-            check("no staged agent left after the bridge stopped", staged == "ABSENT", staged)
+    except Exception as error:
+        check("hardware session", False, f"{type(error).__name__}: {error}")
+    finally:
+        if args.no_clean:
+            print("  (--no-clean: leaving the session up)")
+        elif bridge is not None:
+            try:
+                teardown(bridge, serial)
+            except Exception as error:
+                check("teardown", False, f"{type(error).__name__}: {error}")
 
     print()
     for note in notes:
@@ -452,5 +526,13 @@ def main() -> int:
     return 0
 
 
+def handle_sigterm(signum, _frame) -> None:
+    # Actions cancellation sends SIGTERM. Unwind the same guarded cleanup as an
+    # exception, and do not let a second TERM interrupt restoration in finally.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_sigterm)
     raise SystemExit(main())

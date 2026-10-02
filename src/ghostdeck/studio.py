@@ -630,7 +630,7 @@ def _device_ready(serial: str, *, timeout: float) -> bool:
         time.sleep(0.5)
 
 
-def _spawn_bridge(serial: str, log) -> subprocess.Popen:
+def _spawn_bridge(serial: str, log, *, detach: bool = True) -> subprocess.Popen:
     env = os.environ.copy()
     previous = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(VENDOR) if not previous else str(VENDOR) + os.pathsep + previous
@@ -662,7 +662,7 @@ def _spawn_bridge(serial: str, log) -> subprocess.Popen:
         f"{HID_PID:04x}",
     ]
     return subprocess.Popen(
-        [sys.executable, "-c", wrapper, *argv],
+        [sys.executable, "-c", wrapper, *argv] if detach else argv,
         stdin=subprocess.DEVNULL,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -681,6 +681,23 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
     except subprocess.TimeoutExpired:
         child.kill()
         child.wait(timeout=timeout)
+
+
+def _stop_verifier_bridge(child: subprocess.Popen, *, timeout: float = 60.0) -> bool:
+    """Allow device restoration to finish; never SIGKILL the verifier's bridge.
+
+    DeviceProxy.close can spend 12 seconds waiting for restoration, then perform
+    several bounded device cleanup steps. A five-second kill truncates that work.
+    A timeout means cleanup is still pending, not permission to force the deck down.
+    """
+    if child.poll() is not None:
+        return True
+    child.terminate()
+    try:
+        child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
 
 
 def _stop_our_bridge(*, timeout: float = 8.0) -> None:
@@ -791,9 +808,21 @@ def require_bridge() -> None:
     )
 
 
-def _ensure_bridge() -> None:
+def _require_reusable_bridge(reuse_existing: bool) -> None:
+    if not reuse_existing:
+        raise RuntimeError(
+            f"a listener already holds {SOCKET}; refusing to adopt an existing session. "
+            "Close the session in its owning application, then re-run the hardware check"
+        )
+    if not _bridge_owner_live():
+        raise _stranger_refusal("use")
+
+
+def _ensure_bridge(*, reuse_existing: bool = True) -> subprocess.Popen | None:
+    """Start a bridge, reusing a verified listener only when the caller permits it."""
     endpoint, probe_reason = _socket_state()
     if endpoint == _ENDPOINT_LIVE:
+        _require_reusable_bridge(reuse_existing)
         return
     if endpoint == _ENDPOINT_UNDETERMINABLE:
         raise _undeterminable_endpoint(probe_reason)
@@ -839,6 +868,7 @@ def _ensure_bridge() -> None:
             # is, an unclassifiable endpoint refuses, and only a proven-dead path is reclaimed.
             endpoint, probe_reason = _socket_state()
             if endpoint == _ENDPOINT_LIVE:
+                _require_reusable_bridge(reuse_existing)
                 return
             if endpoint == _ENDPOINT_UNDETERMINABLE:
                 raise _undeterminable_endpoint(probe_reason)
@@ -846,16 +876,35 @@ def _ensure_bridge() -> None:
                 SOCKET.unlink()
             except FileNotFoundError:
                 pass
-            child = _spawn_bridge(serial, log)
-            deadline = time.monotonic() + BRIDGE_WAIT
-            while time.monotonic() < deadline:
-                if _socket_live() and _bridge_owner_live():
-                    return
-                if child.poll() is not None and child.returncode != 0:
-                    reason = f"hidshim bridge exited with status {child.returncode}"
-                    break
-                time.sleep(0.2)
-            _stop_owned_bridge(child)
+            # A verifier needs exact process ownership, not a detached wrapper PID.
+            child = (_spawn_bridge(serial, log) if reuse_existing
+                     else _spawn_bridge(serial, log, detach=False))
+            retained = False
+            try:
+                deadline = time.monotonic() + BRIDGE_WAIT
+                while time.monotonic() < deadline:
+                    if _socket_live() and _bridge_owner_live():
+                        if reuse_existing:
+                            return
+                        if _owned_bridge_pid() == child.pid and child.poll() is None:
+                            retained = True
+                            return child
+                        raise RuntimeError("bridge listener changed during bring-up; refusing to adopt it")
+                    if child.poll() is not None and child.returncode != 0:
+                        reason = f"hidshim bridge exited with status {child.returncode}"
+                        break
+                    time.sleep(0.2)
+            finally:
+                # Strict callers cannot clean up a child they never received, including
+                # when a probe raises or the verifier is interrupted during startup.
+                if not reuse_existing and not retained:
+                    if not _stop_verifier_bridge(child):
+                        raise RuntimeError(
+                            "bridge cleanup is still pending after 60s; leaving it to restore "
+                            "the deck without SIGKILL and not starting another bridge"
+                        )
+            if reuse_existing:
+                _stop_owned_bridge(child)
     finally:
         log.close()
     raise RuntimeError(reason)

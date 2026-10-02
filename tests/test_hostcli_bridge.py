@@ -33,7 +33,11 @@ from ghostdeck import studio  # noqa: E402
 class _FakeChild:
     """Stand-in for a spawned bridge. Optionally binds the endpoint, as a real bridge would."""
 
+    _next_pid = 10000
+
     def __init__(self, endpoint: Path | None = None):
+        self.pid = self._next_pid
+        type(self)._next_pid += 1
         self.returncode: int | None = None
         self._listener: socket.socket | None = None
         if endpoint is not None:
@@ -133,17 +137,23 @@ def _stub_device_chain(monkeypatch, spawned, *, endpoint=None, on_ready=None):
             on_ready()
         return True
 
-    def spawn(serial, log):
+    def spawn(serial, log, *, detach=True):
         child = _FakeChild(endpoint)
+        child.detach = detach
         spawned.append(child)
         return child
 
+    monkeypatch.setattr(studio, "_open_bridge_log", tempfile.TemporaryFile)
     monkeypatch.setattr(studio, "_device_ready", ready)
     monkeypatch.setattr(studio, "_spawn_bridge", spawn)
     # Ownership is the kernel's socket peer and that peer's argv. A fake child binds in THIS process,
     # whose argv is pytest, so ownership is modelled: the spawned child is our bridge while it listens.
     monkeypatch.setattr(
         studio, "_bridge_owner_live", lambda: any(child._listener is not None for child in spawned)
+    )
+    monkeypatch.setattr(
+        studio, "_owned_bridge_pid",
+        lambda: next((child.pid for child in spawned if child._listener is not None), None),
     )
 
 
@@ -199,11 +209,212 @@ def test_live_endpoint_at_entry_is_used_and_never_unlinked(scratch, monkeypatch)
     try:
         monkeypatch.setattr(studio, "SOCKET", sock)
         _stub_device_chain(monkeypatch, spawned)
+        monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
         studio._ensure_bridge()
         assert sock.exists() and sock.stat().st_ino == inode
         assert spawned == [], "a second bridge was spawned although one was already up"
     finally:
         listener.close()
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_strict_start_refuses_every_live_endpoint_at_entry(scratch, monkeypatch, owned):
+    """A verifier cannot adopt even a bridge from this checkout that it did not start."""
+    sock = scratch / "b.sock"
+    listener = _bind_listener(sock)
+    inode = sock.stat().st_ino
+    spawned = []
+    try:
+        monkeypatch.setattr(studio, "SOCKET", sock)
+        _stub_device_chain(monkeypatch, spawned)
+        monkeypatch.setattr(studio, "_bridge_owner_live", lambda: owned)
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("an existing listener must be refused before device work or log creation")
+
+        monkeypatch.setattr(studio, "_adb_serial", forbidden)
+        monkeypatch.setattr(studio, "_open_bridge_log", forbidden)
+        with pytest.raises(RuntimeError, match="refusing to adopt an existing session"):
+            studio._ensure_bridge(reuse_existing=False)
+        assert sock.exists() and sock.stat().st_ino == inode
+        assert spawned == []
+    finally:
+        listener.close()
+
+
+def test_default_start_refuses_a_foreign_live_endpoint(scratch, monkeypatch):
+    sock = scratch / "b.sock"
+    listener = _bind_listener(sock)
+    inode = sock.stat().st_ino
+    spawned = []
+    try:
+        monkeypatch.setattr(studio, "SOCKET", sock)
+        _stub_device_chain(monkeypatch, spawned)
+        with pytest.raises(RuntimeError, match="unidentified bridge"):
+            studio._ensure_bridge()
+        assert sock.exists() and sock.stat().st_ino == inode
+        assert spawned == []
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_strict_start_refuses_a_listener_arriving_during_device_wait(scratch, monkeypatch, owned):
+    sock = scratch / "b.sock"
+    _stale(sock)
+    holder = []
+    inodes = []
+
+    def bridge_arrives():
+        sock.unlink()
+        holder.append(_bind_listener(sock))
+        inodes.append(sock.stat().st_ino)
+
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, on_ready=bridge_arrives)
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: owned)
+    try:
+        with pytest.raises(RuntimeError, match="refusing to adopt an existing session"):
+            studio._ensure_bridge(reuse_existing=False)
+        assert sock.exists() and sock.stat().st_ino == inodes[0]
+        assert spawned == []
+        assert studio._socket_live() is True
+    finally:
+        for listener in holder:
+            listener.close()
+
+
+def test_default_start_reuses_owned_listener_arriving_during_device_wait(scratch, monkeypatch):
+    sock = scratch / "b.sock"
+    holder = []
+
+    def bridge_arrives():
+        holder.append(_bind_listener(sock))
+
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, on_ready=bridge_arrives)
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    try:
+        assert studio._ensure_bridge() is None
+        assert spawned == []
+        assert studio._socket_live() is True
+    finally:
+        for listener in holder:
+            listener.close()
+
+
+def test_strict_start_returns_its_direct_child_when_that_child_owns_the_socket(scratch, monkeypatch):
+    sock = scratch / "b.sock"
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned, endpoint=sock)
+    try:
+        child = studio._ensure_bridge(reuse_existing=False)
+        assert len(spawned) == 1
+        assert child is spawned[0]
+        assert child.detach is False
+        assert child.poll() is None
+    finally:
+        for child in spawned:
+            child._close()
+
+
+def test_strict_start_rejects_a_different_listener_after_spawning(scratch, monkeypatch):
+    """A same-checkout listener racing the spawn cannot become the verifier's session."""
+    sock = scratch / "b.sock"
+    spawned = []
+    stopped = []
+    holder = []
+    monkeypatch.setattr(studio, "SOCKET", sock)
+    _stub_device_chain(monkeypatch, spawned)
+    fake_spawn = studio._spawn_bridge
+
+    def spawn_with_foreign_listener(serial, log, *, detach):
+        child = fake_spawn(serial, log, detach=detach)
+        holder.append(_bind_listener(sock))
+        return child
+
+    monkeypatch.setattr(studio, "_spawn_bridge", spawn_with_foreign_listener)
+    monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
+    monkeypatch.setattr(studio, "_owned_bridge_pid", lambda: 999)
+    stop_owned = studio._stop_verifier_bridge
+
+    def record_stop(child):
+        stopped.append(child)
+        return stop_owned(child)
+
+    monkeypatch.setattr(studio, "_stop_verifier_bridge", record_stop)
+    try:
+        with pytest.raises(RuntimeError, match="listener changed during bring-up"):
+            studio._ensure_bridge(reuse_existing=False)
+        assert len(spawned) == 1
+        assert stopped == spawned
+        assert spawned[0].returncode == -15
+        assert sock.exists()
+        assert studio._socket_live() is True, "cleanup must not stop the foreign listener"
+    finally:
+        for listener in holder:
+            listener.close()
+
+
+def test_strict_start_reaps_its_child_when_no_listener_becomes_ready(scratch, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", scratch / "b.sock")
+    _stub_device_chain(monkeypatch, spawned)
+    with pytest.raises(RuntimeError, match="socket did not come up"):
+        studio._ensure_bridge(reuse_existing=False)
+    assert len(spawned) == 1
+    assert spawned[0].detach is False
+    assert spawned[0].returncode == -15
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_strict_start_reaps_its_child_when_readiness_probe_raises(scratch, monkeypatch, failure):
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", scratch / "b.sock")
+    _stub_device_chain(monkeypatch, spawned)
+
+    def broken_probe():
+        raise failure("readiness interrupted")
+
+    monkeypatch.setattr(studio, "_socket_live", broken_probe)
+    with pytest.raises(failure, match="readiness interrupted"):
+        studio._ensure_bridge(reuse_existing=False)
+    assert len(spawned) == 1
+    assert spawned[0].detach is False
+    assert spawned[0].returncode == -15
+
+
+@pytest.mark.parametrize("detach", [False, True])
+def test_spawn_bridge_uses_a_direct_process_only_when_requested(monkeypatch, detach):
+    """The strict caller's Popen PID must be the bridge, never the double-fork wrapper."""
+    calls = []
+    child = object()
+    log = object()
+
+    def spawn(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return child
+
+    monkeypatch.setattr(studio.adb, "require_adb", lambda: "/fake/adb")
+    monkeypatch.setattr(studio.subprocess, "Popen", spawn)
+    result = studio._spawn_bridge("SERIAL", log, detach=detach)
+    assert result is child
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    bridge_argv = [sys.executable, "-B", "-u", str(studio.BRIDGE)]
+    if detach:
+        assert argv[:2] == [sys.executable, "-c"]
+        assert "os.fork()" in argv[2]
+        assert argv[3:7] == bridge_argv
+    else:
+        assert argv[:4] == bridge_argv
+        assert "-c" not in argv
+    assert argv[argv.index("--serial") + 1] == "SERIAL"
+    assert kwargs["stdout"] is log
+    assert kwargs["start_new_session"] is True
 
 
 def test_live_endpoint_appearing_during_the_device_wait_is_not_unlinked(scratch, monkeypatch):
@@ -502,3 +713,72 @@ def test_restart_server_succeeds_quietly_when_both_commands_exit_zero(monkeypatc
     monkeypatch.setattr(studio.adb.subprocess, "run", fake_run)
     assert studio.adb.restart_server() is None
     assert seen == ["kill-server", "start-server"]
+
+
+def test_verifier_shutdown_allows_more_than_five_seconds():
+    class SlowChild:
+        returncode = None
+        def poll(self):
+            return self.returncode
+        def terminate(self):
+            self.terminated = True
+        def wait(self, timeout):
+            assert self.terminated
+            assert timeout >= 12, "restoration alone may take 12 seconds"
+            self.returncode = 0
+        def kill(self):
+            pytest.fail("must not interrupt restoration")
+    child = SlowChild()
+    assert studio._stop_verifier_bridge(child) is True
+    assert child.returncode == 0
+
+
+def test_verifier_shutdown_timeout_never_sends_sigkill():
+    class StuckChild:
+        def poll(self):
+            return None
+        def terminate(self):
+            pass
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("bridge", timeout)
+        def kill(self):
+            pytest.fail("must leave slow cleanup alive")
+    assert studio._stop_verifier_bridge(StuckChild(), timeout=0.1) is False
+
+
+def test_strict_start_does_not_retry_while_cleanup_is_pending(scratch, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", scratch / "b.sock")
+    _stub_device_chain(monkeypatch, spawned)
+    monkeypatch.setattr(studio, "BRIDGE_ATTEMPTS", 3)
+    monkeypatch.setattr(studio, "_stop_verifier_bridge", lambda child: False)
+    with pytest.raises(RuntimeError, match="cleanup is still pending"):
+        studio._ensure_bridge(reuse_existing=False)
+    assert len(spawned) == 1
+
+
+def test_verifier_shutdown_preserves_a_real_six_second_cleanup(tmp_path):
+    marker = tmp_path / "cleanup-finished"
+    script = (
+        "import signal,sys,time\n"
+        "from pathlib import Path\n"
+        "def stop(*args):\n"
+        "    time.sleep(6)\n"
+        "    Path(sys.argv[1]).write_text('restored')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM,stop)\n"
+        "print('ready',flush=True)\n"
+        "while True: time.sleep(1)\n"
+    )
+    child = subprocess.Popen([sys.executable, "-c", script, str(marker)],
+                             stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        assert studio._stop_verifier_bridge(child) is True
+        assert child.returncode == 0
+        assert marker.read_text() == "restored"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()

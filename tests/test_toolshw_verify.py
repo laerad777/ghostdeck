@@ -1,14 +1,7 @@
 """Deck-free tests for tools/hardware_verify.py.
 
-Why this file exists (C-169): the harness grew real process-signalling logic and none of it
-was covered here, so a defect that signals a bridge it did not start (C-167) shipped in a
-commit whose own message claimed the ownership rule held. This covers only the deck-free
-surface - the parts reachable without a deck, a bridge, or studio._ensure_bridge().
-
-Deliberately NOT covered, because it needs hardware or spawns a real bridge:
-  * anything past the device-mode check (bring-up, play, stop, teardown against a deck)
-  * studio._ensure_bridge()
-The master's own runs cover those, and `docs`/commit notes record that split.
+All device and product operations in lifecycle tests are stubbed. Real socket probes
+are confined to scratch endpoints; no attached deck or operator session is touched.
 """
 
 from __future__ import annotations
@@ -36,8 +29,11 @@ def _harness():
 
 
 @pytest.fixture
-def harness():
-    return _harness()
+def harness(monkeypatch, tmp_path):
+    module = _harness()
+    monkeypatch.setattr(module.studio, "SOCKET", tmp_path / "absent.sock")
+    monkeypatch.setattr(module, "HOST_STATE", tmp_path / "host.json")
+    return module
 
 
 def _run_main(harness, monkeypatch, *, gate: bool, mode: str | None = None, adb: bool = True):
@@ -219,7 +215,7 @@ def test_hardware_verifier_stages_device_binaries_before_the_bridge():
     without `devicebuild.ensure()`.
     """
     text = HARNESS.read_text(encoding="utf-8")
-    assert "devicebuild.ensure()\n        studio._ensure_bridge()" in text
+    assert "devicebuild.ensure()\n        bridge = studio._ensure_bridge(reuse_existing=False)" in text
 
 
 def test_agent_workflow_builds_the_release_artifact_the_failure_message_names():
@@ -238,3 +234,194 @@ def test_agent_workflow_builds_the_release_artifact_the_failure_message_names():
     assert "CMAKE_SYSTEM_PROCESSOR=arm" in text
     assert devicebuild.AGENT_RELEASE_URL.endswith("/d200-color-agent")
     assert "laerad777/ghostdeck" in devicebuild.AGENT_RELEASE_URL
+
+
+@pytest.mark.parametrize("endpoint", ["live", "undeterminable"])
+def test_shared_endpoint_refuses_before_any_device_work(harness, monkeypatch, tmp_path, endpoint):
+    monkeypatch.setattr(harness, "own_bridges", lambda: [])
+    monkeypatch.setattr(harness.studio, "_socket_state", lambda: (endpoint, "occupied"))
+    state = tmp_path / "host.json"
+    state.write_text("operator state")
+    monkeypatch.setattr(harness, "HOST_STATE", state)
+    def forbidden(*args, **kwargs):
+        pytest.fail("an existing session must not be touched")
+    for name in ("observe", "start_play_async", "cli", "stop_own_bridges"):
+        monkeypatch.setattr(harness, name, forbidden)
+    monkeypatch.setattr(harness.devicebuild, "ensure", forbidden)
+    monkeypatch.setattr(harness.studio, "_ensure_bridge", forbidden)
+    assert _run_main(harness, monkeypatch, gate=True, mode="adb") == 2
+    assert state.read_text() == "operator state"
+
+
+class FakeBridge:
+    pid = 87654
+    returncode = None
+    def poll(self):
+        return self.returncode
+
+
+def setup_owned_session(harness, monkeypatch, *, serial="SERIAL", listener=None, count=1):
+    bridge = FakeBridge()
+    stopped = []
+    monkeypatch.setenv("GHOSTDECK_HW_TEST", "1")
+    monkeypatch.setattr(sys, "argv", ["hardware_verify.py", "--media", "clip.mp4"])
+    monkeypatch.setattr(harness, "adb_available", lambda: True)
+    monkeypatch.setattr(harness, "own_bridges", lambda: [])
+    states = iter([("dead", "absent")])
+    monkeypatch.setattr(harness.studio, "_socket_state", lambda: next(states, ("live", "")))
+    monkeypatch.setattr(harness.studio, "_owned_bridge_pid", lambda: bridge.pid if listener is None else listener)
+    monkeypatch.setattr(harness, "device_mode", lambda: "adb")
+    monkeypatch.setattr(harness, "observe", lambda stage: None)
+    monkeypatch.setattr(harness.devicebuild, "ensure", lambda: None)
+    def ensure(*, reuse_existing):
+        assert reuse_existing is False
+        monkeypatch.setattr(harness, "own_bridge_count", lambda: count)
+        return bridge
+    monkeypatch.setattr(harness.studio, "_ensure_bridge", ensure)
+    monkeypatch.setattr(harness, "device_serial", lambda: serial)
+    monkeypatch.setattr(harness, "adb_devices", lambda: [(serial, "device")])
+    monkeypatch.setattr(harness, "reachable", lambda serial: True)
+    def stop(child):
+        assert child is bridge
+        stopped.append(child.pid)
+        child.returncode = 0
+        return True
+    monkeypatch.setattr(harness.studio, "_stop_verifier_bridge", stop)
+    monkeypatch.setattr(harness, "wait_for_mode", lambda wanted: "hid")
+    monkeypatch.setattr(harness.play, "playing", lambda: False)
+    monkeypatch.setattr(harness, "deck_paths", lambda *args: {"/tmp/d200-color-agent": "ABSENT"})
+    return bridge, stopped
+
+
+def test_listener_mismatch_aborts_before_play_or_stop(harness, monkeypatch, tmp_path):
+    bridge, stopped = setup_owned_session(harness, monkeypatch, listener=99999)
+    def forbidden(*args, **kwargs):
+        pytest.fail("must not play or stop someone else's session")
+    monkeypatch.setattr(harness, "start_play_async", forbidden)
+    monkeypatch.setattr(harness, "cli", forbidden)
+    assert harness.main() == 1
+    assert stopped == [bridge.pid]
+
+
+@pytest.mark.parametrize("failure", ["serial", "play"])
+def test_owned_child_is_cleaned_up_on_early_failure(harness, monkeypatch, failure):
+    bridge, stopped = setup_owned_session(harness, monkeypatch, serial=None if failure == "serial" else "SERIAL")
+    calls = []
+    monkeypatch.setattr(harness, "stop_playing", lambda: calls.append("stop") or "stop rc=0")
+    def boom(media):
+        raise RuntimeError("launcher unavailable")
+    monkeypatch.setattr(harness, "start_play_async", boom)
+    assert harness.main() == 1
+    assert calls == ["stop"]
+    assert stopped == [bridge.pid]
+
+
+def test_teardown_does_not_stop_replacement_session(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch, listener=99999)
+    monkeypatch.setattr(harness, "stop_playing", lambda: pytest.fail("foreign stop"))
+    harness.teardown(bridge, "SERIAL")
+    assert stopped == [bridge.pid]
+    assert "teardown ownership" in harness.failures
+
+
+def test_run_logs_are_preserved_and_launcher_error_is_reported(harness, monkeypatch, tmp_path, capsys):
+    directory = tmp_path / "run-logs"
+    monkeypatch.setenv("GHOSTDECK_HW_LOG_DIR", str(directory))
+    handle = harness.open_run_log("ghostdeck-play-")
+    handle.write(b"specific launcher failure\n")
+    handle.flush()
+    player = FakeBridge()
+    player._ghostdeck_log = handle
+    harness.report_play_log(player)
+    handle.close()
+    assert Path(handle.name).parent == directory
+    assert "specific launcher failure" in capsys.readouterr().out
+    assert Path(handle.name).exists()
+
+
+def test_workflow_preserves_run_logs_and_serializes_hardware():
+    text = (ROOT / ".github/workflows/hardware.yml").read_text()
+    assert "cancel-in-progress: false" in text
+    assert "GHOSTDECK_HW_LOG_DIR" in text
+    assert "tee" in text and "verifier.log" in text
+    assert "${{ runner.temp }}/ghostdeck-hardware-${{ github.run_id }}-${{ github.run_attempt }}/*.log" in text
+
+
+def test_owned_happy_session_plays_and_cleans_up(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch)
+    player = FakeBridge()
+    player.returncode = 0
+    calls = []
+    monkeypatch.setattr(harness, "start_play_async", lambda media: calls.append("play") or player)
+    monkeypatch.setattr(harness.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(harness, "host_diagnostics", lambda: {"framesConsumed": 12, "firstConsumedReceipt": True})
+    def cli(command):
+        calls.append(command)
+        return subprocess.CompletedProcess([], 0, "playing=yes" if command == "status" else "", "")
+    monkeypatch.setattr(harness, "cli", cli)
+    assert harness.main() == 0
+    assert calls == ["play", "status", "stop", "stop"]
+    assert stopped == [bridge.pid]
+
+
+def test_no_clean_preserves_owned_session(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["hardware_verify.py", "--no-clean"])
+    monkeypatch.setattr(harness, "cli", lambda *args: pytest.fail("no-clean must not stop"))
+    assert harness.main() == 0
+    assert stopped == []
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_invalid_bridge_count_aborts_playback(harness, monkeypatch, count):
+    bridge, stopped = setup_owned_session(harness, monkeypatch, count=count)
+    monkeypatch.setattr(harness, "start_play_async", lambda media: pytest.fail("invalid session"))
+    monkeypatch.setattr(harness, "stop_playing", lambda: "stop rc=0")
+    assert harness.main() == 1
+    assert stopped == [bridge.pid]
+
+
+def test_post_bringup_diagnostic_exception_still_reaps_child(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch)
+    def observe(stage):
+        if stage == "after bring-up":
+            raise RuntimeError("diagnostic failed")
+    monkeypatch.setattr(harness, "observe", observe)
+    monkeypatch.setattr(harness, "stop_playing", lambda: "stop rc=0")
+    assert harness.main() == 1
+    assert stopped == [bridge.pid]
+
+
+def test_pending_bridge_cleanup_is_reported_without_waiting_for_hid(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch)
+    monkeypatch.setattr(harness, "stop_playing", lambda: "stop rc=0")
+    monkeypatch.setattr(harness.studio, "_stop_verifier_bridge", lambda child: False)
+    monkeypatch.setattr(harness, "wait_for_mode", lambda mode: pytest.fail("cleanup is pending"))
+    harness.teardown(bridge, "SERIAL")
+    assert "owned bridge cleanup finished" in harness.failures
+    assert bridge.poll() is None
+
+
+def test_a_killed_bridge_is_not_reported_as_clean_teardown(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch)
+    monkeypatch.setattr(harness, "stop_playing", lambda: "stop rc=0")
+    def killed(child):
+        child.returncode = -9
+        return True
+    monkeypatch.setattr(harness.studio, "_stop_verifier_bridge", killed)
+    harness.teardown(bridge, "SERIAL")
+    assert "the bridge this run started exited cleanly" in harness.failures
+
+
+def test_sigterm_unwinds_cleanup_and_ignores_repeated_term(harness, monkeypatch):
+    calls = []
+    monkeypatch.setattr(harness.signal, "signal", lambda *args: calls.append(args))
+    cleaned = []
+    with pytest.raises(SystemExit) as error:
+        try:
+            harness.handle_sigterm(harness.signal.SIGTERM, None)
+        finally:
+            cleaned.append(True)
+    assert error.value.code == 143
+    assert cleaned == [True]
+    assert calls == [(harness.signal.SIGTERM, harness.signal.SIG_IGN)]

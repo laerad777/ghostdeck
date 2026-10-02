@@ -26,6 +26,11 @@ on:
     # 17:00 UTC = 02:00 KST, outside working hours on the host this is registered on.
     - cron: "0 17 * * *"
 
+# Manual and scheduled runs share one deck; never cancel a run during teardown.
+concurrency:
+  group: ghostdeck-hardware
+  cancel-in-progress: false
+
 jobs:
   deck-smoke:
     runs-on: [self-hosted, macOS, d200]
@@ -48,6 +53,8 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          export GHOSTDECK_HW_LOG_DIR="$RUNNER_TEMP/ghostdeck-hardware-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$GHOSTDECK_HW_LOG_DIR"
           # Sample clips are not in git. A 2s 540x960 testsrc is enough to prove play→stop
           # on the attached deck (item 6). GHOSTDECK_HW_MEDIA overrides it with a real file.
           clip=${GHOSTDECK_HW_MEDIA:-}
@@ -56,7 +63,9 @@ jobs:
             ffmpeg -y -f lavfi -i testsrc=duration=2:size=540x960:rate=30 \
               -pix_fmt yuv420p -an "$clip"
           fi
-          PYTHONPATH=src .venv-hw/bin/python tools/hardware_verify.py --media "$clip"
+          # pipefail preserves refusal/failure; an occupied deck must not look like a pass.
+          PYTHONPATH=src .venv-hw/bin/python -u tools/hardware_verify.py --media "$clip" \
+            2>&1 | tee "$GHOSTDECK_HW_LOG_DIR/verifier.log"
 
       - name: Upload the verifier's output on failure
         if: failure()
@@ -64,6 +73,7 @@ jobs:
         with:
           name: hardware-verify-log
           path: |
+            ${{ runner.temp }}/ghostdeck-hardware-${{ github.run_id }}-${{ github.run_attempt }}/*.log
             /tmp/d200-local-bridge.log
             /tmp/d200-hidshim.log
           if-no-files-found: ignore
