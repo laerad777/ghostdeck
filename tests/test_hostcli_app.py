@@ -764,7 +764,7 @@ def test_reconnect_restarts_adb_quits_the_copy_and_launches_studio(monkeypatch):
     monkeypatch.setattr(studio, "_stop_our_bridge", lambda: seen.append("bridge"))
     monkeypatch.setattr(studio, "launch", lambda: seen.append("launch"))
     studio.reconnect(wait=0)
-    assert seen == ["adb", "quit", "bridge", "launch"]
+    assert seen == ["quit", "bridge", "adb", "launch"]
 
 
 def test_reconnect_refuses_when_the_deck_is_missing(monkeypatch):

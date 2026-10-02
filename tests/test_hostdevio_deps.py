@@ -922,8 +922,8 @@ class _Device:
     serial_number = "STUB-SERIAL"
 
 
-def find(idVendor=None, idProduct=None):
-    return _Device()
+def find(idVendor=None, idProduct=None, find_all=False):
+    return [_Device()] if find_all else _Device()
 """
 
 # The boundary case: the submodule imports, but talking to the bus fails at runtime.

@@ -70,7 +70,6 @@ from ghostdeck.playwait import (
 # catch an interpreter that starts and exits, and short enough to stay invisible to the user.
 _PLAY_GRACE = 1.0
 _OPEN_WAIT = 20.0
-_CLAIM_WAIT = 0.6
 
 _TOOL_HINTS = {
     "ffmpeg": "brew install ffmpeg",
@@ -255,36 +254,48 @@ def start_play(source: str, fit: str = "auto", start: float = 0.0, loop: bool = 
     # command must not exit 0 - the user would be told playback started while nothing is playing.
     # Nothing is written before this check, so there is no stale record to clear on the way out.
     try:
-        returncode = proc.wait(timeout=_PLAY_GRACE)
-    except subprocess.TimeoutExpired:
-        returncode = None
-    if returncode is not None:
-        raise _player_died(returncode, log_path, log_start)
-    claim_deadline = time.monotonic() + _CLAIM_WAIT
-    open_deadline = time.monotonic() + _OPEN_WAIT
-    saw_self = False
-    while time.monotonic() < open_deadline:
-        returncode = proc.poll()
+        try:
+            returncode = proc.wait(timeout=_PLAY_GRACE)
+        except subprocess.TimeoutExpired:
+            returncode = None
         if returncode is not None:
             raise _player_died(returncode, log_path, log_start)
-        host = _host_claim(proc.pid)
-        if host is not None:
-            saw_self = True
-            video = host.get("video") if isinstance(host.get("video"), dict) else {}
-            if video.get("epoch") == 1 and video.get("capability"):
-                break
-            if str(host.get("phase") or "") == "terminal":
-                raise RuntimeError("video OPEN failed; nothing is playing")
-        elif saw_self:
-            raise RuntimeError("video OPEN failed; nothing is playing")
-        elif time.monotonic() >= claim_deadline:
-            break
-        time.sleep(0.1)
-    data = gdstate.update(play_pid=proc.pid)
-    if data.get("play_pid") != proc.pid:
-        # A-104: fail loudly rather than silently reporting a session that was never recorded.
-        raise RuntimeError(f"could not record the player pid {proc.pid} in {gdstate.STATE_PATH}")
-    _record_identity(proc.pid)
+        open_deadline = time.monotonic() + _OPEN_WAIT
+        saw_self = False
+        while time.monotonic() < open_deadline:
+            returncode = proc.poll()
+            if returncode is not None:
+                raise _player_died(returncode, log_path, log_start)
+            host = _host_claim(proc.pid)
+            if host is not None:
+                saw_self = True
+                video = host.get("video") if isinstance(host.get("video"), dict) else {}
+                if str(host.get("phase") or "") == "terminal":
+                    raise RuntimeError("video OPEN failed; nothing is playing")
+                if video.get("epoch") == 1 and video.get("capability"):
+                    break
+            elif saw_self:
+                raise RuntimeError("video OPEN ownership changed; startup cancelled")
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f"video OPEN timed out after {_OPEN_WAIT:g}s; startup cancelled")
+        data = gdstate.update(play_pid=proc.pid)
+        if data.get("play_pid") != proc.pid:
+            # A-104: fail loudly rather than silently reporting a session that was never recorded.
+            raise RuntimeError(f"could not record the player pid {proc.pid} in {gdstate.STATE_PATH}")
+        _record_identity(proc.pid)
+    except BaseException:
+        # Popen owns precisely this child. Never use the global stop sweep or
+        # erase host/state records: another session may have replaced ours.
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "video OPEN did not complete; player cleanup is still pending"
+                ) from None
+        raise
 
 
 def _player_log_path() -> Path:
