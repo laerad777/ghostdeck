@@ -196,6 +196,16 @@ def _hid_present() -> bool | None:
         return False
 
 
+def _require_single_hid(entries) -> None:
+    # A physical deck has several HID interfaces. Only distinct interface-zero
+    # paths count as separate candidates; repeated rows are not extra decks.
+    paths = {entry.get("path").encode() if isinstance(entry.get("path"), str)
+             else entry.get("path") for entry in entries
+             if entry.get("interface_number") == 0 and entry.get("path") is not None}
+    if len(paths) > 1:
+        raise RuntimeError("multiple D200 HID devices match; disconnect extra decks before retrying")
+
+
 def _hid_serial() -> str | None:
     try:
         hid = _hid_module()
@@ -205,6 +215,7 @@ def _hid_serial() -> str | None:
         entries = hid.enumerate(HID_VID, HID_PID)
     except Exception:
         return None
+    _require_single_hid(entries)
     for entry in entries:
         serial = entry.get("serial_number") or None
         if isinstance(serial, bytes):
@@ -239,6 +250,7 @@ def _hid_iface0(*, timeout: float):
         except Exception as error:
             entries = []
             last_error = error
+        _require_single_hid(entries)
         for entry in entries:
             if entry.get("interface_number") != 0:
                 continue
@@ -279,9 +291,12 @@ def _usb_find(vid: int, pid: int):
     except ImportError as error:
         raise MissingDependency(USB_BROKEN_HINT) from error
     try:
-        return usb.core.find(idVendor=vid, idProduct=pid)
+        matches = list(usb.core.find(find_all=True, idVendor=vid, idProduct=pid) or [])
     except Exception:
         return None
+    if len(matches) > 1:
+        raise RuntimeError("multiple D200 USB devices match; disconnect extra decks before retrying")
+    return matches[0] if matches else None
 
 
 def _usb_serial(dev) -> str | None:

@@ -72,7 +72,9 @@ def run_cli(argv: list[str]) -> CommandResult:
     env = os.environ.copy()
     previous = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(root / "src") if not previous else str(root / "src") + os.pathsep + previous
-    timeout = {"studio": 180.0, "play": 30.0, "bridge": 90.0, "stop": 60.0, "reconnect": 180.0}.get(argv[0] if argv else "", 20.0)
+    # Play may spend over 30s recovering the bridge before OPEN and owned-child cleanup.
+    # Keep the GUI budget aligned with reconnect instead of killing that normal recovery.
+    timeout = {"studio": 180.0, "play": 180.0, "bridge": 90.0, "stop": 60.0, "reconnect": 180.0}.get(argv[0] if argv else "", 20.0)
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "ghostdeck", *argv],
@@ -236,7 +238,7 @@ def media_path_candidate(text: str) -> str:
         text = unquote(urlparse(text).path)
     if not text.startswith("/"):
         return ""
-    path = text.split("?")[0]
+    path = text
     if Path(path).suffix.lower() in _MEDIA_SUFFIXES:
         return path
     return ""
@@ -422,6 +424,33 @@ def playlist_add(items, source: str, title: str = "", channel: str = "", duratio
             out[i] = merged
             return out
     return out + [playlist_entry(source, title, channel, length, live=live)]
+
+
+def playlist_metadata_token(ctrl, source: str):
+    """Capture a row's lifetime, independent of moves and metadata normalization."""
+    tokens = getattr(ctrl, "metadata_tokens", None)
+    if tokens is None:
+        tokens = ctrl.metadata_tokens = {}
+    return tokens.setdefault(playlist_identity(source), object())
+
+
+def playlist_apply_metadata(ctrl, source: str, token, title="", channel="", duration=0.0, *, live=False) -> bool:
+    """A late probe may enrich an existing row, never insert or revive a removed one."""
+    key = playlist_identity(source)
+    if getattr(ctrl, "metadata_tokens", {}).get(key) is not token:
+        return False
+    if not playlist_find(getattr(ctrl, "playlist", []), key):
+        return False
+    ctrl.playlist = playlist_add(ctrl.playlist, key, title, channel, duration, live=live)
+    return True
+
+
+def playlist_remove_row(ctrl, index: int) -> None:
+    items = playlist_normalize(getattr(ctrl, "playlist", []))
+    if 0 <= index < len(items):
+        key = playlist_identity(playlist_source(items[index]))
+        getattr(ctrl, "metadata_tokens", {}).pop(key, None)
+    ctrl.playlist = playlist_remove(items, index)
 
 
 def playlist_extend(items, entries) -> list[dict[str, str]]:
@@ -661,8 +690,8 @@ def playlist_should_loop(source: str, items, repeat: str = "off") -> bool:
     """Whether the player process itself loops. Queue wrap is `playlist_next`."""
     if repeat == "one":
         return True
-    n = len(playlist_normalize(items))
-    if repeat == "all" and n <= 1:
+    queue = playlist_normalize(items)
+    if repeat == "all" and len(queue) == 1 and playlist_identity(source) == playlist_identity(playlist_source(queue[0])):
         return True
     return False
 
@@ -1291,6 +1320,19 @@ def wrap_playhead(pos: float, duration: float, looping: bool) -> float:
     if looping:
         return pos % duration
     return duration if pos > duration else pos
+
+def deck_loop_state(path: Path = HOST_STATE) -> tuple[str, str, bool | None]:
+    """Published worker identity and loop mode, including workers started outside this GUI."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return "", "", None
+    if not isinstance(data, dict) or not isinstance(data.get("video"), dict):
+        return "", "", None
+    if not isinstance(data.get("loop"), bool):
+        return "", "", None
+    return (str(data.get("source") or ""), str(data["video"].get("session") or ""), data["loop"])
+
 
 def deck_playhead(path: Path = HOST_STATE) -> tuple[str, float, bool]:
     """(source, seconds, active). Seconds is --start plus time since the first consumed frame."""
@@ -2362,7 +2404,8 @@ def main() -> int:
                 # resumes; ■ refines the position, a natural end leaves it at the start.
                 ctrl.resume_source = last.argv[1]
                 ctrl.resume_pos = 0.0
-                _gui_playlist_put(ctrl, last.argv[1])
+                if playlist_identity(last.argv[1]) not in getattr(ctrl, "removed_now", set()):
+                    _gui_playlist_put(ctrl, last.argv[1])
             _gui_notify(ctrl, play_success_note(deck_has_picture()))
         elif last.argv[:1] == ["studio"]:
             _gui_notify(ctrl, "스튜디오를 켰습니다. 이제 재생할 수 있습니다.")
@@ -2375,7 +2418,7 @@ def main() -> int:
         ):
             _gui_kick(ctrl, "play", pending, start=pending_start)
 
-    def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False, crop: str = "auto") -> None:
+    def _gui_kick(ctrl, op: str, source: str, start: float = 0.0, loop: bool = False, crop: str = "auto", *, preserve_queue: bool = False) -> None:
         if op in ("reconnect", "studio", "bridge"):
             ctrl.epoch = getattr(ctrl, "epoch", 0) + 1
             epoch = ctrl.epoch
@@ -2423,6 +2466,11 @@ def main() -> int:
                 daemon=True,
             ).start()
             return
+        # Every new play route (open, drop, URL, queue and deferred play) clears Stop.
+        if op == "play":
+            ctrl.user_stopped = False
+            if not preserve_queue:
+                getattr(ctrl, "removed_now", set()).discard(playlist_identity(source))
         if ctrl.busy and op == "play":
             ctrl.pending_source = source
             ctrl.pending_start = play_offset(start)
@@ -2435,6 +2483,11 @@ def main() -> int:
                 ctrl.seen_watch = source
                 ctrl.played_start = play_offset(start)
                 ctrl.saw_picture = False
+                # Suppress reconciliation against the old publication until replacement.
+                ctrl.replacing_session = deck_loop_state()[1]
+                ctrl.worker_loop = playlist_should_loop(
+                    source, getattr(ctrl, "playlist", []), getattr(ctrl, "repeat", "off")
+                )
             _gui_set_busy(ctrl, True)
             _gui_notify(ctrl, "재생 준비 중…" if op == "play" else "멈추는 중…")
         pasteboard = read_pasteboard() if op == "play" else ""
@@ -2454,11 +2507,7 @@ def main() -> int:
                     lambda: _gui_apply(ctrl, r, e, epoch)
                 ),
                 play_offset(start),
-                playlist_should_loop(
-                    source,
-                    getattr(ctrl, "playlist", []),
-                    getattr(ctrl, "repeat", "off"),
-                ) if op == "play" else loop,
+                ctrl.worker_loop if op == "play" else loop,
                 crop,
                 audio_gain(getattr(ctrl, "volume", 1.0), getattr(ctrl, "muted", False)),
                 play_fit(getattr(ctrl, "fit", "auto")),
@@ -2484,15 +2533,18 @@ def main() -> int:
         playlist_save(PLAYLIST_PATH, ctrl.playlist)
         _gui_playlist_draw(ctrl)
         found = playlist_find(ctrl.playlist, source)
-        if found.get("title") and found.get("duration"):
+        if found.get("title") and (found.get("duration") or found.get("live")):
             return
+
+        token = playlist_metadata_token(ctrl, source)
 
         def fill():
             title, channel = source_identity(source) if not found.get("title") else ("", "")
-            length, live = source_length(source) if not found.get("duration") else (0.0, False)
+            length, live = source_length(source) if not (found.get("duration") or found.get("live")) else (0.0, False)
 
             def apply():
-                ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, title, channel, length, live=live)
+                if not playlist_apply_metadata(ctrl, source, token, title, channel, length, live=live):
+                    return
                 playlist_save(PLAYLIST_PATH, ctrl.playlist)
                 _gui_playlist_draw(ctrl)
 
@@ -2507,19 +2559,23 @@ def main() -> int:
         launch does not probe it again (~3s of yt-dlp per live row, every launch). A failed probe
         (offline, timeout) marks nothing and is simply tried again next launch.
         """
-        missing = [playlist_source(item) for item in getattr(ctrl, "playlist", [])
-                   if not item.get("duration") and not item.get("live")]
+        missing = [
+            (playlist_source(item), playlist_metadata_token(ctrl, playlist_source(item)))
+            for item in getattr(ctrl, "playlist", [])
+            if not item.get("duration") and not item.get("live")
+        ]
         if not missing:
             return
 
         def fill():
-            for source in missing:
+            for source, token in missing:
                 length, live = source_length(source)
                 if length <= 0 and not live:
                     continue
 
-                def apply(source=source, length=length, live=live):
-                    ctrl.playlist = playlist_add(getattr(ctrl, "playlist", []), source, duration=length, live=live)
+                def apply(source=source, length=length, live=live, token=token):
+                    if not playlist_apply_metadata(ctrl, source, token, duration=length, live=live):
+                        return
                     playlist_save(PLAYLIST_PATH, ctrl.playlist)
                     _gui_playlist_draw(ctrl)
 
@@ -2656,7 +2712,28 @@ def main() -> int:
             _describe(button, "덱 설정 (스튜디오 · 브리지 · 화면 · 여백 · 버튼 불투명도)"
                       + (f" — 지금: {custom}" if custom else ""))
 
+    def _gui_sync_loop(ctrl) -> None:
+        """Apply mode/queue changes at the current position once the worker is ready."""
+        if getattr(ctrl, "busy", False) or getattr(ctrl, "user_stopped", False):
+            return
+        state = deck_loop_state()
+        published_source, session, looping = state
+        if not session or session == getattr(ctrl, "replacing_session", None):
+            return
+        source, pos, active = deck_playhead()
+        if (not active or not deck_has_picture()
+                or playlist_identity(source) != playlist_identity(published_source)
+                or deck_loop_state() != state):
+            return
+        desired = playlist_should_loop(
+            source, getattr(ctrl, "playlist", []), getattr(ctrl, "repeat", "off")
+        )
+        if desired == looping:
+            return
+        _gui_kick(ctrl, "play", source, start=pos, crop=deck_crop() or "auto", preserve_queue=True)
+
     def _gui_playlist_draw(ctrl) -> None:
+        _gui_sync_loop(ctrl)
         table = getattr(ctrl, "playlist_table", None)
         items = getattr(ctrl, "playlist", [])
         if table is not None:
@@ -3880,6 +3957,7 @@ def main() -> int:
             modes = list(_REPEAT_MODES)
             cur = getattr(self, "repeat", "off")
             self.repeat = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else "off"
+            _gui_sync_loop(self)
             _save_prefs(self)
             _gui_mode_draw(self)
 
@@ -4032,7 +4110,7 @@ def main() -> int:
                 _gui_notify(self, "지울 항목을 고르십시오.")
                 return
             entry = dict(items[row])
-            self.playlist = playlist_remove(items, row)
+            playlist_remove_row(self, row)
             playlist_save(PLAYLIST_PATH, self.playlist)
             source = playlist_identity(playlist_source(entry))
             if source and source == playlist_identity(deck_now_playing()):
@@ -4068,7 +4146,8 @@ def main() -> int:
                 # moved (a move, an add, auto-next) between undo and redo.
                 undo.registerUndoWithTarget_selector_object_(self, "removeSource:", playlist_source(entry))
                 undo.setActionName_("대기열에서 제거")
-            _gui_playlist_draw(self)
+            # Undo creates a new row lifetime; any missing metadata needs a fresh probe.
+            _gui_playlist_put(self, playlist_source(entry))
             at = playlist_index(self.playlist, playlist_source(entry))
             if at >= 0:
                 self.playlist_table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(at), False)

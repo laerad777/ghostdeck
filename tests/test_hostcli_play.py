@@ -59,6 +59,7 @@ def deck_home(tmp_path, monkeypatch):
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
     monkeypatch.setattr(studio, "_bridge_lost_deck", lambda: False)
     monkeypatch.setattr(play, "_HOST_STATE", tmp_path / "d200-color-host.json")
+    monkeypatch.setattr(play, "_host_claim", lambda pid: {"pid": pid, "phase": "active", "video": {"epoch": 1, "capability": "test-capability"}})
     # `play` chooses between `require_bridge` (refuse and name `ghostdeck studio`) and starting the
     # bridge itself, based on whether the official app is installed. That decision must be pinned, or
     # every test here would answer differently on a host that has it. The default is "installed"
@@ -172,7 +173,7 @@ def test_play_returns_while_the_player_keeps_running_under_captured_output(tmp_p
         "play._signal_speakers = lambda: None\n"
         "play.abandon_host_session = lambda *a: None\n"
         f"play._HOST_STATE = Path({str(tmp_path / 'host.json')!r})\n"
-        "play._CLAIM_WAIT = 0.2\n"
+        "play._host_claim = lambda pid: {'pid': pid, 'phase': 'active', 'video': {'epoch': 1, 'capability': 'test'}}\n"
         f"play.VENDOR_PLAY = Path({str(player)!r})\n"
         f"play.start_play({str(_source(tmp_path))!r})\n"
         "print(state.load()['play_pid'])\n",
@@ -481,3 +482,82 @@ def test_play_lifecycle_is_not_the_identity_or_wait_modules():
     assert "def _kill_play" not in text
     assert "def start_play" in text
     assert "def stop" in text
+
+
+@pytest.mark.parametrize('claim', [None, {'phase': 'active', 'video': {'epoch': 0, 'capability': None}}, {'phase': 'terminal', 'video': {'epoch': 1, 'capability': 'old'}}])
+def test_unopened_player_fails_and_reaps_only_owned_child(tmp_path, monkeypatch, deck_home, claim):
+    from ghostdeck import play, state
+    monkeypatch.setattr(play, '_OPEN_WAIT', 0.1)
+    monkeypatch.setattr(play, '_PLAY_GRACE', 0.05)
+    monkeypatch.setattr(play, '_host_claim', lambda pid: claim)
+    monkeypatch.setattr(play, '_kill_play', lambda: None)
+    monkeypatch.setattr(play, '_session_released', lambda **kwargs: True)
+    monkeypatch.setattr(play, '_signal_speakers', lambda: None)
+    player = _player(tmp_path, 'import time\ntime.sleep(60)\n')
+    monkeypatch.setattr(play, 'VENDOR_PLAY', player)
+    children = []
+    popen = subprocess.Popen
+    def spawn(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(play.subprocess, 'Popen', spawn)
+    state.update(play_pid=987654)
+    with pytest.raises(RuntimeError, match='video OPEN'):
+        play.start_play(str(_source(tmp_path)))
+    assert len(children) == 1
+    assert children[0].poll() is not None
+    assert state.load()['play_pid'] == 987654
+
+
+def test_interrupted_grace_cancels_only_spawned_player(tmp_path, monkeypatch, deck_home):
+    from ghostdeck import play
+    class Child:
+        pid = 123456
+        stopped = False
+        def wait(self, timeout):
+            if self.stopped:
+                return -15
+            raise KeyboardInterrupt()
+        def poll(self):
+            return -15 if self.stopped else None
+        def terminate(self):
+            self.stopped = True
+    child = Child()
+    monkeypatch.setattr(play, '_kill_play', lambda: None)
+    monkeypatch.setattr(play, '_signal_speakers', lambda: None)
+    monkeypatch.setattr(play.subprocess, 'Popen', lambda *a, **k: child)
+    with pytest.raises(KeyboardInterrupt):
+        play.start_play(str(_source(tmp_path)))
+    assert child.stopped
+
+
+def test_delayed_claim_must_reach_open_before_success(tmp_path, monkeypatch, deck_home):
+    from ghostdeck import play, state
+    monkeypatch.setattr(play, '_PLAY_GRACE', 0.01)
+    monkeypatch.setattr(play, '_OPEN_WAIT', 2)
+    claims = iter([None, None, {'phase': 'active', 'video': {'epoch': 0}},
+                   {'phase': 'active', 'video': {'epoch': 1, 'capability': 'valid'}}])
+    monkeypatch.setattr(play, '_host_claim', lambda pid: next(claims))
+    monkeypatch.setattr(play, 'VENDOR_PLAY', _player(tmp_path, 'import time\ntime.sleep(60)\n'))
+    play.start_play(str(_source(tmp_path)))
+    os.kill(state.load()['play_pid'], signal.SIGTERM)
+
+
+def test_claim_replaced_during_open_cancels_owned_player(tmp_path, monkeypatch, deck_home):
+    from ghostdeck import play
+    monkeypatch.setattr(play, '_PLAY_GRACE', 0.01)
+    monkeypatch.setattr(play, '_OPEN_WAIT', 1)
+    claims = iter([{'phase': 'active', 'video': {'epoch': 0}}, None])
+    monkeypatch.setattr(play, '_host_claim', lambda pid: next(claims))
+    monkeypatch.setattr(play, 'VENDOR_PLAY', _player(tmp_path, 'import time\ntime.sleep(60)\n'))
+    children = []
+    popen = subprocess.Popen
+    def spawn(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(play.subprocess, 'Popen', spawn)
+    with pytest.raises(RuntimeError, match='ownership changed'):
+        play.start_play(str(_source(tmp_path)))
+    assert children[0].poll() is not None

@@ -284,6 +284,11 @@ def reconnect(*, wait: float = 12.0) -> None:
     then times out on video OPEN. Always quit the copy first. Does not switch
     HID to ADB — that is play.
     """
+    _refuse_pending_bridge_cleanup()
+    if running():
+        _quit_copy()
+    _quit_official()
+    _stop_our_bridge()
     adb.restart_server()
     found = usb.detect()
     deadline = time.monotonic() + wait
@@ -292,10 +297,6 @@ def reconnect(*, wait: float = 12.0) -> None:
         found = usb.detect()
     if (found or {}).get("mode") not in ("hid", "adb"):
         raise RuntimeError("덱이 USB에 없습니다. 케이블을 꽂은 다음 다시 연결하십시오")
-    if running():
-        _quit_copy()
-    _quit_official()
-    _stop_our_bridge()
     try:
         launch()
     except RuntimeError as error:
@@ -568,7 +569,9 @@ def _bus_serial() -> str:
     found = usb.detect()
     if found and found.get("mode") == "adb" and found.get("serial"):
         return str(found["serial"])
-    return adb.serial_from_devices() or ""
+    # HID is positive evidence that this deck is not an ADB transport yet.
+    # Never substitute an unrelated phone from `adb devices`.
+    return ""
 
 
 def _usb_reports_adb(serial: str) -> bool:
@@ -700,30 +703,74 @@ def _stop_verifier_bridge(child: subprocess.Popen, *, timeout: float = 60.0) -> 
     return True
 
 
-def _stop_our_bridge(*, timeout: float = 8.0) -> None:
-    """SIGTERM only a live bridge we own. A stranger's listener is left alone."""
+def _bridge_process_pids() -> set[int]:
+    """Conservative veto census, never authority to signal or adopt a process."""
+    try:
+        listed = subprocess.check_output(
+            ["ps", "-ww", "-axo", "pid=,command="], text=True,
+            env=dict(os.environ, LC_ALL="C"), timeout=5.0,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        raise RuntimeError(
+            "cannot rule out pending bridge cleanup; not restarting or replacing it"
+        ) from error
+    candidates = set()
+    for line in listed.splitlines():
+        pid, _, argv = line.strip().partition(" ")
+        if pid.isdigit() and str(BRIDGE) in argv:
+            candidates.add(int(pid))
+    return candidates
+
+
+def _refuse_pending_bridge_cleanup() -> None:
+    """A disconnected listener can still be restoring the device.
+
+    Records and the process census are vetoes only. The census also covers a
+    long-lived bridge whose /tmp record was removed by the system's cleaner.
+    Socket ownership remains the only authority to signal or adopt a bridge.
+    """
+    candidates = _bridge_process_pids()
+    try:
+        record = json.loads(BRIDGE_STATE.read_text())
+        pid = record.get("pid") if isinstance(record, dict) else None
+    except (OSError, ValueError):
+        pid = None
+    if type(pid) is int and pid > 0 and str(BRIDGE) in _pid_argv(pid):
+        candidates.add(pid)
+    if candidates - {_owned_bridge_pid()}:
+        raise RuntimeError("bridge cleanup is still pending; not restarting or replacing it")
+
+
+def _process_still_exists(pid: int) -> bool:
+    """Only ESRCH proves exit; unreadable argv or EPERM does not."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _stop_our_bridge(*, timeout: float = 60.0) -> None:
+    """Request graceful restoration and refuse replacement until it finishes."""
+    _refuse_pending_bridge_cleanup()
     pid = _owned_bridge_pid()
     if pid is None:
         return
     try:
         os.kill(pid, signal.SIGTERM)
-    except OSError:
+    except ProcessLookupError:
         return
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _pid_argv(pid):
-            break
-        time.sleep(0.2)
-    else:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        if _socket_state()[0] != _ENDPOINT_LIVE:
+        if not _process_still_exists(pid):
             return
         time.sleep(0.2)
+    raise RuntimeError(
+        f"bridge cleanup is still pending after {timeout:g}s; leaving it to restore "
+        "the deck without SIGKILL and not starting another bridge"
+    )
 
 
 def require_bridge_or_start_it() -> None:
@@ -820,6 +867,7 @@ def _require_reusable_bridge(reuse_existing: bool) -> None:
 
 def _ensure_bridge(*, reuse_existing: bool = True) -> subprocess.Popen | None:
     """Start a bridge, reusing a verified listener only when the caller permits it."""
+    _refuse_pending_bridge_cleanup()
     endpoint, probe_reason = _socket_state()
     if endpoint == _ENDPOINT_LIVE:
         _require_reusable_bridge(reuse_existing)
@@ -866,6 +914,7 @@ def _ensure_bridge(*, reuse_existing: bool = True) -> subprocess.Popen | None:
                 continue
             # Re-probe immediately before spawning: a bridge that came up meanwhile is used as
             # is, an unclassifiable endpoint refuses, and only a proven-dead path is reclaimed.
+            _refuse_pending_bridge_cleanup()
             endpoint, probe_reason = _socket_state()
             if endpoint == _ENDPOINT_LIVE:
                 _require_reusable_bridge(reuse_existing)
