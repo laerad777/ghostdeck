@@ -339,13 +339,13 @@ def test_strict_start_rejects_a_different_listener_after_spawning(scratch, monke
     monkeypatch.setattr(studio, "_spawn_bridge", spawn_with_foreign_listener)
     monkeypatch.setattr(studio, "_bridge_owner_live", lambda: True)
     monkeypatch.setattr(studio, "_owned_bridge_pid", lambda: 999)
-    stop_owned = studio._stop_owned_bridge
+    stop_owned = studio._stop_verifier_bridge
 
     def record_stop(child):
         stopped.append(child)
-        stop_owned(child)
+        return stop_owned(child)
 
-    monkeypatch.setattr(studio, "_stop_owned_bridge", record_stop)
+    monkeypatch.setattr(studio, "_stop_verifier_bridge", record_stop)
     try:
         with pytest.raises(RuntimeError, match="listener changed during bring-up"):
             studio._ensure_bridge(reuse_existing=False)
@@ -713,3 +713,72 @@ def test_restart_server_succeeds_quietly_when_both_commands_exit_zero(monkeypatc
     monkeypatch.setattr(studio.adb.subprocess, "run", fake_run)
     assert studio.adb.restart_server() is None
     assert seen == ["kill-server", "start-server"]
+
+
+def test_verifier_shutdown_allows_more_than_five_seconds():
+    class SlowChild:
+        returncode = None
+        def poll(self):
+            return self.returncode
+        def terminate(self):
+            self.terminated = True
+        def wait(self, timeout):
+            assert self.terminated
+            assert timeout >= 12, "restoration alone may take 12 seconds"
+            self.returncode = 0
+        def kill(self):
+            pytest.fail("must not interrupt restoration")
+    child = SlowChild()
+    assert studio._stop_verifier_bridge(child) is True
+    assert child.returncode == 0
+
+
+def test_verifier_shutdown_timeout_never_sends_sigkill():
+    class StuckChild:
+        def poll(self):
+            return None
+        def terminate(self):
+            pass
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("bridge", timeout)
+        def kill(self):
+            pytest.fail("must leave slow cleanup alive")
+    assert studio._stop_verifier_bridge(StuckChild(), timeout=0.1) is False
+
+
+def test_strict_start_does_not_retry_while_cleanup_is_pending(scratch, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(studio, "SOCKET", scratch / "b.sock")
+    _stub_device_chain(monkeypatch, spawned)
+    monkeypatch.setattr(studio, "BRIDGE_ATTEMPTS", 3)
+    monkeypatch.setattr(studio, "_stop_verifier_bridge", lambda child: False)
+    with pytest.raises(RuntimeError, match="cleanup is still pending"):
+        studio._ensure_bridge(reuse_existing=False)
+    assert len(spawned) == 1
+
+
+def test_verifier_shutdown_preserves_a_real_six_second_cleanup(tmp_path):
+    marker = tmp_path / "cleanup-finished"
+    script = (
+        "import signal,sys,time\n"
+        "from pathlib import Path\n"
+        "def stop(*args):\n"
+        "    time.sleep(6)\n"
+        "    Path(sys.argv[1]).write_text('restored')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM,stop)\n"
+        "print('ready',flush=True)\n"
+        "while True: time.sleep(1)\n"
+    )
+    child = subprocess.Popen([sys.executable, "-c", script, str(marker)],
+                             stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        assert studio._stop_verifier_bridge(child) is True
+        assert child.returncode == 0
+        assert marker.read_text() == "restored"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()

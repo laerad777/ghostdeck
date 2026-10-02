@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -338,14 +339,19 @@ def teardown(bridge, serial: str | None) -> None:
     except RuntimeError as error:
         check("teardown ownership", False, str(error))
         # Still release our exact child, but never issue shared stop against its replacement.
-        studio._stop_owned_bridge(bridge)
+        finished = studio._stop_verifier_bridge(bridge)
+        check("owned bridge cleanup finished", finished, "cleanup still pending" if not finished else "exited")
         return
     try:
         observe("before teardown")
         print(f"  teardown: {stop_playing()}")
     finally:
-        studio._stop_owned_bridge(bridge)
-    check("the bridge this run started is stopped", bridge.poll() is not None,
+        finished = studio._stop_verifier_bridge(bridge)
+        check("owned bridge cleanup finished", finished,
+              "cleanup still pending; leaving the bridge alive without SIGKILL" if not finished else "exited")
+    if not finished:
+        return
+    check("the bridge this run started exited cleanly", bridge.poll() == 0,
           f"rc={bridge.poll()}")
     final_mode = wait_for_mode("hid")
     observe("after teardown")
@@ -520,5 +526,13 @@ def main() -> int:
     return 0
 
 
+def handle_sigterm(signum, _frame) -> None:
+    # Actions cancellation sends SIGTERM. Unwind the same guarded cleanup as an
+    # exception, and do not let a second TERM interrupt restoration in finally.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_sigterm)
     raise SystemExit(main())

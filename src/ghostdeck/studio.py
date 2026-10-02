@@ -683,6 +683,23 @@ def _stop_owned_bridge(child: subprocess.Popen, *, timeout: float = 5.0) -> None
         child.wait(timeout=timeout)
 
 
+def _stop_verifier_bridge(child: subprocess.Popen, *, timeout: float = 60.0) -> bool:
+    """Allow device restoration to finish; never SIGKILL the verifier's bridge.
+
+    DeviceProxy.close can spend 12 seconds waiting for restoration, then perform
+    several bounded device cleanup steps. A five-second kill truncates that work.
+    A timeout means cleanup is still pending, not permission to force the deck down.
+    """
+    if child.poll() is not None:
+        return True
+    child.terminate()
+    try:
+        child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def _stop_our_bridge(*, timeout: float = 8.0) -> None:
     """SIGTERM only a live bridge we own. A stranger's listener is left alone."""
     pid = _owned_bridge_pid()
@@ -881,7 +898,11 @@ def _ensure_bridge(*, reuse_existing: bool = True) -> subprocess.Popen | None:
                 # Strict callers cannot clean up a child they never received, including
                 # when a probe raises or the verifier is interrupted during startup.
                 if not reuse_existing and not retained:
-                    _stop_owned_bridge(child)
+                    if not _stop_verifier_bridge(child):
+                        raise RuntimeError(
+                            "bridge cleanup is still pending after 60s; leaving it to restore "
+                            "the deck without SIGKILL and not starting another bridge"
+                        )
             if reuse_existing:
                 _stop_owned_bridge(child)
     finally:

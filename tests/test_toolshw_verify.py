@@ -285,7 +285,8 @@ def setup_owned_session(harness, monkeypatch, *, serial="SERIAL", listener=None,
         assert child is bridge
         stopped.append(child.pid)
         child.returncode = 0
-    monkeypatch.setattr(harness.studio, "_stop_owned_bridge", stop)
+        return True
+    monkeypatch.setattr(harness.studio, "_stop_verifier_bridge", stop)
     monkeypatch.setattr(harness, "wait_for_mode", lambda wanted: "hid")
     monkeypatch.setattr(harness.play, "playing", lambda: False)
     monkeypatch.setattr(harness, "deck_paths", lambda *args: {"/tmp/d200-color-agent": "ABSENT"})
@@ -389,3 +390,38 @@ def test_post_bringup_diagnostic_exception_still_reaps_child(harness, monkeypatc
     monkeypatch.setattr(harness, "stop_playing", lambda: "stop rc=0")
     assert harness.main() == 1
     assert stopped == [bridge.pid]
+
+
+def test_pending_bridge_cleanup_is_reported_without_waiting_for_hid(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch)
+    monkeypatch.setattr(harness, "stop_playing", lambda: "stop rc=0")
+    monkeypatch.setattr(harness.studio, "_stop_verifier_bridge", lambda child: False)
+    monkeypatch.setattr(harness, "wait_for_mode", lambda mode: pytest.fail("cleanup is pending"))
+    harness.teardown(bridge, "SERIAL")
+    assert "owned bridge cleanup finished" in harness.failures
+    assert bridge.poll() is None
+
+
+def test_a_killed_bridge_is_not_reported_as_clean_teardown(harness, monkeypatch):
+    bridge, stopped = setup_owned_session(harness, monkeypatch)
+    monkeypatch.setattr(harness, "stop_playing", lambda: "stop rc=0")
+    def killed(child):
+        child.returncode = -9
+        return True
+    monkeypatch.setattr(harness.studio, "_stop_verifier_bridge", killed)
+    harness.teardown(bridge, "SERIAL")
+    assert "the bridge this run started exited cleanly" in harness.failures
+
+
+def test_sigterm_unwinds_cleanup_and_ignores_repeated_term(harness, monkeypatch):
+    calls = []
+    monkeypatch.setattr(harness.signal, "signal", lambda *args: calls.append(args))
+    cleaned = []
+    with pytest.raises(SystemExit) as error:
+        try:
+            harness.handle_sigterm(harness.signal.SIGTERM, None)
+        finally:
+            cleaned.append(True)
+    assert error.value.code == 143
+    assert cleaned == [True]
+    assert calls == [(harness.signal.SIGTERM, harness.signal.SIG_IGN)]
